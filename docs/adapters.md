@@ -1,0 +1,87 @@
+# Writing an adapter
+
+English only — writing an adapter means reading the contract test and two reference
+implementations, which are in English.
+
+> **The adapter contract is not stable until v1.** `apiVersion` is `2` today and will change.
+> Pin the tag you built against.
+
+An adapter is one `.mjs` file at `.caw/adapters/<id>/adapter.mjs`. It teaches the engine how to
+launch one provider, what that provider guarantees per role, and how to read what comes back.
+It does **not** decide policy — the engine compares what you declare against fixed role
+requirements and refuses anything short.
+
+Two references ship in the tree: `.caw/adapters/claude/` and `.caw/adapters/codex/`. A minimal
+third is at `test/third-adapter/adapter.mjs`, and `test/adapter-contract.test.mjs` is the
+contract itself. Read the test first — it is the specification.
+
+## The twelve required keys
+
+Every key is required. Extra keys are a load error, and so is a missing one: the engine refuses
+an adapter it cannot fully account for rather than running a partial one.
+
+```js
+export default {
+  apiVersion: 2,
+  id: 'my-provider',        // must equal the directory name
+  features,                 // transport and reporting capabilities
+  resolveExecutable,        // (env) => path, honouring CAW_MY_PROVIDER then PATH
+  versionInvocation,        // how to ask the CLI its version
+  mechanismAvailable,       // is the OS boundary this adapter needs present on this host?
+  verifyGuaranteeProbe,     // the live call that proves the write boundary
+  describe,                 // (role, cliVersion) => guarantees
+  buildInvocation,          // (binding, prompt, schema, execution) => argv + env
+  buildProbeInvocation,     // the same, for the probe child
+  decodeSuccess,            // provider output => { value, accounting }
+  decodeFailure,            // provider output => a bounded reason
+}
+```
+
+## `describe` is the part that matters
+
+It returns, per role, a state and **how that state is achieved**:
+
+```js
+writeScope: {
+  state: 'delivery-tree',
+  by: 'native-policy',
+  probe: { cliVersion, id: 'my-provider-boundary-v1' },
+}
+```
+
+`state` is compared against the role's requirement through a per-key partial order, so a
+strictly stronger declaration satisfies a weaker one. `by` is how it is enforced —
+`native-tool`, `native-policy`, `absent`, `os-boundary`, `isolated-surface`. The values the
+engine understands are in `GUARANTEE_ORDER` and `GUARANTEE_MECHANISMS` in `caw.mjs`; those two
+objects are the vocabulary, not this file.
+
+Declaring a `probe` makes the binding unavailable until that probe is green on the machine that
+will run it. **Declare one for any `writeScope` you assert.** A boundary claim with no probe is
+a sentence in a config file.
+
+If your provider has no OS boundary on this host, say so: `writeScope: 'shell-residual-delivery'`
+is the honest value, and the engine will refuse the planning roles with a message naming the
+guarantee rather than the missing helper. That refusal is the adapter working correctly.
+
+## Cost and tokens: unknown is a value
+
+`decodeSuccess` returns accounting alongside the value. A provider that reports no price must
+return **unknown**, never zero. The engine prints a total with any unpriced call as a lower bound
+plus the unpriced count, and never adds different currencies:
+
+```
+at least $0.11, plus 1 unpriced call
+```
+
+A zero written where a number was unavailable is the one failure this design will not tolerate.
+
+## Getting it accepted here
+
+1. `test/adapter-contract.test.mjs` green with your adapter added to its table.
+2. A probe that actually fails when the boundary is absent — demonstrate it, do not assert it.
+3. One real run: `plan` and `build` on a small repository, with the log.
+4. The platforms you measured, named. "Works on Linux" without a version and an architecture is
+   not a measurement.
+
+An adapter for a provider nobody but you can run is still welcome — it just lands documented as
+unexercised, in [limitations.md](limitations.md), which is where honest gaps live here.
