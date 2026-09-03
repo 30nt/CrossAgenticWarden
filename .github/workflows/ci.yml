@@ -1,0 +1,75 @@
+name: CI
+
+# Everything here is free. The live suites (`*-live.test.mjs`) make real, paid provider calls
+# and skip unless CAW_LIVE_CLAUDE / CAW_LIVE_CODEX is set — they are never set here, so a green
+# badge on this workflow means the deterministic contracts hold, and nothing about a provider.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  engine:
+    name: engine (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # Without a boundary helper the suite skips every case that measures one, honestly but
+      # uselessly. bubblewrap needs an unprivileged user namespace, which Ubuntu 24.04 restricts
+      # through AppArmor by default; measured in a default Docker container, the same restriction
+      # turns about forty of these cases red instead of skipping them.
+      - name: outer filesystem boundary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / true && echo "bwrap can create a namespace"
+      - name: syntax
+        run: node --check caw.mjs
+      - name: engine suite
+        run: node --test test/*.test.mjs
+
+  guards:
+    name: guards (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --quiet pytest
+      - name: guard suite
+        run: python -m pytest .caw/hooks -q
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The install model is a vendored copy compared byte for byte against a tag, so a CRLF
+      # line ending or a stray personal path is a defect rather than a style opinion.
+      - name: no CRLF in tracked text
+        run: |
+          if git grep -rIl $'\r' -- . ; then
+            echo "::error::CRLF found in a tracked text file"; exit 1
+          fi
+      # `:(exclude)` keeps this job from matching the pattern it carries itself.
+      - name: no personal or third-party identifiers
+        run: |
+          if git grep -nIiE '/Users/[a-z]|zonotvv|laborpraxis' \
+               -- . ':(exclude).github/workflows/ci.yml' ; then
+            echo "::error::personal identifier in a tracked file"; exit 1
+          fi
