@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-.}\"; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/deny_tasks_edit.py\" || { echo 'CAW edit guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/deny_tasks_edit.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-.}\"; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/deny_tasks_bash.py\" || { echo 'CAW shell guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/deny_tasks_bash.py\""
+          },
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-.}\"; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/require_caw_log.py\" || { echo 'CAW log guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/require_caw_log.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

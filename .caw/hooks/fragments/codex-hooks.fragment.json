@@ -1,0 +1,35 @@
+{
+  "description": "CAW operator guards; merge into the trusted project Codex layer.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"$(git rev-parse --show-toplevel)\" || exit 2; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/deny_tasks_edit.py\" || { echo 'CAW edit guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/deny_tasks_edit.py\"",
+            "commandWindows": "$root = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0 -or -not (Get-Command python3 -ErrorAction SilentlyContinue) -or -not (Test-Path \"$root/.caw/hooks/deny_tasks_edit.py\")) { [Console]::Error.WriteLine('CAW edit guard entry point is unavailable'); exit 2 }; python3 \"$root/.caw/hooks/deny_tasks_edit.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"$(git rev-parse --show-toplevel)\" || exit 2; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/deny_tasks_bash.py\" || { echo 'CAW shell guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/deny_tasks_bash.py\"",
+            "commandWindows": "$root = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0 -or -not (Get-Command python3 -ErrorAction SilentlyContinue) -or -not (Test-Path \"$root/.caw/hooks/deny_tasks_bash.py\")) { [Console]::Error.WriteLine('CAW shell guard entry point is unavailable'); exit 2 }; python3 \"$root/.caw/hooks/deny_tasks_bash.py\""
+          },
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "root=\"$(git rev-parse --show-toplevel)\" || exit 2; command -v python3 >/dev/null 2>&1 && test -f \"$root/.caw/hooks/require_caw_log.py\" || { echo 'CAW log guard entry point is unavailable' >&2; exit 2; }; python3 \"$root/.caw/hooks/require_caw_log.py\"",
+            "commandWindows": "$root = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0 -or -not (Get-Command python3 -ErrorAction SilentlyContinue) -or -not (Test-Path \"$root/.caw/hooks/require_caw_log.py\")) { [Console]::Error.WriteLine('CAW log guard entry point is unavailable'); exit 2 }; python3 \"$root/.caw/hooks/require_caw_log.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
