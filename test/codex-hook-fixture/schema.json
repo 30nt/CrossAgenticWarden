@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "uncaptured_caw": { "type": "string" },
+    "queue_write": { "type": "string" }
+  },
+  "required": ["uncaptured_caw", "queue_write"]
+}

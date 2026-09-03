@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "blocked": {
+      "type": "string",
+      "description": "Must explain a real blocker and must never equal the placeholder word blocked."
+    },
+    "carried": {
+      "type": "array",
+      "description": "Must contain one adjudication for every supplied open id.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "state": { "type": "string", "enum": ["closed", "open", "withdrawn"] },
+          "evidence": { "type": "string" }
+        },
+        "required": ["id", "state", "evidence"]
+      }
+    },
+    "weak": {
+      "type": "array",
+      "description": "Every item must be backed by a mutation actually executed against the code under test.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "where": { "type": "string" },
+          "fix": { "type": "string" },
+          "evidence": { "type": "string" }
+        },
+        "required": ["where", "fix", "evidence"]
+      }
+    }
+  },
+  "required": ["blocked", "carried", "weak"]
+}

@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "inside_write": { "type": "string" },
+    "outside_write": { "type": "string" },
+    "hook_observed": { "type": "boolean" }
+  },
+  "required": ["inside_write", "outside_write", "hook_observed"]
+}

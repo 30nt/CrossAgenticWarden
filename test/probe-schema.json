@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "observed_nonce": { "type": "string" },
+    "repository_read_succeeded": { "type": "boolean" },
+    "note": { "type": "string" }
+  },
+  "required": ["observed_nonce", "repository_read_succeeded", "note"]
+}
