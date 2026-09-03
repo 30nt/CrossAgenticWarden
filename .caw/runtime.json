@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "roles": {
+    "architect": {
+      "provider": "claude",
+      "model": "opus",
+      "reasoning": "high"
+    },
+    "enumerator": {
+      "provider": "claude",
+      "model": "opus",
+      "reasoning": "high"
+    },
+    "plan-reviewer": {
+      "provider": "claude",
+      "model": "opus",
+      "reasoning": "high"
+    },
+    "executor": {
+      "provider": "claude",
+      "model": "sonnet",
+      "reasoning": "high"
+    },
+    "reviewer": {
+      "provider": "claude",
+      "model": "opus",
+      "reasoning": "high"
+    }
+  }
+}
