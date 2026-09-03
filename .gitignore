@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+node_modules/
+.DS_Store
+
+# CAW's own scratch, if this clone is ever used as an install target.
+.caw-logs/
+.caw-tasks/

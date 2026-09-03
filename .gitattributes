@@ -1,0 +1,10 @@
+# An install is a vendored copy compared byte for byte against a tag, so identical content
+# must hash identically on every platform. Without this, a clone checked out with
+# core.autocrlf=true streams CRLF into `git archive` and every copied file reads as stale:
+# measured on one Windows install, where all fourteen blobs differed and all fourteen modes
+# matched. Normalize on commit, check out LF everywhere.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary
