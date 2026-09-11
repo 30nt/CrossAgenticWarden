@@ -227,8 +227,9 @@ function createTransport(schema, authFile) {
 }
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'codex',
+  vendor: 'openai',
   features: {
     schemaTransport: 'file', resultTransport: 'file',
     reportsCost: false, reportsCacheCounters: true, reportsModels: false,

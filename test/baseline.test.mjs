@@ -178,6 +178,8 @@ function fixture({
   indexCmd = '',
   indexFormat = '',
   reviewDependencies = '',
+  planningIndependence = '',
+  taskIndependence = '',
 } = {}) {
   const parent = mkdtempSync(join(tmpdir(), 'caw-baseline-'))
   TEMP_ROOTS.add(parent)
@@ -247,6 +249,8 @@ index_cmd: ${indexCmd}
 index_format: ${indexFormat}
 review_dependency_roots: ${reviewDependencies}
 docs_language: English
+planning_independence: ${planningIndependence}
+task_independence: ${taskIndependence}
 ---
 
 # CAW profile
@@ -1097,6 +1101,11 @@ test('current plan path constructs three Claude calls and persists an approved q
   const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'completed')
   assert.equal(manifest.calls.length, 3)
+  assert.deepEqual(manifest.review_independence.map(({ scope, mode, satisfied }) =>
+    [scope, mode, satisfied]), [
+    ['planning', 'same-provider', true],
+    ['task', 'same-provider', true],
+  ])
   assert.deepEqual(manifest.calls.map(({ status }) => status), ['success', 'success', 'success'])
   assert.deepEqual(manifest.calls.map(({ usage_state }) => usage_state),
     ['reported', 'reported', 'reported'])
@@ -1755,6 +1764,42 @@ test('missing runtime refuses with a complete five-role legacy migration', () =>
   assert.equal(parsed.roles.reviewer.reasoning, 'medium')
 })
 
+test('project review independence is enforced before provider calls', () => {
+  const allowed = fixture({ taskIndependence: 'different-model' })
+  const result = run(allowed, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout,
+    /task independence: different-model — anthropic\/sonnet -> anthropic\/opus/)
+
+  const sameModel = fixture({ taskIndependence: 'different-model' })
+  const runtimePath = join(sameModel.root, '.caw', 'runtime.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.roles.reviewer.model = runtime.roles.executor.model
+  writeFileSync(runtimePath, `${JSON.stringify(runtime, null, 2)}\n`)
+  const refused = run(sameModel, ['plan', 'x'], [])
+  assert.equal(refused.status, 1)
+  assert.match(refused.stderr, /task independence requires different-model/)
+  assert.equal(calls(sameModel).length, 0)
+
+  const crossVendor = fixture({ taskIndependence: 'cross-vendor' })
+  const crossRefused = run(crossVendor, ['plan', 'x'], [])
+  assert.equal(crossRefused.status, 1)
+  assert.match(crossRefused.stderr, /task independence requires cross-vendor/)
+  assert.match(crossRefused.stderr, /anthropic\/sonnet -> anthropic\/opus/)
+  assert.equal(calls(crossVendor).length, 0)
+
+  const human = fixture({ planningIndependence: 'human-review' })
+  const humanRefused = run(human, ['plan', 'x'], [])
+  assert.equal(humanRefused.status, 1)
+  assert.match(humanRefused.stderr, /planning independence requires human-review/)
+  assert.match(humanRefused.stderr, /Automated approval is disabled/)
+  assert.equal(calls(human).length, 0)
+})
+
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [
     ['unknown document field', (v) => { v.fallback = 'claude' }, /unknown field.*fallback/],
@@ -2201,7 +2246,7 @@ test('adapter discovery rejects malformed contracts before execution', () => {
   const legacyResult = run(legacy, ['plan', 'x'], [])
   assert.equal(legacyResult.status, 1)
   assert.match(legacyResult.stderr,
-    /adapter test-claude has malformed contract; API version is 1, expected 2/)
+    /adapter test-claude has malformed contract; API version is 1, expected 3/)
   assert.equal(calls(legacy).length, 0)
 
   const f = fixture()

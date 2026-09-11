@@ -3,7 +3,7 @@
 English only — writing an adapter means reading the contract test and two reference
 implementations, which are in English.
 
-> **The adapter contract is not stable until v1.** `apiVersion` is `2` today and will change.
+> **The adapter contract is not stable until v1.** `apiVersion` is `3` today and will change.
 > Pin the tag you built against.
 
 An adapter is one `.mjs` file at `.caw/adapters/<id>/adapter.mjs`. It teaches the engine how to
@@ -15,15 +15,16 @@ Two references ship in the tree: `.caw/adapters/claude/` and `.caw/adapters/code
 third is at `test/third-adapter/adapter.mjs`, and `test/adapter-contract.test.mjs` is the
 contract itself. Read the test first — it is the specification.
 
-## The twelve required keys
+## The thirteen required keys
 
 Every key is required. Extra keys are a load error, and so is a missing one: the engine refuses
 an adapter it cannot fully account for rather than running a partial one.
 
 ```js
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'my-provider',        // must equal the directory name
+  vendor: 'vendor-name',    // stable owner id used by cross-vendor review policy
   features,                 // transport and reporting capabilities
   resolveExecutable,        // (env) => path, honouring CAW_MY_PROVIDER then PATH
   versionInvocation,        // how to ask the CLI its version
