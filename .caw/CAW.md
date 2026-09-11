@@ -15,13 +15,15 @@ gate_fast_timeout_ms:
 gate_full:
 gate_full_timeout_ms:
 
-# Optional. Prints this project's CLOSED sets — the ones a script can list in full and a
+# Optional. Returns this project's CLOSED sets — the ones a script can list in full and a
 # model can only sample: every member of an enum, every caller, every migration, every
-# numbered section of a spec against the files citing it. Its stdout is handed to the
-# enumerator and to no other role. Leave empty and nothing changes.
+# numbered section of a spec against the files citing it. json-v1 is rendered and handed to
+# the enumerator and to no other role. Leave the command empty and nothing changes.
 # Whatever you write here must be verified against a count taken another way before you
 # trust it: on one project the obvious pattern for "every route" returned 22 of 90.
 index_cmd:
+# New profiles use strict, versioned JSON. Profiles without this field retain legacy text-v0.
+index_format: json-v1
 
 # Comma-separated ignored dependency roots exposed read-only inside task-review surfaces.
 # Every other ignored project path is absent there and denied through its delivery-tree path.

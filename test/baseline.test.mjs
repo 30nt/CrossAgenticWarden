@@ -176,6 +176,7 @@ function fixture({
   gateFull = '',
   gateFullTimeout = '',
   indexCmd = '',
+  indexFormat = '',
   reviewDependencies = '',
 } = {}) {
   const parent = mkdtempSync(join(tmpdir(), 'caw-baseline-'))
@@ -243,6 +244,7 @@ gate_fast_timeout_ms: ${gateFastTimeout}
 gate_full: ${gateFull}
 gate_full_timeout_ms: ${gateFullTimeout}
 index_cmd: ${indexCmd}
+index_format: ${indexFormat}
 review_dependency_roots: ${reviewDependencies}
 docs_language: English
 ---
@@ -3288,6 +3290,83 @@ test('index_cmd over the cap is truncated, and the run says how much was dropped
   const result = indexPlan(f, [{ envelope: envelope(population([])) }])
   assert.match(result.stdout, /index_cmd printed 60050 chars, 50 of them DROPPED \(cap 60000\)/)
   assert.match(result.stdout, /The sets are cut and the enumerator is told so/)
+})
+
+test('json-v1 project index is validated, rendered, and sent only to the enumerator', () => {
+  const marker = 'POST /orders/CLOSED-SET-9d2a'
+  const f = fixture({
+    git: true,
+    indexCmd: 'cat index-fixture.json',
+    indexFormat: 'json-v1',
+  })
+  writeFileSync(join(f.root, 'index-fixture.json'), `${JSON.stringify({
+    api_version: 1,
+    sets: [{
+      id: 'public-routes',
+      label: 'Public routes',
+      source: 'scripts/project-index.mjs',
+      members: ['GET /health', marker],
+    }],
+  })}\n`)
+
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /project index json-v1: 1 set\(s\)/)
+  const seen = calls(f)
+  assert.match(seen.find((call) => call.role === 'enumerator').input,
+    /## \[public-routes\] Public routes/)
+  assert.equal(seen.find((call) => call.role === 'enumerator').input.includes(marker), true)
+  for (const call of seen.filter((entry) => entry.role !== 'enumerator')) {
+    assert.equal(call.input.includes(marker), false)
+  }
+})
+
+test('invalid json-v1 project indexes stop before provider calls', () => {
+  const cases = [
+    ['malformed', '{', /invalid JSON/],
+    ['wrong-version', JSON.stringify({ api_version: 2, sets: [] }), /api_version must be 1/],
+    ['unknown-field', JSON.stringify({ api_version: 1, sets: [], extra: true }), /unknown field/],
+    ['duplicate-member', JSON.stringify({
+      api_version: 1,
+      sets: [{ id: 'routes', label: 'Routes', source: 'indexer', members: ['same', 'same'] }],
+    }), /duplicates an earlier member/],
+  ]
+  for (const [name, body, message] of cases) {
+    const f = fixture({ indexCmd: 'cat index-fixture.json', indexFormat: 'json-v1' })
+    writeFileSync(join(f.root, 'index-fixture.json'), body)
+    const result = indexPlan(f)
+    assert.equal(result.status, 1, `${name}: ${result.stderr || result.stdout}`)
+    assert.match(result.stderr, message, name)
+    assert.match(result.stderr, /No provider call ran/, name)
+    assert.equal(calls(f).length, 0, name)
+  }
+})
+
+test('json-v1 project index command failures are fatal before provider calls', () => {
+  const f = fixture({
+    indexCmd: 'printf index-broke >&2; exit 3',
+    indexFormat: 'json-v1',
+  })
+  const result = indexPlan(f)
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /project index json-v1 exited 3/)
+  assert.match(result.stderr, /index-broke/)
+  assert.equal(calls(f).length, 0)
+})
+
+test('unknown project index formats fail before provider calls', () => {
+  const f = fixture({ indexCmd: 'node -e "0"', indexFormat: 'json-v2' })
+  const result = indexPlan(f)
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /index_format must be text-v0 or json-v1/)
+  assert.equal(calls(f).length, 0)
 })
 
 // `gate_full` had no coverage at all. The three outcomes below are the whole of its interface,
