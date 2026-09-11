@@ -4148,7 +4148,58 @@ function captureWeakMutations(items, surface, baseline) {
   return { accepted, noted }
 }
 
-function replayWeakMutation(item, f, spec, expectedDigest) {
+function runWeakReplaySession(items, operations) {
+  if (!Array.isArray(items)) throw new TypeError('weak replay items must be an array')
+  const required = [
+    'createSurface', 'prepareSurface', 'restoreSurface',
+    'runBaseline', 'runMutation', 'finishSurface',
+  ]
+  for (const name of required) {
+    if (typeof operations?.[name] !== 'function') {
+      throw new TypeError(`weak replay operation ${name} must be a function`)
+    }
+  }
+
+  const surface = operations.createSurface()
+  const outcome = { state: 'error', baseline: null, mutations: [], restores: 0 }
+  let baseline = null
+  try {
+    baseline = operations.prepareSurface(surface)
+    outcome.baseline = operations.runBaseline(surface, baseline)
+    if (outcome.baseline?.state !== 'green') {
+      outcome.state = 'baseline-unavailable'
+      return outcome
+    }
+    for (const [index, item] of items.entries()) {
+      operations.restoreSurface(surface, baseline, index)
+      outcome.restores += 1
+      outcome.mutations.push(operations.runMutation(item, surface, baseline, index))
+    }
+    operations.restoreSurface(surface, baseline, items.length)
+    outcome.restores += 1
+    outcome.state = 'complete'
+    return outcome
+  } catch (error) {
+    outcome.error = error
+    throw error
+  } finally {
+    operations.finishSurface(surface, outcome)
+  }
+}
+
+function restoreWeakReplaySurface(surface, baseline) {
+  surfaceGit(surface.workingRoot, 'reset', '--hard', baseline)
+  surfaceGit(surface.workingRoot, 'clean', '-fd')
+  const head = surfaceGit(surface.workingRoot, 'rev-parse', 'HEAD').trim()
+  const status = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (head !== baseline || status) {
+    throw new WeakMutationInvariantError(
+      `weak replay surface did not restore its baseline${status ? `: ${status}` : ''}`)
+  }
+}
+
+function replayWeakMutation(item, f, spec, expectedDigest, surface) {
   const patch = item?.mutation?.patch
   if (typeof patch !== 'string' || !patch.length) throw new Error('weak mutation patch is missing')
   const bytes = Buffer.byteLength(patch)
@@ -4159,78 +4210,52 @@ function replayWeakMutation(item, f, spec, expectedDigest) {
     throw new WeakMutationInvariantError(
       'delivery tree changed after its green gate; refusing weak replay')
   }
-  const surface = createReviewSurface(f)
-  let succeeded = false
-  try {
-    const paths = weakPatchPaths(surface, patch)
-    execFileSync('git', ['apply', '--check', '--binary', '-'], {
-      cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
-    })
-    execFileSync('git', ['apply', '--binary', '-'], {
-      cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
-    })
-    const result = gate(f.gate_fast, spec, surface.workingRoot)
-    const event = {
-      state: result.status === 75 ? 'unverified-refused'
-        : result.ok ? 'confirmed-weak' : 'mutation-caught',
-      patch_sha256: createHash('sha256').update(patch).digest('hex'),
-      patch_bytes: bytes,
-      paths,
-      gate: f.gate_fast,
-      gate_status: result.status ?? (result.ok ? 0 : null),
-      gate_output: result.out.slice(-8000),
-    }
-    surface.weakGate = {
-      phase: 'mutation', state: event.state, gate: event.gate,
-      status: event.gate_status, output: event.gate_output,
-    }
-    if (result.ok) succeeded = true
-    else retainReviewSurface(surface,
-      result.status === 75 ? 'weak-gate-refused' : 'weak-gate-red',
-      result.status === 75
-        ? 'weak mutation gate refused to run (status 75)'
-        : `weak mutation made the gate red (status ${result.status})`)
-    return event
-  } catch (error) {
-    retainReviewSurface(surface, 'failure', error?.message || String(error))
-    throw error
-  } finally {
-    if (succeeded) removeReviewSurface(surface)
+  const paths = weakPatchPaths(surface, patch)
+  execFileSync('git', ['apply', '--check', '--binary', '-'], {
+    cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  execFileSync('git', ['apply', '--binary', '-'], {
+    cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  const startedAt = Date.now()
+  const result = gate(f.gate_fast, spec, surface.workingRoot)
+  const event = {
+    state: result.status === 75 ? 'unverified-refused'
+      : result.ok ? 'confirmed-weak' : 'mutation-caught',
+    patch_sha256: createHash('sha256').update(patch).digest('hex'),
+    patch_bytes: bytes,
+    paths,
+    gate: f.gate_fast,
+    gate_status: result.status ?? (result.ok ? 0 : null),
+    gate_duration_ms: Date.now() - startedAt,
+    gate_output: result.out.slice(-8000),
   }
+  surface.weakGate = {
+    phase: 'mutation', state: event.state, gate: event.gate,
+    status: event.gate_status, output: event.gate_output,
+  }
+  return event
 }
 
-function weakBaselineGate(f, spec, expectedDigest) {
+function weakBaselineGate(f, spec, expectedDigest, surface) {
   if (deliveryDigest() !== expectedDigest) {
     throw new WeakMutationInvariantError(
       'delivery tree changed after its green gate; refusing weak baseline')
   }
-  const surface = createReviewSurface(f)
-  let remove = false
-  try {
-    const result = gate(f.gate_fast, spec, surface.workingRoot)
-    const observation = {
-      gate: f.gate_fast,
-      gate_status: result.status ?? (result.ok ? 0 : null),
-      gate_output: result.out.slice(-8000),
-    }
-    surface.weakGate = {
-      phase: 'baseline',
-      state: result.status === 75 ? 'refused' : result.ok ? 'green' : 'red',
-      gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
-    }
-    if (result.ok) remove = true
-    else retainReviewSurface(surface,
-      result.status === 75 ? 'weak-baseline-refused' : 'weak-baseline-red',
-      result.status === 75
-        ? 'unmutated weak-verification gate refused to run (status 75)'
-        : `unmutated weak-verification gate was red (status ${result.status})`)
-    return { ...observation, state: surface.weakGate.state }
-  } catch (error) {
-    retainReviewSurface(surface, 'failure', error?.message || String(error))
-    throw error
-  } finally {
-    if (remove) removeReviewSurface(surface)
+  const startedAt = Date.now()
+  const result = gate(f.gate_fast, spec, surface.workingRoot)
+  const observation = {
+    gate: f.gate_fast,
+    gate_status: result.status ?? (result.ok ? 0 : null),
+    gate_duration_ms: Date.now() - startedAt,
+    gate_output: result.out.slice(-8000),
   }
+  surface.weakGate = {
+    phase: 'baseline',
+    state: result.status === 75 ? 'refused' : result.ok ? 'green' : 'red',
+    gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
+  }
+  return { ...observation, state: surface.weakGate.state }
 }
 
 function verifyWeakMutations(items, f, spec, expectedDigest) {
@@ -4243,12 +4268,65 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
   const events = []
   const noted = []
   if (!(items || []).length) return { accepted, events, noted, verification: null }
-  const baseline = weakBaselineGate(f, spec, expectedDigest)
+  say(`  weak verification: one reusable replay surface, ${(items || []).length}` +
+    ` independent mutation gate(s)`)
+  const session = runWeakReplaySession(items, {
+    createSurface: () => createReviewSurface(f),
+    prepareSurface: (surface) => prepareWeakCapture(surface),
+    restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
+    runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
+    runMutation: (item, surface) => {
+      try {
+        return { event: replayWeakMutation(item, f, spec, expectedDigest, surface) }
+      } catch (error) {
+        if (error instanceof WeakMutationSecurityError ||
+            error instanceof WeakMutationInvariantError) throw error
+        const detail = (error?.stderr?.toString() || error?.message || String(error))
+          .trim().split('\n').filter(Boolean).pop() || 'replay unavailable'
+        return { error: detail }
+      }
+    },
+    finishSurface: (surface, outcome) => {
+      if (outcome.state === 'baseline-unavailable') {
+        const baseline = outcome.baseline || {}
+        retainReviewSurface(surface,
+          baseline.state === 'refused' ? 'weak-baseline-refused' : 'weak-baseline-red',
+          baseline.state === 'refused'
+            ? 'unmutated weak-verification gate refused to run (status 75)'
+            : `unmutated weak-verification gate was red (status ${baseline.gate_status})`)
+      } else if (outcome.state === 'error') {
+        retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
+      } else {
+        const refused = outcome.mutations.find((result) =>
+          result?.event?.state === 'unverified-refused')
+        const caught = outcome.mutations.find((result) =>
+          result?.event?.state === 'mutation-caught')
+        const failed = outcome.mutations.find((result) => result?.error)
+        if (refused) {
+          retainReviewSurface(surface, 'weak-gate-refused',
+            'weak mutation gate refused to run (status 75)')
+        } else if (caught) {
+          retainReviewSurface(surface, 'weak-gate-red',
+            `weak mutation made the gate red (status ${caught.event.gate_status})`)
+        } else if (failed) {
+          retainReviewSurface(surface, 'weak-replay-partial', failed.error)
+        } else {
+          removeReviewSurface(surface)
+        }
+      }
+    },
+  })
+  const baseline = session.baseline
   const verification = {
     state: baseline.state === 'green' ? 'baseline-green'
       : baseline.state === 'refused' ? 'unverified-baseline-refused' : 'unverified-baseline-red',
     baseline,
     mutations: [],
+    replay_surface: {
+      strategy: 'single-reusable-surface',
+      surfaces_created: 1,
+      restores: session.restores,
+    },
   }
   if (baseline.state !== 'green') {
     say(`  weak verification ${baseline.state === 'refused' ? 'DID NOT RUN' : 'unavailable'}:` +
@@ -4266,9 +4344,10 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     }
     return { accepted, events, noted, verification }
   }
-  for (const item of items || []) {
-    try {
-      const event = replayWeakMutation(item, f, spec, expectedDigest)
+  for (const [index, item] of (items || []).entries()) {
+    const result = session.mutations[index]
+    if (result?.event) {
+      const event = result.event
       verification.mutations.push(event)
       if (event.state === 'confirmed-weak') {
         events.push(event)
@@ -4281,12 +4360,8 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
         noted.push(weakDowngrade(item,
           `weak mutation made the gate red (status ${event.gate_status}); finding refused`))
       }
-    } catch (error) {
-      if (error instanceof WeakMutationSecurityError ||
-          error instanceof WeakMutationInvariantError) throw error
-      const detail = (error?.stderr?.toString() || error?.message || String(error))
-        .trim().split('\n').filter(Boolean).pop() || 'replay unavailable'
-      noted.push(weakDowngrade(item, detail))
+    } else {
+      noted.push(weakDowngrade(item, result?.error || 'replay unavailable'))
     }
   }
   return { accepted, events, noted, verification }
@@ -5618,5 +5693,6 @@ export {
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
   normalizeAccounting, reviewCriteriaIssue,
   populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
-  removeTree, retainWeakVerificationEvents, zeroAccounting,
+  removeTree, restoreWeakReplaySurface, retainWeakVerificationEvents, runWeakReplaySession,
+  zeroAccounting,
 }
