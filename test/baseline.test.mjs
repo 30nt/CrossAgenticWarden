@@ -315,6 +315,14 @@ function configureProjectPolicies(f, source, stages = ['planning', 'review', 'ga
   execFileSync('git', ['commit', '-q', '-m', 'configure project policies'], { cwd: f.root })
 }
 
+function configureProfileFields(f, fields) {
+  const path = join(f.root, '.caw', 'CAW.md')
+  const lines = Object.entries(fields).map(([key, value]) => `${key}: ${value}`).join('\n')
+  const text = readFileSync(path, 'utf8').replace('\n---\n\n# CAW profile',
+    `\n${lines}\n---\n\n# CAW profile`)
+  writeFileSync(path, text)
+}
+
 const projectPolicySource = `
 let text = ''
 process.stdin.setEncoding('utf8')
@@ -1186,6 +1194,11 @@ test('current plan path constructs three Claude calls and persists an approved q
   const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'completed')
   assert.equal(manifest.calls.length, 3)
+  assert.deepEqual(manifest.stages.map(({ kind, name, state }) => [kind, name, state]), [
+    ['provider', 'enumerator', 'success'],
+    ['provider', 'architect', 'success'],
+    ['provider', 'plan-reviewer', 'success'],
+  ])
   assert.deepEqual(manifest.review_independence.map(({ scope, mode, satisfied }) =>
     [scope, mode, satisfied]), [
     ['planning', 'same-provider', true],
@@ -1225,6 +1238,72 @@ test('current plan path constructs three Claude calls and persists an approved q
   const purged = run(f, ['artifacts', 'purge', runNames[0]], [])
   assert.equal(purged.status, 0)
   assert.equal(existsSync(runPath), false)
+})
+
+test('request, planning and role budgets stop before the next provider process', () => {
+  const cases = [
+    ['budget_request_calls', 2, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(planReview()) },
+    ], 2],
+    ['budget_planning_calls', 2, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(planReview()) },
+    ], 2],
+    ['budget_architect_calls', 1, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope({ ...planReview(), uncovered: ['one more case'] }) },
+      { envelope: envelope(plan()) },
+    ], 3],
+  ]
+  for (const [field, limit, responses, expectedCalls] of cases) {
+    const f = fixture()
+    configureProfileFields(f, { [field]: limit })
+    const result = run(f, ['plan', 'Create the fixture output'], responses)
+    assert.equal(result.status, 1, `${field}: ${result.stderr || result.stdout}`)
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.match(output, new RegExp(`${field} reached`))
+    assert.match(output, /no (?:plan-reviewer|architect) provider call was started/)
+    assert.equal(calls(f).length, expectedCalls, field)
+  }
+})
+
+test('task budget preserves delivery and stops before reviewer', () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { budget_task_calls: 1 })
+  execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure task budget'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_budget.md'), 'title: Budgeted task\n')
+  const result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'delivery.txt': 'kept\n' }, envelope: envelope(delivery('kept delivery')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /budget_task_calls reached \(1\/1\)/)
+  assert.match(result.stderr, /no reviewer provider call was started/)
+  assert.equal(calls(f).length, 1)
+  assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'kept\n')
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_budget.md.json')), true)
+})
+
+test('unknown-cost budget uses observed completed calls and keeps unknown distinct from estimated', () => {
+  const f = fixture()
+  configureProfileFields(f, { budget_unknown_cost_calls: 1 })
+  const result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: { structured_output: population() } },
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /budget_unknown_cost_calls reached \(1\/1\)/)
+  assert.equal(calls(f).length, 1)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls[0].usage_state, 'unknown')
+  assert.equal(manifest.provider_budgets.consumed.unknown_cost_calls, 1)
 })
 
 test('population cache reuses exact inputs and misses after canonical authority changes', () => {
@@ -3045,11 +3124,14 @@ test('fake provider can expose malformed output and structured failures without 
   assert.equal(manifest.calls.length, 1)
   assert.equal(manifest.calls[0].status, 'failure')
   assert.equal(manifest.calls[0].failure_kind, 'nonzero-exit')
-  assert.equal(manifest.calls[0].usage_state, 'unknown')
+  assert.equal(manifest.calls[0].usage_state, 'estimated')
   assert.equal(existsSync(join(runPath, manifest.calls[0].attempt_file)), true)
   const failure = JSON.parse(readFileSync(join(runPath, manifest.calls[0].file), 'utf8'))
   assert.equal(failure.attempt_id, manifest.calls[0].attempt_id)
   assert.equal(failure.exit_status, 1)
+  assert.equal(failure.usage_estimate.method, 'utf8-bytes-div-4')
+  assert.equal(manifest.stages[0].name, 'enumerator')
+  assert.equal(manifest.stages[0].state, 'failure')
 })
 
 test('engine structural validation rejects missing, mistyped, and unknown canonical fields', () => {
@@ -4144,7 +4226,7 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
     join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.equal(runManifest.calls.length, 1)
   assert.equal(runManifest.calls[0].status, 'interrupted')
-  assert.equal(runManifest.calls[0].usage_state, 'unknown')
+  assert.equal(runManifest.calls[0].usage_state, 'estimated')
   assert.equal(existsSync(join(f.root, '.caw-logs', runName,
     runManifest.calls[0].attempt_file)), true)
 })
@@ -4176,7 +4258,7 @@ test('current timeout override refuses invalid input and kills an over-cap child
   assert.equal(manifest.calls.length, 1)
   assert.equal(manifest.calls[0].status, 'failure')
   assert.equal(manifest.calls[0].failure_kind, 'timeout')
-  assert.equal(manifest.calls[0].usage_state, 'unknown')
+  assert.equal(manifest.calls[0].usage_state, 'estimated')
 })
 
 test('current timeout override is one per-child value across every role in a command', () => {

@@ -135,9 +135,9 @@ spend.
 
 Each provider call creates an immutable `attempt-*.json` before the child process starts. The run
 manifest links that attempt to its success, failure, timeout, interrupted state, diagnostics, and
-duration through one `attempt_id`. Usage is labelled `reported`, `partial`, or `unknown`; unknown
-is never written as zero. `estimated` is reserved for a future explicitly sourced estimator and
-is not emitted by the current adapters. Before old run records are pruned or explicitly purged,
+duration through one `attempt_id`. Usage is labelled `reported`, `estimated`, `partial`, or
+`unknown`; unknown is never written as zero. A failed call receives only a clearly sourced
+byte-based input estimate, never invented reported usage. Before old run records are pruned or explicitly purged,
 CAW appends payload-free counters and durations to Git's private `caw/metrics/runs.jsonl`.
 
 ## Before you point this at a real repository
