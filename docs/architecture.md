@@ -57,6 +57,10 @@ derives approval from whether anything blocking is open. From round 2 it is hand
 items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An id it
 omits stays open.
 
+The derived result is retained as a [certification record](certification.md). Acceptance and full
+certification are separate states: missing independent population or unavailable verification is
+visible as `limited`, never silently called `approved`.
+
 ## Roles bind to adapters, and bindings are proved
 
 `.caw/runtime.json` binds each role to a provider, model and reasoning level. That declaration is

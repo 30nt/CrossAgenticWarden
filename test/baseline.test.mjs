@@ -1090,6 +1090,8 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), true)
   const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
   assert.match(planText, /approved: true/)
+  assert.match(planText, /population_state: none/)
+  assert.match(planText, /population_digest: [0-9a-f]{64}/)
   assert.match(planText, /## Runtime provenance/)
   assert.match(planText, /"role": "enumerator"/)
   assert.match(planText, /"role": "architect"/)
@@ -2416,7 +2418,7 @@ title: Baseline task
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), false)
   assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'final\n')
   assert.match(execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' }),
-    /Review: approved, round 3/)
+    /Review: accepted with LIMITED certification, round 3/)
   assert.match(second.stdout, /at least \$1\.00, plus 1 unpriced Other call on this task/)
 
   const seen = calls(f)
@@ -2687,12 +2689,58 @@ title: Core title
     cwd: f.root, encoding: 'utf8',
   })
   assert.match(message, /^project: delivered safely\n/)
+  assert.match(message, /Review: accepted with LIMITED certification, round 1/)
   assert.match(message, /--- spec \(001_policy-review\.md\), verbatim/)
   assert.match(message, /"project:review-policy:privacy":true/)
   assert.match(message, /"trace the project privacy boundary":true/)
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.deepEqual(manifest.policy_calls.map(({ stage }) => stage), ['gate', 'review', 'commit'])
+  assert.equal(manifest.certifications[0].state, 'limited')
+  assert.deepEqual(manifest.certifications[0].limitations,
+    ['population-unknown', 'author-runtime-unobserved'])
+})
+
+test('a planned task retains an approved certification with population and criterion ledger',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, taskIndependence: 'different-model' })
+  let result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource('Create the fixture output'),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+      { id: 'done-when-1', state: 'met', evidence: 'ran the fixture gate' },
+    ] })) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const runNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  const runPath = join(f.root, '.caw-logs', runNames.at(-1))
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.certifications.length, 1)
+  assert.equal(manifest.certifications[0].state, 'approved')
+  const certification = JSON.parse(readFileSync(
+    join(runPath, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.population.state, 'sample')
+  assert.equal(certification.population.retained, 1)
+  assert.equal(certification.author.role, 'executor')
+  assert.equal(certification.reviewer.provider, 'test-claude')
+  assert.equal(certification.independence.mode, 'different-model')
+  assert.deepEqual(certification.criteria.map(({ id }) => id),
+    ['must-cover-1', 'done-when-1'])
+  assert.match(certification.review_surface.baseline_commit, /^[0-9a-f]{40}$/)
+  assert.match(execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  }), /Review: approved, round 1/)
 })
 
 test('project gate policy can stop a green core gate before reviewer', () => {

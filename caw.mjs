@@ -1627,6 +1627,7 @@ const PROJECT_POLICY_TIMEOUT_DEFAULT_MS = 5000
 const PROJECT_POLICY_TIMEOUT_MAX_MS = 60000
 const PROJECT_POLICY_SCRATCH_PARENT = join(tmpdir(), 'caw-project-policies')
 let projectPolicySet = null
+let activePopulationCertification = null
 let runRecord = null
 
 function writeRunManifest(status) {
@@ -1642,6 +1643,7 @@ function writeRunManifest(status) {
     timeout_ms: AGENT_TIMEOUT_MS,
     calls: runRecord.calls,
     diagnostics: runRecord.diagnostics,
+    certifications: runRecord.certifications || [],
     ...(projectPolicySet?.manifestDigest ? {
       project_policies: {
         api_version: projectPolicySet.apiVersion,
@@ -1912,6 +1914,51 @@ function recordWeakVerification(task, round, verification, status = 'active') {
   }))]
   run.weakVerification = retainWeakVerificationEvents(run.weakVerification, events)
   writeRunManifest(status)
+}
+
+function recordTaskCertification({ task, round, criteria, open, author, reviewer, reviewSurface,
+  reviewBaseline, weakVerification }) {
+  const run = beginRunRecord()
+  const population = activePopulationCertification || {
+    state: 'unknown', source: 'no-plan-population-record', digest: null,
+  }
+  const limitations = []
+  if (population.state !== 'sample') limitations.push(`population-${population.state}`)
+  if (!author) limitations.push('author-runtime-unobserved')
+  if (weakVerification?.state?.startsWith('unverified')) {
+    limitations.push(weakVerification.state)
+  }
+  const state = open.length ? 'rejected' : limitations.length ? 'limited' : 'approved'
+  const body = {
+    version: 1,
+    task,
+    round,
+    state,
+    limitations,
+    created_at: new Date().toISOString(),
+    delivery_digest: deliveryDigest(),
+    independence: resolvedRuntime.independence?.find((entry) => entry.scope === 'task') || null,
+    author: author || { kind: 'human-or-prior-unobserved' },
+    reviewer,
+    population,
+    criteria,
+    open_item_ids: open.map((item) => item.id),
+    review_surface: {
+      surface_id: reviewSurface?.id || null,
+      baseline_commit: reviewBaseline || null,
+    },
+    weak_verification: weakVerification,
+    project_policies: projectPolicySnapshot(),
+  }
+  const name = `certification-${taskArtifactBase(task)}-round-${round}.json`
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
+  run.certifications ||= []
+  run.certifications.push({
+    file: name, task, round, state, limitations, bytes: bytes.length,
+  })
+  writeRunManifest(state === 'rejected' ? 'failed' : 'active')
+  return body
 }
 
 // `.caw-tasks/` holds three kinds of file and only one of them is work to run. `PLAN.md` is
@@ -3879,9 +3926,62 @@ const changedFiles = () =>
 // The coverage mapping survives here and nowhere else. `writeSpecs` scatters it into per-spec
 // `## Must cover` blocks, so each task knows its own cases and the claim about the population
 // as a whole is lost the moment planning ends.
+function populationPlanRecord(population) {
+  const summary = populationResolution.get(population) || {
+    state: 'unknown', returned: 0, repaired: 0, dropped: 0, retained: 0,
+    witnessWithdrawn: false,
+  }
+  return {
+    state: summary.state,
+    returned: summary.returned,
+    repaired: summary.repaired,
+    dropped: summary.dropped,
+    retained: summary.retained,
+    witness_withdrawn: summary.witnessWithdrawn,
+    digest: createHash('sha256').update(stableJson(population || [])).digest('hex'),
+  }
+}
+
+function readPlanPopulationRecord(text) {
+  const field = (name) => text.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim()
+  const state = field('population_state')
+  const integer = (name) => {
+    const value = Number(field(name))
+    return Number.isSafeInteger(value) && value >= 0 ? value : null
+  }
+  const digest = field('population_digest')
+  if (!['sample', 'none'].includes(state) || !/^[0-9a-f]{64}$/.test(digest || '')) {
+    return { state: 'unknown', source: 'plan-artifact-missing-or-invalid', digest: null }
+  }
+  const record = {
+    state,
+    returned: integer('population_returned'),
+    repaired: integer('population_repaired'),
+    dropped: integer('population_dropped'),
+    retained: integer('population_retained'),
+    witness_withdrawn: field('population_witness_withdrawn') === 'true',
+    digest,
+    source: 'plan-artifact',
+  }
+  if (Object.values(record).some((value) => value === null)) {
+    return { state: 'unknown', source: 'plan-artifact-missing-or-invalid', digest: null }
+  }
+  return record
+}
+
 function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = []) {
+  const populationRecord = populationPlanRecord(population)
   writeFileSync(PLAN, [
-    '---', `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`, '---', '',
+    '---',
+    `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`,
+    `population_state: ${populationRecord.state}`,
+    `population_returned: ${populationRecord.returned}`,
+    `population_repaired: ${populationRecord.repaired}`,
+    `population_dropped: ${populationRecord.dropped}`,
+    `population_retained: ${populationRecord.retained}`,
+    `population_witness_withdrawn: ${populationRecord.witness_withdrawn}`,
+    `population_digest: ${populationRecord.digest}`,
+    '---', '',
     '# Plan', '',
     'Written by `caw.mjs`, not by an agent. The specs in `.caw-tasks/` are the source of truth for',
     'what gets built; this file is the reasoning that produced them and is safe to delete.', '',
@@ -4384,6 +4484,7 @@ function writeSpecs(tasks, coverage) {
 function build(noFull) {
   const { f, text } = profile()
   noticeNotesLog()
+  activePopulationCertification = { state: 'unknown', source: 'no-plan-artifact', digest: null }
   // The flag outlives the terminal that printed the holes, which is the whole point of it
   // being on disk. Flipped by `review-specs` when it comes back clean — the one thing in this
   // tool whose job is judging a spec against the request — or by hand, which is an explicit
@@ -4391,6 +4492,7 @@ function build(noFull) {
   // gate here, which is right: there was never a plan to approve.
   if (existsSync(PLAN)) {
     const plan = readFileSync(PLAN, 'utf8')
+    activePopulationCertification = readPlanPopulationRecord(plan)
     if (/^approved:\s*false\s*$/m.test(plan)) {
       // Two states, one flag, and they are not the same event. A plan that was never approved
       // carries what stopped it. A plan whose approval was WITHDRAWN carries nothing — withdrawal
@@ -5499,10 +5601,23 @@ function runTask(file, f, profileText, opts = {}) {
     // anything is printed about it.
     saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
       weakVerification)
+    const authorRuntime = [...runtimeHistory].reverse().find((entry) => entry.role === 'executor') || null
+    const certification = recordTaskCertification({
+      task: file,
+      round,
+      criteria: rv.criteria,
+      open: nowOpen,
+      author: authorRuntime,
+      reviewer: reviewerRuntime,
+      reviewSurface,
+      reviewBaseline: weakBaseline,
+      weakVerification,
+    })
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
     if (!nowOpen.length) {
-      return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline)
+      return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline,
+        certification)
     }
 
     // Two ways to reach the human and they ask different questions. The budget says "this has
@@ -5598,6 +5713,9 @@ function stop(file, spec, ex, history, round, how, noted, why,
 // terminal being closed, which a keystroke does not.
 function resumeTask(cmd, arg) {
   const { f, text } = profile()
+  activePopulationCertification = existsSync(PLAN)
+    ? readPlanPopulationRecord(readFileSync(PLAN, 'utf8'))
+    : { state: 'unknown', source: 'no-plan-artifact', digest: null }
   if (!arg) die(`${cmd} needs a spec filename, e.g.: caw.mjs ${cmd} 001_registry-and-scan.md`)
   const name = arg.replace(/^(\.\/)?tasks\//, '')
   if (!specFiles().includes(name)) {
@@ -5662,7 +5780,8 @@ function resumeTask(cmd, arg) {
 // The third is the one worth having. Before it, the only way out of a task the loop could not
 // approve was `done`, which removes a spec from the queue with no judgement of the work at all
 // — so the tasks most likely to need a review were exactly the ones guaranteed not to get one.
-function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [], reviewedDigest = null) {
+function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [],
+  reviewedDigest = null, certification = null) {
   // .caw-tasks/ must never enter a commit, and it takes both lines because each has a hole.
   // `git add -A` already skips ignored files, so the .gitignore line the README asks for
   // does the job; the reset covers a project that has not added it. An explicit
@@ -5723,7 +5842,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
       + ' pipeline and approved by `review`.', '',
     `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.` +
       ` Not run: ${f.gate_full || '(none configured)'}.`,
-    `Review: approved, round ${round}${
+    `Review: ${certification?.state === 'limited' ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${
       how === 'hand' ? " — approved by `review`: no executor ran in the approving round, so the"
                        + ' code above it was written by a hand or by an earlier round this'
                        + ' pipeline did not get to judge'

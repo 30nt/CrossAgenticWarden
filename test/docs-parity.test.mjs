@@ -20,6 +20,7 @@ const PAIRS = [
   ['docs/architecture.md', 'docs/architecture.ru.md'],
   ['docs/limitations.md', 'docs/limitations.ru.md'],
   ['docs/project-policies.md', 'docs/project-policies.ru.md'],
+  ['docs/certification.md', 'docs/certification.ru.md'],
   ['CONTRIBUTING.md', 'docs/contributing.ru.md'],
 ]
 
