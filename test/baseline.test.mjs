@@ -372,6 +372,16 @@ if (request.stage === 'planning' && request.context.phase === 'request') {
 process.stdout.write(JSON.stringify(output))
 `
 
+const flakyGatePolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+process.stdout.write(JSON.stringify(request.context.state === 'red'
+  ? { action: 'retry', classification: 'flaky', reason: 'allowlisted intermittent fixture' }
+  : { action: 'continue', reason: '' }))
+`
+
 function run(f, args, responses, extraEnv = {}) {
   writeFileSync(f.queue, `${JSON.stringify(responses, null, 2)}\n`)
   const env = {
@@ -1304,6 +1314,71 @@ test('project planning policy can stop or add instructions before provider calls
   assert.match(manifest.project_policies.manifest_digest, /^[0-9a-f]{64}$/)
   assert.deepEqual(manifest.policy_calls.map(({ stage, status }) => [stage, status]),
     [['planning', 'success']])
+})
+
+test('a v2 gate policy can retry a confirmed allowlisted flaky failure without an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateCount = join(tmpdir(), `caw-flaky-gate-${process.pid}-${Date.now()}.txt`)
+  TEMP_ROOTS.add(gateCount)
+  const gateFast = `node -e "const fs=require('fs');const p=process.env.CAW_GATE_COUNT;` +
+    `const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;` +
+    `fs.writeFileSync(p,String(n+1));process.exit(n<2?1:0)"`
+  const f = fixture({ git: true, gateFast })
+  configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_flaky.md'), `---
+title: Flaky gate
+---
+
+## Change
+
+- Write the fixture output.
+
+## Done when
+
+- The fixture output exists.
+`)
+  const criteria = [
+    { id: 'change-1', state: 'met', evidence: 'traced the fixture output' },
+    { id: 'done-when-1', state: 'met', evidence: 'ran the fixture gate' },
+  ]
+
+  const result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria })) },
+  ], { CAW_GATE_COUNT: gateCount })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /classified the confirmed failure as flaky — retry 1\/2/)
+  assert.equal(readFileSync(gateCount, 'utf8'), '3')
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor'])
+  const runName = readdirSync(join(f.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.policy_calls.filter(({ stage }) => stage === 'gate')
+    .map(({ decision }) => [decision.action, decision.classification]), [
+    ['retry', 'flaky'], ['retry', 'flaky'], ['continue', null],
+  ])
+})
+
+test('project flaky retries are engine-bounded when the gate stays red', () => {
+  const gateCount = join(tmpdir(), `caw-flaky-cap-${process.pid}-${Date.now()}.txt`)
+  TEMP_ROOTS.add(gateCount)
+  const gateFast = `node -e "const fs=require('fs');const p=process.env.CAW_GATE_COUNT;` +
+    `const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;` +
+    `fs.writeFileSync(p,String(n+1));process.exit(1)"`
+  const f = fixture({ git: true, gateFast })
+  configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_flaky.md'), 'title: Flaky gate\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', '001_flaky.md'], [], { CAW_GATE_COUNT: gateCount })
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /project flaky retry cap reached \(2\)/)
+  assert.match(`${result.stdout}\n${result.stderr}`, /review baseline stayed red/)
+  assert.equal(readFileSync(gateCount, 'utf8'), '4')
+  assert.equal(calls(f).length, 0)
 })
 
 test('v2 risk policy attests a complete population and requires full-gate baselines',

@@ -1639,6 +1639,18 @@ const PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA = closeSchema({
   required: ['issues', 'instructions', 'attestation'],
 })
 
+const PROJECT_POLICY_V2_GATE_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['continue', 'stop', 'retry'] },
+    reason: { type: 'string' },
+    classification: {
+      type: 'string', enum: ['defect', 'flaky', 'infrastructure', 'unknown'],
+    },
+  },
+  required: ['action', 'reason'],
+})
+
 // ---------------------------------------------------------------- infrastructure
 
 // A run that dies has no commit to carry its notes, so they go to a file as well as the
@@ -1686,6 +1698,7 @@ const PROJECT_POLICY_INPUT_MAX = 1024 * 1024
 const PROJECT_POLICY_FILES_MAX = 2 * 1024 * 1024
 const PROJECT_POLICY_TIMEOUT_DEFAULT_MS = 5000
 const PROJECT_POLICY_TIMEOUT_MAX_MS = 60000
+const PROJECT_GATE_RETRIES_MAX = 2
 const PROJECT_POLICY_SCRATCH_PARENT = join(tmpdir(), 'caw-project-policies')
 const POPULATION_CACHE_VERSION = 1
 const POPULATION_CACHE_MAX = 20
@@ -3030,6 +3043,7 @@ function projectPolicyOutputSchema(stage, apiVersion, context) {
       ? PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA
       : PROJECT_POLICY_V2_PLANNING_REQUEST_SCHEMA
   }
+  if (apiVersion === 2 && stage === 'gate') return PROJECT_POLICY_V2_GATE_SCHEMA
   return PROJECT_POLICY_OUTPUT_SCHEMAS[stage]
 }
 
@@ -3068,6 +3082,14 @@ function validateProjectPolicyOutput(stage, policy, output, apiVersion = 1, cont
       throw new Error('project planning policy must evidence a complete population attestation')
     }
   }
+  if (stage === 'gate' && apiVersion === 2 && output.action === 'retry') {
+    if (context?.state !== 'red' || !context?.task) {
+      throw new Error('project gate policy may retry only a red fast task gate')
+    }
+    if (output.classification !== 'flaky' || !output.reason.trim()) {
+      throw new Error('project gate policy retry requires flaky classification and a reason')
+    }
+  }
   if (stage === 'review') {
     const ids = output.criteria.map((row) => row.id)
     if (ids.some((id) => !/^[a-z][a-z0-9.-]{0,63}$/.test(id))) {
@@ -3088,13 +3110,21 @@ function validateProjectPolicyOutput(stage, policy, output, apiVersion = 1, cont
   }
 }
 
-function recordProjectPolicyCall(policy, stage, startedAt, status, context = {}, apiVersion = 1) {
+function recordProjectPolicyCall(policy, stage, startedAt, status, context = {}, apiVersion = 1,
+  output = null) {
   const run = beginRunRecord()
   run.policyCalls ||= []
   run.policyCalls.push({
     stage, id: policy.id, digest: policy.digest,
     api_version: apiVersion,
     ...(stage === 'planning' && context.phase ? { phase: context.phase } : {}),
+    ...(stage === 'gate' && output ? {
+      decision: {
+        action: output.action,
+        classification: output.classification || null,
+        reason: output.reason,
+      },
+    } : {}),
     duration_ms: Date.now() - startedAt, status,
   })
   writeRunManifest(status === 'success' ? 'active' : 'failed')
@@ -3114,6 +3144,7 @@ function runProjectPolicy(stage, context, { record = true, set = projectPolicySe
   const startedAt = Date.now()
   const before = projectPolicyStateDigest(set.root)
   let callStatus = 'failure'
+  let policyOutput = null
   try {
     const pathValue = process.env.PATH || process.env.Path || ''
     const env = {
@@ -3149,10 +3180,13 @@ function runProjectPolicy(stage, context, { record = true, set = projectPolicySe
     try { output = JSON.parse(result.stdout) }
     catch (error) { throw new Error(`project ${stage} policy returned invalid JSON: ${error.message}`) }
     validateProjectPolicyOutput(stage, policy, output, set.apiVersion || 1, context)
+    policyOutput = output
     callStatus = 'success'
     return { output, policy }
   } finally {
-    if (record) recordProjectPolicyCall(policy, stage, startedAt, callStatus, context, apiVersion)
+    if (record) {
+      recordProjectPolicyCall(policy, stage, startedAt, callStatus, context, apiVersion, policyOutput)
+    }
     removeTree(scratch)
   }
 }
@@ -6256,6 +6290,7 @@ function runTask(file, f, profileText, opts = {}) {
   let retry = 0 // executor retries bought by a confirmed red gate
   let gateRedAttempts = 0 // all red gate invocations, including confirmation runs
   let confirmationRuns = 0 // provider-free reruns since the last executor delivery
+  let projectGateRetries = 0 // bounded policy retries for a confirmed project-classified flaky gate
   let ex = resume?.ex || null
   let gateFact = null // a red gate's output, which is a fact handed over rather than a finding
   let weakVerification = resume?.weak_verification || null
@@ -6363,6 +6398,7 @@ function runTask(file, f, profileText, opts = {}) {
         weakVerification)
       gateFact = null
       confirmationRuns = 0
+      projectGateRetries = 0
     }
 
     const g = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms)
@@ -6376,6 +6412,7 @@ function runTask(file, f, profileText, opts = {}) {
       timeout_ms: g.timeoutMs,
       executor_retries: retry,
       confirmation_runs: confirmationRuns,
+      project_retry_runs: projectGateRetries,
     })
     if (gatePolicy?.output.action === 'stop') {
       if (g.out) say(g.out)
@@ -6415,6 +6452,18 @@ function runTask(file, f, profileText, opts = {}) {
         skipExecutor = true
         say('  gate red — confirming once without an executor')
         continue
+      }
+      if (gatePolicy?.output.action === 'retry' &&
+          projectGateRetries < PROJECT_GATE_RETRIES_MAX) {
+        projectGateRetries += 1
+        confirmationRuns += 1
+        skipExecutor = true
+        say(`  project gate policy classified the confirmed failure as flaky — retry ` +
+          `${projectGateRetries}/${PROJECT_GATE_RETRIES_MAX} without an executor`)
+        continue
+      }
+      if (gatePolicy?.output.action === 'retry') {
+        say(`  project flaky retry cap reached (${PROJECT_GATE_RETRIES_MAX})`)
       }
       if (action === GateFailureAction.stopReview) {
         say(g.out)

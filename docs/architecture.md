@@ -44,7 +44,8 @@ planning policies classify request risk before enumeration and attest the resolv
 afterwards. A `complete` population is a project-owned claim bound to the exact population digest,
 never an inference from one model draw. A risk class may also require a green `gate_full` on the
 starting commit before any executor runs; the final full gate can then attribute a regression to
-the build range.
+the build range. API v2 gate policies may classify a project-allowlisted flaky failure, while the
+engine retains the confirmation and retry cap.
 
 ## The five roles
 
