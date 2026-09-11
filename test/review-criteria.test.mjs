@@ -70,6 +70,20 @@ test('non-met criteria must bind to their exact blocking item', () => {
   }), /does not quote/)
 })
 
+test('an open carried finding can justify a non-met criterion without duplication', () => {
+  const criterion = criteria[0].criterion
+  const weakRows = [{ ...rows[0], state: 'weak' }, ...rows.slice(1)]
+  const priorOpen = [{ id: 'r4.1', evidence: `Observed earlier. Criterion: ${criterion}` }]
+  assert.equal(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{ id: 'r4.1', state: 'open', evidence: 'still reproduces' }],
+  }, [], priorOpen), null)
+  assert.match(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{ id: 'r4.1', state: 'closed', evidence: 'fixed now' }],
+  }, [], priorOpen), /no weak item/)
+})
+
 test('reviewer schema requires the complete criterion ledger', () => {
   assert.ok(SCHEMA.verdict.required.includes('criteria'))
   assert.deepEqual(SCHEMA.verdict.properties.criteria.items.properties.state.enum,

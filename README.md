@@ -43,6 +43,10 @@ Before those slots, the engine creates an atomic census from every `## Must cove
 and `## Done when` bullet. The reviewer must give every stable id one disposition and evidence;
 missing, duplicate, and unknown ids invalidate the response.
 
+An open carried item can support the same non-met criterion without being filed again. A
+schema-valid but semantically inconsistent review gets one correction call on the unchanged
+review baseline; another inconsistency stops the run.
+
 By default, a primary and one blind challenger pass judge the exact same delivery digest before
 the executor can run again. Their findings are merged conservatively. A challenger-only finding
 is retained as `late-same-baseline`; disagreement about an older finding leaves it open.
