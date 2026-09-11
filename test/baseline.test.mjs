@@ -2456,7 +2456,7 @@ test('legacy numeric round spend migrates to known USD without losing recovery',
   assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), false)
 })
 
-test('review retries a red gate without waking an executor', () => {
+test('review confirms a red gate once without waking an executor', () => {
   const gateFast = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'red\\n');process.exit(1)"`
   const f = fixture({ git: true, gateFast })
   const gateLog = join(f.parent, 'gate-calls.log')
@@ -2468,9 +2468,10 @@ test('review retries a red gate without waking an executor', () => {
   const result = run(f, ['review', spec], [], { CAW_GATE_LOG: gateLog })
 
   assert.equal(result.status, 1)
-  assert.match(`${result.stdout}\n${result.stderr}`, /gate still red after 2 retries/)
+  assert.match(`${result.stdout}\n${result.stderr}`,
+    /review baseline stayed red after one provider-free confirmation/)
   assert.equal(calls(f).length, 0)
-  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 3)
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
   assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
 })
 
@@ -3085,6 +3086,29 @@ const buildOneTask = (f, extraResponses = [], args = ['build']) => {
     ...extraResponses,
   ])
 }
+
+test('build wakes an executor only after the same delivery makes the gate red twice', () => {
+  const gateFast = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');const ok=f.readFileSync('src/output.txt','utf8').includes('fixed');process.exit(ok?0:1)"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'broken\n' }, envelope: envelope(delivery('first try')) },
+    { writeFiles: { 'src/output.txt': 'fixed\n' }, envelope: envelope(delivery('fixed it')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  // The reviewer is intentionally unable to append to the harness log outside its isolated
+  // surface. The two writable calls therefore prove exactly the executor boundary in question.
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 3)
+  assert.match(result.stdout, /gate red — confirming once without an executor/)
+  assert.match(result.stdout, /gate reproducibly red \(executor retry 1\/2\)/)
+  assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
+})
 
 test('a configured gate_full runs once at the end of a build and reports green', () => {
   const f = fixture({ git: true, gateFull: 'node -e "process.exit(0)"' })

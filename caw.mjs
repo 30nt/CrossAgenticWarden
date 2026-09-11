@@ -146,7 +146,37 @@ const MAX_PLAN_ROUNDS = 3
 // that same install — two rounds, $4.88, five substantive items closed and three fresh ones
 // raised, stopped at the cap with the task one hand-edit from done.
 const MAX_TASK_ROUNDS = 4 // rounds a task runs before the run stops and asks the human
-const MAX_GATE_RETRIES = 2 // red-gate attempts, which buy no review and spend no review round
+const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
+
+const GateFailureAction = Object.freeze({
+  confirm: 'confirm',
+  executor: 'executor',
+  stopReview: 'stop-review',
+  stopRetries: 'stop-retries',
+})
+
+function decideGateFailure({
+  reviewOnly,
+  confirmationRuns,
+  executorRetries,
+  maxExecutorRetries,
+}) {
+  for (const [name, value] of Object.entries({
+    confirmationRuns,
+    executorRetries,
+    maxExecutorRetries,
+  })) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new TypeError(`${name} must be a non-negative integer`)
+    }
+  }
+  if (typeof reviewOnly !== 'boolean') throw new TypeError('reviewOnly must be a boolean')
+
+  if (confirmationRuns === 0) return GateFailureAction.confirm
+  if (reviewOnly) return GateFailureAction.stopReview
+  if (executorRetries >= maxExecutorRetries) return GateFailureAction.stopRetries
+  return GateFailureAction.executor
+}
 
 // A hung child used to block a run forever: `spawnSync` was called with no timeout at all.
 // Thirty minutes is roughly three times the longest call ever observed here — measured across
@@ -4172,7 +4202,9 @@ function runTask(file, f, profileText, opts = {}) {
   const history = resume?.history || []
   const startRound = resume?.round || 0
   let round = startRound // review rounds: attempts a reviewer actually judged
-  let retry = 0 // gate retries: attempts that never reached a reviewer
+  let retry = 0 // executor retries bought by a confirmed red gate
+  let gateRedAttempts = 0 // all red gate invocations, including confirmation runs
+  let confirmationRuns = 0 // provider-free reruns since the last executor delivery
   let ex = resume?.ex || null
   let gateFact = null // a red gate's output, which is a fact handed over rather than a finding
   let weakVerification = resume?.weak_verification || null
@@ -4209,8 +4241,8 @@ function runTask(file, f, profileText, opts = {}) {
     }
   }
 
-  // Every pass increments exactly one of the two counters, so this ends after at most
-  // `rounds` + MAX_GATE_RETRIES attempts however the two interleave.
+  // Every delivery gets at most one provider-free confirmation. Only a confirmed red gate
+  // consumes an executor retry; reviewer rounds remain separately bounded.
   // What HEAD was before the executor ran. Only used to tell two silences apart below.
   let headBeforeExecutor = null
   for (;;) {
@@ -4270,10 +4302,12 @@ function runTask(file, f, profileText, opts = {}) {
       saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
         weakVerification)
       gateFact = null
+      confirmationRuns = 0
     }
 
     const g = gate(f.gate_fast, file)
     if (!g.ok) {
+      gateRedAttempts += 1
       // A refusal spends no retry, because no executor round changes why a gate refuses to
       // start. Retrying it would burn the purse and then report "still red after N retries"
       // about a gate that never ran once. Same convention as the full gate above; unlike it,
@@ -4285,17 +4319,36 @@ function runTask(file, f, profileText, opts = {}) {
              `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}`,
              taskAccounting(), runtimeHistory, weakVerification)
       }
-      if (++retry > MAX_GATE_RETRIES) {
+      const action = decideGateFailure({
+        reviewOnly: startAt === 'gate',
+        confirmationRuns,
+        executorRetries: retry,
+        maxExecutorRetries: MAX_GATE_RETRIES,
+      })
+      if (action === GateFailureAction.confirm) {
+        confirmationRuns += 1
+        skipExecutor = true
+        say('  gate red — confirming once without an executor')
+        continue
+      }
+      if (action === GateFailureAction.stopReview) {
         say(g.out)
         stop(file, spec, ex, history, round, how, noted,
-             `${file} — gate still red after ${MAX_GATE_RETRIES} retries. Its output is above.`,
+             `${file} — review baseline stayed red after one provider-free confirmation.` +
+             ` No executor ran; fix or classify the gate failure, then run review again.`,
              taskAccounting(), runtimeHistory, weakVerification)
       }
-      say(`  gate red (retry ${retry}/${MAX_GATE_RETRIES})`)
+      if (action === GateFailureAction.stopRetries) {
+        say(g.out)
+        stop(file, spec, ex, history, round, how, noted,
+             `${file} — gate stayed red after ${MAX_GATE_RETRIES} executor retries.` +
+             ` Its output is above.`,
+             taskAccounting(), runtimeHistory, weakVerification)
+      }
+      retry += 1
+      confirmationRuns = 0
+      say(`  gate reproducibly red (executor retry ${retry}/${MAX_GATE_RETRIES})`)
       gateFact = `The gate \`${f.gate_fast}\` failed. Its output, last 8000 chars:\n\n${g.out}`
-      // `review` judges work already present in the tree. A red gate may be retried, but it must
-      // never hand that work to an executor that the operator did not ask to run.
-      if (how === 'hand') skipExecutor = true
       continue
     }
 
@@ -4418,7 +4471,7 @@ function runTask(file, f, profileText, opts = {}) {
 
     if (!nowOpen.length) {
       clearRoundState(file)
-      return commit(file, spec, ex, f, round, retry, how, noted, deliveryBaseline)
+      return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline)
     }
 
     // Two ways to reach the human and they ask different questions. The budget says "this has
@@ -4577,7 +4630,7 @@ function resumeTask(cmd, arg) {
 // The third is the one worth having. Before it, the only way out of a task the loop could not
 // approve was `done`, which removes a spec from the queue with no judgement of the work at all
 // — so the tasks most likely to need a review were exactly the ones guaranteed not to get one.
-function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewedDigest = null) {
+function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [], reviewedDigest = null) {
   // .caw-tasks/ must never enter a commit, and it takes both lines because each has a hole.
   // `git add -A` already skips ignored files, so the .gitignore line the README asks for
   // does the job; the reset covers a project that has not added it. An explicit
@@ -4627,7 +4680,7 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
     // of one is itself stated rather than filled in.
     ex?.summary || 'No executor round recorded for this task — the tree was finished outside the'
       + ' pipeline and approved by `review`.', '',
-    `Gate: ${f.gate_fast} — green${retry ? ` (red on ${retry} earlier attempt${retry === 1 ? '' : 's'})` : ''}.` +
+    `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.` +
       ` Not run: ${f.gate_full || '(none configured)'}.`,
     `Review: approved, round ${round}${
       how === 'hand' ? " — approved by `review`: no executor ran in the approving round, so the"
@@ -5337,7 +5390,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 export {
-  SCHEMA, addAccounting, deltaAccounting, formatAccounting, normalizeAccounting,
+  GateFailureAction, SCHEMA, addAccounting, decideGateFailure, deltaAccounting,
+  formatAccounting, normalizeAccounting,
   populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
   removeTree, retainWeakVerificationEvents, zeroAccounting,
 }
