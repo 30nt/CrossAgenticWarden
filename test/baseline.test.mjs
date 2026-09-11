@@ -1097,6 +1097,19 @@ test('current plan path constructs three Claude calls and persists an approved q
   const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'completed')
   assert.equal(manifest.calls.length, 3)
+  assert.deepEqual(manifest.calls.map(({ status }) => status), ['success', 'success', 'success'])
+  assert.deepEqual(manifest.calls.map(({ usage_state }) => usage_state),
+    ['reported', 'reported', 'reported'])
+  assert.equal(new Set(manifest.calls.map(({ attempt_id }) => attempt_id)).size, 3)
+  for (const call of manifest.calls) {
+    assert.match(call.attempt_id, /^provider-\d{3}$/)
+    assert.equal(existsSync(join(runPath, call.attempt_file)), true)
+    const attempt = JSON.parse(readFileSync(join(runPath, call.attempt_file), 'utf8'))
+    assert.equal(attempt.attempt_id, call.attempt_id)
+    assert.equal(attempt.status, 'started')
+    assert.equal(attempt.requested.model, 'opus')
+    assert.equal(typeof attempt.requested.native.model, 'string')
+  }
   const callFiles = readdirSync(runPath).filter((name) => name.startsWith('call-'))
   assert.equal(callFiles.length, 3)
   const retained = JSON.parse(readFileSync(join(runPath, callFiles[0]), 'utf8'))
@@ -1285,8 +1298,8 @@ test('Codex executor uses file transport and returns the canonical result throug
 
   const runNames = readdirSync(join(f.root, '.caw-logs')).filter((name) => name.startsWith('run-')).sort()
   const latest = join(f.root, '.caw-logs', runNames.at(-1))
-  const retainedPath = readdirSync(latest).map((name) => join(latest, name)).find((path) =>
-    path.endsWith('-executor.json'))
+  const retainedPath = readdirSync(latest).filter((name) => name.startsWith('call-'))
+    .map((name) => join(latest, name)).find((path) => path.endsWith('-executor.json'))
   const retained = JSON.parse(readFileSync(retainedPath, 'utf8'))
   assert.equal(retained.provider, 'codex')
   assert.deepEqual(retained.requested.native, {
@@ -2439,6 +2452,17 @@ test('fake provider can expose malformed output and structured failures without 
   assert.match(refusal.stderr, /authentication refused/)
   assert.match(refusal.stderr, /terminal_reason: authentication/)
   assert.match(refusal.stderr, /provider stderr/)
+  const runName = readdirSync(join(failed.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runPath = join(failed.root, '.caw-logs', runName)
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.length, 1)
+  assert.equal(manifest.calls[0].status, 'failure')
+  assert.equal(manifest.calls[0].failure_kind, 'nonzero-exit')
+  assert.equal(manifest.calls[0].usage_state, 'unknown')
+  assert.equal(existsSync(join(runPath, manifest.calls[0].attempt_file)), true)
+  const failure = JSON.parse(readFileSync(join(runPath, manifest.calls[0].file), 'utf8'))
+  assert.equal(failure.attempt_id, manifest.calls[0].attempt_id)
+  assert.equal(failure.exit_status, 1)
 })
 
 test('engine structural validation rejects missing, mistyped, and unknown canonical fields', () => {
@@ -2448,6 +2472,17 @@ test('engine structural validation rejects missing, mistyped, and unknown canoni
   ])
   assert.equal(wrongArray.status, 1)
   assert.match(wrongArray.stderr, /invalid canonical output at \$\.cases: expected array/)
+  const mistypedRun = readdirSync(join(mistyped.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const mistypedManifest = JSON.parse(readFileSync(
+    join(mistyped.root, '.caw-logs', mistypedRun, 'manifest.json'), 'utf8'))
+  assert.equal(mistypedManifest.calls[0].status, 'failure')
+  assert.equal(mistypedManifest.calls[0].failure_kind, 'schema-validation')
+  assert.equal(mistypedManifest.calls[0].usage_state, 'reported')
+  const mistypedFailure = JSON.parse(readFileSync(join(
+    mistyped.root, '.caw-logs', mistypedRun, mistypedManifest.calls[0].file), 'utf8'))
+  assert.equal(mistypedFailure.attempt_id, mistypedManifest.calls[0].attempt_id)
+  assert.equal(mistypedFailure.cost.amount, 0.2)
 
   const missing = fixture()
   const missingSource = run(missing, ['plan', 'x'], [
@@ -3163,6 +3198,14 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
   assert.equal(retained.length, 1)
   assert.equal(JSON.parse(readFileSync(
     join(REVIEW_SURFACE_PARENT, retained[0], 'manifest.json'), 'utf8')).state, 'interrupted')
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runManifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(runManifest.calls.length, 1)
+  assert.equal(runManifest.calls[0].status, 'interrupted')
+  assert.equal(runManifest.calls[0].usage_state, 'unknown')
+  assert.equal(existsSync(join(f.root, '.caw-logs', runName,
+    runManifest.calls[0].attempt_file)), true)
 })
 
 test('current timeout override refuses invalid input and kills an over-cap child', () => {
@@ -3186,6 +3229,13 @@ test('current timeout override refuses invalid input and kills an over-cap child
   assert.equal(timedOut.status, 1)
   assert.match(timedOut.stderr, /enumerator did not finish within/)
   assert.match(timedOut.stdout, /agent timeout:/)
+  const runName = readdirSync(join(slow.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(slow.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.length, 1)
+  assert.equal(manifest.calls[0].status, 'failure')
+  assert.equal(manifest.calls[0].failure_kind, 'timeout')
+  assert.equal(manifest.calls[0].usage_state, 'unknown')
 })
 
 test('current timeout override is one per-child value across every role in a command', () => {

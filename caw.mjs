@@ -1643,10 +1643,61 @@ function beginRunRecord() {
   return runRecord
 }
 
-function recordProviderCall(role, provider, result) {
+function beginProviderAttempt(role, provider, binding, invocation) {
   const run = beginRunRecord()
   const index = String(run.calls.length + 1).padStart(3, '0')
+  const attemptId = `provider-${index}`
+  const startedAt = new Date().toISOString()
+  const name = `attempt-${index}-${role}.json`
   const body = {
+    attempt_id: attemptId,
+    status: 'started',
+    started_at: startedAt,
+    role,
+    provider: provider.adapter.id,
+    adapter_digest: provider.adapter.digest,
+    cli_version: provider.cliVersion,
+    runtime_digest: resolvedRuntime.digest,
+    requested: {
+      model: binding.model,
+      reasoning: binding.reasoning,
+      native: invocation.requestedNative || null,
+    },
+  }
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
+  const entry = {
+    attempt_id: attemptId,
+    attempt_file: name,
+    role,
+    provider: provider.adapter.id,
+    status: 'started',
+    usage_state: 'unknown',
+    started_at: startedAt,
+  }
+  run.calls.push(entry)
+  writeRunManifest('active')
+  return { id: attemptId, index, startedAt, startedMs: Date.now(), entry }
+}
+
+function providerUsageState(result) {
+  const tokenValues = Object.values(result.tokens || {})
+  const anyTokens = tokenValues.some((value) => typeof value === 'number')
+  const allTokens = tokenValues.length > 0 && tokenValues.every((value) => typeof value === 'number')
+  if (result.cost !== null && allTokens) return 'reported'
+  if (result.cost !== null || anyTokens) return 'partial'
+  return 'unknown'
+}
+
+function recordProviderCall(role, provider, result, attempt) {
+  const run = beginRunRecord()
+  const index = attempt.index
+  const usageState = providerUsageState(result)
+  const body = {
+    attempt_id: attempt.id,
+    status: 'success',
+    started_at: attempt.startedAt,
+    completed_at: new Date().toISOString(),
     role,
     provider: result.provider,
     adapter_digest: provider.adapter.digest,
@@ -1657,6 +1708,7 @@ function recordProviderCall(role, provider, result) {
     tokens: result.tokens,
     cost: result.cost,
     duration_ms: result.durationMs,
+    usage_state: usageState,
     final_response: result.finalResponse,
   }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
@@ -1665,20 +1717,46 @@ function recordProviderCall(role, provider, result) {
   }
   const name = `call-${index}-${role}.json`
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
-  run.calls.push({ file: name, role, provider: result.provider, bytes: bytes.length, status: 'success' })
+  Object.assign(attempt.entry, {
+    file: name,
+    provider: result.provider,
+    bytes: bytes.length,
+    status: 'success',
+    usage_state: usageState,
+    duration_ms: result.durationMs ?? (Date.now() - attempt.startedMs),
+    completed_at: new Date().toISOString(),
+  })
   writeRunManifest('active')
 }
 
-function recordProviderFailure(role, provider, result) {
+function recordProviderFailure(role, provider, result, attempt, failureKind = 'provider-failure',
+  observed = null) {
   const run = beginRunRecord()
-  const index = String(run.calls.length + 1).padStart(3, '0')
+  const index = attempt.index
   const raw = `${result.stdout || ''}\n${result.stderr || ''}`
+  const usageState = observed ? providerUsageState(observed) : 'unknown'
+  const terminalStatus = failureKind === 'interrupted' ? 'interrupted' : 'failure'
   const body = {
+    attempt_id: attempt.id,
+    status: terminalStatus,
+    failure_kind: failureKind,
+    started_at: attempt.startedAt,
+    completed_at: new Date().toISOString(),
     role,
     provider: provider.adapter.id,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
-    status: result.status,
+    exit_status: result.status,
+    signal: result.signal || null,
+    error_code: result.error?.code || null,
+    usage_state: usageState,
+    ...(observed ? {
+      requested: observed.requested,
+      models: observed.models,
+      tokens: observed.tokens,
+      cost: observed.cost,
+      duration_ms: observed.durationMs,
+    } : {}),
     bytes: Buffer.byteLength(raw),
     sha256: createHash('sha256').update(raw).digest('hex'),
     first: raw.slice(0, 8192),
@@ -1687,7 +1765,40 @@ function recordProviderFailure(role, provider, result) {
   const name = `failure-${index}-${role}.json`
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
-  run.calls.push({ file: name, role, provider: provider.adapter.id, bytes: bytes.length, status: 'failure' })
+  Object.assign(attempt.entry, {
+    file: name,
+    bytes: bytes.length,
+    status: terminalStatus,
+    failure_kind: failureKind,
+    usage_state: usageState,
+    duration_ms: Date.now() - attempt.startedMs,
+    completed_at: new Date().toISOString(),
+  })
+  writeRunManifest('failed')
+}
+
+function markInterruptedProviderAttempts(reason) {
+  if (!runRecord) return
+  const completedAt = new Date().toISOString()
+  for (const call of runRecord.calls) {
+    if (call.status !== 'started') continue
+    Object.assign(call, {
+      status: 'interrupted',
+      failure_kind: reason,
+      usage_state: 'unknown',
+      completed_at: completedAt,
+    })
+  }
+}
+
+function failProviderAttempt(attempt, failureKind) {
+  Object.assign(attempt.entry, {
+    status: 'failure',
+    failure_kind: failureKind,
+    usage_state: 'unknown',
+    duration_ms: Date.now() - attempt.startedMs,
+    completed_at: new Date().toISOString(),
+  })
   writeRunManifest('failed')
 }
 
@@ -2360,7 +2471,10 @@ process.once('exit', (code) => {
     retainReviewSurface(surface, 'interrupted', 'process exited before cleanup')
   }
   if (runRecord) {
-    try { writeRunManifest(code === 0 ? 'completed' : 'failed') } catch { /* preserve exit */ }
+    try {
+      markInterruptedProviderAttempts(code === 0 ? 'process-ended' : 'process-failed')
+      writeRunManifest(code === 0 ? 'completed' : 'failed')
+    } catch { /* preserve exit */ }
   }
 })
 
@@ -2707,9 +2821,8 @@ function projectPolicySnapshot() {
 function validateBlockedValue(role, value) {
   if (!Object.prototype.hasOwnProperty.call(value, 'blocked')) return
   const raw = value.blocked.trim()
-  if (raw && !blocked(raw)) {
-    schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder')
-  }
+  if (raw && !blocked(raw)) throw new Error(
+    `${role} returned invalid canonical output at $.blocked: use the empty string, not a placeholder`)
 }
 
 function validatePlanRelations(out) {
@@ -2882,7 +2995,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     die(`${role} adapter could not construct invocation: ${error?.message || error}`)
   }
 
-  beginRunRecord()
+  const attempt = beginProviderAttempt(role, provider, binding, invocation)
   process.stderr.write(`  · ${role} `)
   // The agent is the only long call in this script — the gates are seconds — so it is the
   // only one worth holding the machine awake for.
@@ -2908,7 +3021,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
   if (r.error?.code === 'ETIMEDOUT') {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'call timed out')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'timeout')
     die(`${role} did not finish within ${formatTimeout(AGENT_TIMEOUT_MS)} and was killed.\n` +
         `  Nothing came back, and whatever it spent is spent. If it was genuinely still working,\n` +
         `  the cap is what is wrong rather than the run: re-run it with a larger\n` +
@@ -2918,13 +3031,15 @@ function agent(role, prompt, schema, f, spec, context = null) {
   if (r.error) {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'call did not start')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'launch-error')
     die(`could not run "${bin}": ${r.error.message}`)
   }
   if (r.status !== 0) {
     discardInvocationTransport(invocation)
-    recordMissingEnumeratorPopulation(role, 'call failed')
-    recordProviderFailure(role, provider, r)
+    const interrupted = Boolean(r.signal) || [130, 143].includes(r.status)
+    recordMissingEnumeratorPopulation(role, interrupted ? 'call was interrupted' : 'call failed')
+    recordProviderFailure(role, provider, r, attempt,
+      interrupted ? 'interrupted' : 'nonzero-exit')
     die(`${role} exited ${r.status}\n${provider.adapter.decodeFailure(r)}`)
   }
   let decoded, result
@@ -2938,7 +3053,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
   } catch (error) {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'response could not be decoded')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'decode-error')
     die(`${role} ${error?.message || error}`)
   }
   const callAccount = callAccounting(result.provider, result.cost, {
@@ -2950,14 +3065,21 @@ function agent(role, prompt, schema, f, spec, context = null) {
   const finalBytes = Buffer.byteLength(JSON.stringify(result.value))
   if (finalBytes > FINAL_VALUE_MAX) {
     recordMissingEnumeratorPopulation(role, 'response exceeded the canonical value limit', 'failed')
+    recordProviderFailure(role, provider, r, attempt, 'canonical-value-oversized', result)
     die(`${role} final canonical value is ${finalBytes} bytes; limit is ${FINAL_VALUE_MAX}`)
   }
   const canonicalProblem = canonicalIssue(schema, result.value, '$')
   if (canonicalProblem) {
     recordMissingEnumeratorPopulation(role, 'response failed schema validation', 'failed')
+    recordProviderFailure(role, provider, r, attempt, 'schema-validation', result)
     schemaFailure(role, canonicalProblem.path, canonicalProblem.message)
   }
-  validateBlockedValue(role, result.value)
+  try { validateBlockedValue(role, result.value) }
+  catch (error) {
+    recordMissingEnumeratorPopulation(role, 'response failed blocked-value validation', 'failed')
+    recordProviderFailure(role, provider, r, attempt, 'blocked-value-validation', result)
+    die(error.message)
+  }
   valueRuntime.set(result.value, {
     runtime_digest: resolvedRuntime.digest,
     provider: result.provider,
@@ -2966,9 +3088,10 @@ function agent(role, prompt, schema, f, spec, context = null) {
     requested: result.requested,
     observed: { models: result.models, tokens: result.tokens, duration_ms: result.durationMs },
   })
-  try { recordProviderCall(role, provider, { ...result, finalResponse: decoded.finalResponse }) }
+  try { recordProviderCall(role, provider, { ...result, finalResponse: decoded.finalResponse }, attempt) }
   catch (error) {
     recordMissingEnumeratorPopulation(role, 'successful response could not be retained', 'failed')
+    failProviderAttempt(attempt, 'retention-error')
     die(`${role} ${error?.message || error}`)
   }
   // The price stays first and keeps its shape, because it is what a reader looks for and what
