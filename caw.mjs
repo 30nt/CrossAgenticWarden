@@ -178,6 +178,123 @@ function decideGateFailure({
   return GateFailureAction.executor
 }
 
+const PlanningAction = Object.freeze({
+  architect: 'architect',
+  stopRequest: 'stop-request',
+})
+
+function decidePlanningAction(requestIssues) {
+  if (!Array.isArray(requestIssues)) throw new TypeError('requestIssues must be an array')
+  return requestIssues.length ? PlanningAction.stopRequest : PlanningAction.architect
+}
+
+function canonicalAuthorityPaths(profileText) {
+  if (typeof profileText !== 'string') throw new TypeError('profileText must be a string')
+  const heading = profileText.match(/^## Canonical docs\s*$/m)
+  const tail = heading ? profileText.slice(heading.index + heading[0].length) : ''
+  const nextHeading = tail.search(/^##\s/m)
+  const section = nextHeading === -1 ? tail : tail.slice(0, nextHeading)
+  const paths = new Set(['.caw/CAW.md'])
+  for (const line of section.split('\n')) {
+    const match = line.match(/^\s*-\s+(?:`([^`]+)`|\[[^\]]+\]\(([^)]+)\)|(\S+))/)
+    const path = match && (match[1] || match[2] || match[3])
+    if (path && !/^[a-z]+:\/\//i.test(path)) paths.add(path)
+  }
+  return paths
+}
+
+const REVIEW_CRITERION_SECTIONS = new Map([
+  ['must cover', { label: 'Must cover', prefix: 'must-cover' }],
+  ['done when', { label: 'Done when', prefix: 'done-when' }],
+])
+
+function extractReviewCriteria(spec) {
+  if (typeof spec !== 'string') throw new TypeError('spec must be a string')
+  const found = []
+  const counts = new Map()
+  let section = null
+  let pending = null
+
+  const flush = () => {
+    if (!pending) return
+    const count = (counts.get(section.prefix) || 0) + 1
+    counts.set(section.prefix, count)
+    found.push({
+      id: `${section.prefix}-${count}`,
+      section: section.label,
+      criterion: pending.trim(),
+    })
+    pending = null
+  }
+
+  for (const line of spec.replace(/\r\n|\r/g, '\n').split('\n')) {
+    const heading = line.match(/^##\s+(.+?)\s*$/)
+    if (heading) {
+      flush()
+      section = REVIEW_CRITERION_SECTIONS.get(heading[1].trim().toLowerCase()) || null
+      continue
+    }
+    if (!section) continue
+    const bullet = line.match(/^\s*-\s+(.+?)\s*$/)
+    if (bullet) {
+      flush()
+      pending = bullet[1]
+      continue
+    }
+    if (pending && line.trim()) pending += ` ${line.trim()}`
+    else if (!line.trim()) flush()
+  }
+  flush()
+  return found
+}
+
+function renderReviewCriteria(spec) {
+  const criteria = extractReviewCriteria(spec)
+  return criteria.length
+    ? criteria.map((item) => `- ${item.id} [${item.section}] ${item.criterion}`).join('\n')
+    : '(none — this spec has no Must cover or Done when bullets)'
+}
+
+function reviewCriteriaIssue(spec, rows, verdict) {
+  if (!Array.isArray(rows)) return 'criteria must be an array'
+  const expected = extractReviewCriteria(spec)
+  const byId = new Map(expected.map((item) => [item.id, item]))
+  const seen = new Set()
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return 'every criteria row must be an object'
+    }
+    if (seen.has(row.id)) return `duplicate criterion id ${JSON.stringify(row.id)}`
+    if (!byId.has(row.id)) return `unknown criterion id ${JSON.stringify(row.id)}`
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) {
+      return `${row.id} has empty evidence`
+    }
+    seen.add(row.id)
+  }
+
+  const missing = expected.filter((item) => !seen.has(item.id)).map((item) => item.id)
+  if (missing.length) return `missing criterion id(s): ${missing.join(', ')}`
+
+  const slotForState = { broken: 'broken', uncovered: 'uncovered', weak: 'weak' }
+  for (const row of rows) {
+    if (row.state === 'met') continue
+    const criterion = byId.get(row.id).criterion
+    const slot = slotForState[row.state]
+    const items = verdict?.[slot]
+    if (!Array.isArray(items) || !items.some((item) => item?.evidence?.includes(criterion))) {
+      return `${row.id} is ${row.state} but no ${slot} item quotes its exact criterion`
+    }
+  }
+
+  for (const item of verdict?.uncovered || []) {
+    if (!expected.some((criterion) => item?.evidence?.includes(criterion.criterion))) {
+      return 'an uncovered item does not quote any exact Must cover or Done when criterion'
+    }
+  }
+  return null
+}
+
 // A hung child used to block a run forever: `spawnSync` was called with no timeout at all.
 // Thirty minutes is roughly three times the longest call ever observed here — measured across
 // two installs, where a role takes 300-550s and the median is about 390 — and the asymmetry
@@ -1217,8 +1334,27 @@ const SCHEMA = closeSchema({
           required: ['case', 'source'],
         },
       },
+      request_issues: {
+        type: 'array',
+        description: 'every request/profile/canonical-doc conflict or product question the ' +
+          'request assumes settled but project authority does not settle. Empty when the ' +
+          'request is ready for an architect.',
+        items: {
+          type: 'object',
+          properties: {
+            issue: { type: 'string' },
+            request_source: POPULATION_SOURCE_SCHEMA,
+            authority_sources: {
+              type: 'array', minItems: 1, items: POPULATION_SOURCE_SCHEMA,
+              description: 'exact profile or canonical-document excerpts that conflict with, ' +
+                'or fail to settle, the request premise',
+            },
+          },
+          required: ['issue', 'request_source', 'authority_sources'],
+        },
+      },
     },
-    required: ['cases'],
+    required: ['cases', 'request_issues'],
   },
 
   // Typed slots, for the reason stated over `planReview` and against the measurement that the
@@ -1246,6 +1382,27 @@ const SCHEMA = closeSchema({
   verdict: {
     type: 'object',
     properties: {
+      criteria: {
+        type: 'array',
+        description: 'exactly one row for every engine-listed Must cover and Done when ' +
+          'criterion. Missing, duplicate, or unknown ids invalidate the response.',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned criterion id' },
+            state: {
+              type: 'string', enum: ['met', 'broken', 'uncovered', 'weak'],
+              description: 'met only when the shipped consumer and meaningful verification ' +
+                'establish the criterion; otherwise name the blocking slot that carries it',
+            },
+            evidence: {
+              type: 'string',
+              description: 'what was traced, read, or experimentally checked for this criterion',
+            },
+          },
+          required: ['id', 'state', 'evidence'],
+        },
+      },
       // Empty on round 1 — there is nothing to carry. From round 2 on it must hold one entry
       // per item this task still has open, and the loop refuses a verdict that skips any.
       carried: {
@@ -1310,7 +1467,7 @@ const SCHEMA = closeSchema({
           'here everything you would otherwise be tempted to block on "while we are here".',
       },
     },
-    required: ['carried', 'broken', 'uncovered', 'weak', 'noted'],
+    required: ['criteria', 'carried', 'broken', 'uncovered', 'weak', 'noted'],
   },
   delivery: {
     type: 'object',
@@ -2703,6 +2860,60 @@ function sourceLabel(source) {
   return `index:${source.index_sha256.slice(0, 12)}:${range} — ${excerpt}`
 }
 
+function validateRequestIssues(issues, context) {
+  const authorityPaths = canonicalAuthorityPaths(context.profileText)
+  for (const [index, issue] of issues.entries()) {
+    if (!issue.issue.trim()) {
+      schemaFailure('enumerator', `$.request_issues[${index}].issue`, 'must not be empty')
+    }
+    if (issue.request_source?.kind !== 'request') {
+      schemaFailure('enumerator', `$.request_issues[${index}].request_source`,
+        'must quote the human request')
+    }
+    const requestResolution = resolvePopulationSource(issue.request_source, context)
+    if (!requestResolution.ok) {
+      schemaFailure('enumerator', `$.request_issues[${index}].request_source`,
+        requestResolution.reason)
+    }
+    if (!issue.authority_sources.length) {
+      schemaFailure('enumerator', `$.request_issues[${index}].authority_sources`,
+        'must contain at least one authority source')
+    }
+    for (const [authorityIndex, source] of issue.authority_sources.entries()) {
+      const path = `$.request_issues[${index}].authority_sources[${authorityIndex}]`
+      if (source?.kind !== 'repository') {
+        schemaFailure('enumerator', path,
+          'must quote .caw/CAW.md or a repository canonical document')
+      }
+      if (!authorityPaths.has(source.path)) {
+        schemaFailure('enumerator', path,
+          `${JSON.stringify(source.path)} is not .caw/CAW.md or listed under ## Canonical docs`)
+      }
+      const authorityResolution = resolvePopulationSource(source, context)
+      if (!authorityResolution.ok) schemaFailure('enumerator', path, authorityResolution.reason)
+    }
+  }
+}
+
+function requestIssuesText(issues) {
+  return issues.map((issue, index) => [
+    `${index + 1}. ${issue.issue}`,
+    `   request: ${sourceLabel(issue.request_source)}`,
+    ...issue.authority_sources.map((source) => `   authority: ${sourceLabel(source)}`),
+  ].join('\n')).join('\n')
+}
+
+function requireReadyRequest(enumeration, retryCommand = 'plan') {
+  if (decidePlanningAction(enumeration.requestIssues) === PlanningAction.architect) {
+    return enumeration.cases
+  }
+  say(`\nrequest preflight stopped before architect; ${enumeration.requestIssues.length} issue(s):`)
+  say(requestIssuesText(enumeration.requestIssues))
+  die('the request conflicts with, or assumes more than, the project authority settles.\n' +
+      `  Resolve every issue in the request or canonical docs, then ${retryCommand} again.\n` +
+      '  No architect or plan-reviewer call ran.')
+}
+
 function exactOccurrence(text, candidate) {
   if (!candidate) return null
   const normalizedText = normalizedSourceText(text)
@@ -3141,16 +3352,22 @@ function enumerate(description, text, f) {
     'Profile:\n\n' + text,
     indexBlock(indexResult),
     '\n\nRequest from the human:\n\n' + description,
-    '\n\nEnumerate the cases this request implies. Search the tree for them rather than',
-    ' recalling them, and give every case a source. You are not planning and you will not be',
-    ' shown a plan.',
+    '\n\nFirst compare the request against the profile and every relevant canonical document.',
+    ' Put every contradiction or still-undecided product premise in `request_issues`, with exact',
+    ' request and authority sources. Do not stop at the first. If any exist, return no cases:',
+    ' the engine stops before architect. Otherwise leave `request_issues` empty, enumerate the',
+    ' cases this request implies, search the tree for them rather than recalling them, and give',
+    ' every case a source. You are not planning and you will not be shown a plan.',
   ].join(''), SCHEMA.population, f)
 
-  const resolved = resolvePopulation(p.cases || [], {
+  const context = {
     request: description,
     indexResult,
     workingRoot: process.cwd(),
-  })
+    profileText: text,
+  }
+  validateRequestIssues(p.request_issues, context)
+  const resolved = resolvePopulation(p.cases, context)
   recordPopulationResolution(resolved)
   const cases = resolved.cases
   valueRuntime.set(cases, runtimeIdentity(p))
@@ -3170,7 +3387,7 @@ function enumerate(description, text, f) {
     : resolved.returnedCount === 0
       ? '  population: none — enumerator returned no cases; reviewer judges on its own reading alone'
       : '  enumerator witness was withdrawn — reviewer judges on its own reading alone')
-  return cases
+  return { cases, requestIssues: p.request_issues }
 }
 
 // One wording, two callers, because the rule about what may be dropped is the load-bearing
@@ -3336,7 +3553,8 @@ function plan(description) {
         `  the ones you do not want, then plan again.`)
   }
 
-  const population = enumerate(description, text, f)
+  const enumeration = enumerate(description, text, f)
+  const population = requireReadyRequest(enumeration)
   const planProvenance = [{ role: 'enumerator', ...runtimeIdentity(population) }]
 
   let problems = null
@@ -4388,6 +4606,10 @@ function runTask(file, f, profileText, opts = {}) {
         '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
         `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
         ' Whether it passes is settled. Judge whether it passes for the right reason.',
+        '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
+        ' and finish every row before returning. For a non-met row, the corresponding blocking',
+        ' item must quote the criterion text exactly in its evidence:\n\n' +
+          renderReviewCriteria(spec),
         '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
           ` baseline is commit ${weakBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
           ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
@@ -4435,6 +4657,8 @@ function runTask(file, f, profileText, opts = {}) {
     if (deliveryDigest() !== deliveryBaseline) {
       die(`${file} — delivery tree changed while the isolated reviewer ran; refusing the verdict`)
     }
+    const criteriaProblem = reviewCriteriaIssue(spec, rv.criteria, rv)
+    if (criteriaProblem) schemaFailure('reviewer', '$.criteria', criteriaProblem)
     const reviewerRuntime = runtimeIdentity(rv)
     runtimeHistory.push({ round: round + 1, role: 'reviewer', ...reviewerRuntime })
     validateCarriedSet(rv.carried, open)
@@ -4836,7 +5060,7 @@ function reviewSpecs(description, noFix) {
   // 24% different populations run to run. That number decided how much of the spread between
   // runs is sampling and how much is the request growing. Nothing else could have told them
   // apart, and after this line it has to be measured on purpose rather than found in the waste.
-  const population = enumerate(description, text, f)
+  const population = requireReadyRequest(enumerate(description, text, f), 'review-specs')
 
   for (let round = 1; round <= FIX_ROUNDS; round++) {
     const verdict = judgeSpecs(description, f, text, population)
@@ -5390,8 +5614,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 export {
-  GateFailureAction, SCHEMA, addAccounting, decideGateFailure, deltaAccounting,
-  formatAccounting, normalizeAccounting,
+  GateFailureAction, PlanningAction, SCHEMA, addAccounting, canonicalAuthorityPaths,
+  decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
+  normalizeAccounting, reviewCriteriaIssue,
   populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
   removeTree, retainWeakVerificationEvents, zeroAccounting,
 }
