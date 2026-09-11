@@ -1628,6 +1628,10 @@ const PROJECT_POLICY_FILES_MAX = 2 * 1024 * 1024
 const PROJECT_POLICY_TIMEOUT_DEFAULT_MS = 5000
 const PROJECT_POLICY_TIMEOUT_MAX_MS = 60000
 const PROJECT_POLICY_SCRATCH_PARENT = join(tmpdir(), 'caw-project-policies')
+const POPULATION_CACHE_VERSION = 1
+const POPULATION_CACHE_MAX = 20
+const POPULATION_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+const POPULATION_CACHE_FILE_MAX = 8 * 1024 * 1024
 let projectPolicySet = null
 let activePopulationCertification = null
 let runRecord = null
@@ -1658,6 +1662,9 @@ function writeRunManifest(status) {
     ...(runRecord.population === undefined ? {} : {
       population: runRecord.population,
       population_counts: runRecord.populationCounts,
+    }),
+    ...(runRecord.populationCache === undefined ? {} : {
+      population_cache: runRecord.populationCache,
     }),
     ...(runRecord.weakVerification === undefined ? {} : {
       weak_verification: runRecord.weakVerification,
@@ -4096,9 +4103,144 @@ function planIncomplete(description, out, history, problems, reason, population,
 // can run to tens of KB — fall behind a varying prefix too, and index_cmd starts costing full
 // rate on every call for nothing. The order is load-bearing for the mechanism, not for the
 // price. The unmeasured residual above still applies, to this role alone.
+function populationCacheRoot() {
+  try {
+    const path = execFileSync('git', ['rev-parse', '--git-path', 'caw/population-cache'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    return path ? resolve(path) : null
+  } catch { return null }
+}
+
+function prunePopulationCache(root, now = Date.now()) {
+  if (!root || !existsSync(root)) return
+  const entries = readdirSync(root).filter((name) => /^[0-9a-f]{64}\.json$/.test(name))
+    .map((name) => {
+      const path = join(root, name)
+      const stat = lstatSync(path)
+      return { path, stat }
+    })
+    .filter(({ stat }) => stat.isFile() && !stat.isSymbolicLink())
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
+  entries.forEach((entry, index) => {
+    if (index >= POPULATION_CACHE_MAX || now - entry.stat.mtimeMs > POPULATION_CACHE_MAX_AGE_MS) {
+      unlinkSync(entry.path)
+    }
+  })
+}
+
+function canonicalAuthoritySnapshot(profileText) {
+  return [...canonicalAuthorityPaths(profileText)].sort().map((path) => {
+    try {
+      const stat = lstatSync(path)
+      if (!stat.isFile() || stat.isSymbolicLink()) return { path, state: 'not-regular' }
+      return {
+        path,
+        state: 'file',
+        sha256: createHash('sha256').update(readFileSync(path)).digest('hex'),
+      }
+    } catch { return { path, state: 'missing' } }
+  })
+}
+
+function populationCacheIdentity(description, text, f, indexResult, prompt) {
+  if (!populationCacheRoot()) return null
+  const binding = resolvedRuntime.value.roles.enumerator
+  const provider = resolvedRuntime.providers.get(binding.provider)
+  const inputs = {
+    version: POPULATION_CACHE_VERSION,
+    request_sha256: createHash('sha256').update(description).digest('hex'),
+    profile_sha256: createHash('sha256').update(text).digest('hex'),
+    prompt_sha256: createHash('sha256').update(prompt).digest('hex'),
+    instructions_sha256: createHash('sha256').update(
+      assembledInstructions('enumerator', binding, provider, f.docs_language)).digest('hex'),
+    schema_sha256: createHash('sha256').update(stableJson(SCHEMA.population)).digest('hex'),
+    engine_sha256: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    repository: { head: headCommit(), delivery_digest: deliveryDigest() },
+    canonical_authority: canonicalAuthoritySnapshot(text),
+    index: {
+      command_sha256: createHash('sha256').update(f.index_cmd || '').digest('hex'),
+      format: indexResult.format,
+      api_version: indexResult.apiVersion,
+      content_sha256: indexResult.sha256,
+      truncated: indexResult.truncated,
+    },
+    runtime: {
+      digest: resolvedRuntime.digest,
+      provider: binding.provider,
+      vendor: provider.adapter.vendor,
+      model: binding.model,
+      reasoning: binding.reasoning,
+      adapter_digest: provider.adapter.digest,
+      cli_version: provider.cliVersion,
+    },
+    project_policy_digest: projectPolicySnapshot()?.set_digest || null,
+  }
+  return {
+    key: createHash('sha256').update(stableJson(inputs)).digest('hex'),
+    inputs,
+  }
+}
+
+function readPopulationCache(identity) {
+  if (!identity) return null
+  const root = populationCacheRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > POPULATION_CACHE_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record,
+      ['version', 'key', 'created_at', 'inputs', 'value_digest', 'runtime', 'value'],
+      'population cache')
+    if (record.version !== POPULATION_CACHE_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs) ||
+        record.value_digest !== createHash('sha256').update(stableJson(record.value)).digest('hex') ||
+        canonicalIssue(SCHEMA.population, record.value, '$')) return null
+    return record
+  } catch { return null }
+}
+
+function writePopulationCache(identity, value, runtime) {
+  if (!identity) return null
+  const root = populationCacheRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  const record = {
+    version: POPULATION_CACHE_VERSION,
+    key: identity.key,
+    created_at: new Date().toISOString(),
+    inputs: identity.inputs,
+    value_digest: createHash('sha256').update(stableJson(value)).digest('hex'),
+    runtime,
+    value,
+  }
+  const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+  if (bytes.length > POPULATION_CACHE_FILE_MAX) return null
+  const target = join(root, `${identity.key}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, target)
+  try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  return record
+}
+
+function recordPopulationCache(value) {
+  const run = beginRunRecord()
+  run.populationCache = value
+  writeRunManifest('active')
+}
+
 function enumerate(description, text, f) {
   const indexResult = index(f.index_cmd, f.index_format)
-  const p = agent('enumerator', [
+  const prompt = [
     'Profile:\n\n' + text,
     indexBlock(indexResult),
     '\n\nRequest from the human:\n\n' + description,
@@ -4108,7 +4250,24 @@ function enumerate(description, text, f) {
     ' the engine stops before architect. Otherwise leave `request_issues` empty, enumerate the',
     ' cases this request implies, search the tree for them rather than recalling them, and give',
     ' every case a source. You are not planning and you will not be shown a plan.',
-  ].join(''), SCHEMA.population, f)
+  ].join('')
+  const cacheIdentity = populationCacheIdentity(description, text, f, indexResult, prompt)
+  const cached = readPopulationCache(cacheIdentity)
+  let p
+  if (cached) {
+    p = cached.value
+    valueRuntime.set(p, cached.runtime)
+    recordPopulationCache({
+      state: 'hit', key: cacheIdentity.key, created_at: cached.created_at,
+      inputs: cacheIdentity.inputs,
+    })
+    say(`  population cache hit ${cacheIdentity.key.slice(0, 12)} — enumerator call skipped`)
+  } else {
+    if (cacheIdentity) recordPopulationCache({
+      state: 'miss', key: cacheIdentity.key, inputs: cacheIdentity.inputs,
+    })
+    p = agent('enumerator', prompt, SCHEMA.population, f)
+  }
 
   const context = {
     request: description,
@@ -4129,6 +4288,13 @@ function enumerate(description, text, f) {
     retained: resolved.retainedCount,
     witnessWithdrawn: resolved.witnessWithdrawn,
   })
+  if (!cached && cacheIdentity) {
+    const stored = writePopulationCache(cacheIdentity, p, runtimeIdentity(p))
+    if (stored) recordPopulationCache({
+      state: 'miss', stored: true, key: cacheIdentity.key, created_at: stored.created_at,
+      inputs: cacheIdentity.inputs,
+    })
+  }
   // Zero is not fatal: the reviewer still has the request, the profile and a shell, which is
   // exactly what it had before this role existed. It is said out loud because a silent empty
   // list is indistinguishable from a request whose population is genuinely one case wide.
