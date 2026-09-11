@@ -117,6 +117,7 @@ node caw.mjs round <spec>            # one more review round on a task that stop
 node caw.mjs review <spec>           # review a task you finished by hand, and commit it
 node caw.mjs done <spec>             # remove a spec with no review at all
 node caw.mjs probe <provider>        # write current machine-local guarantee evidence
+node caw.mjs verify-project          # validate project policy extensions
 node caw.mjs artifacts list          # retained run/recovery/probe/transport artifacts
 ```
 
@@ -144,6 +145,7 @@ node caw.mjs artifacts list          # retained run/recovery/probe/transport art
 | [docs/install.md](install.ru.md) | полное руководство по установке |
 | [docs/architecture.md](architecture.ru.md) | как устроены движок, роли, адаптеры и пробы |
 | [docs/adapters.md](adapters.md) | как написать адаптер для другого провайдера (EN) |
+| [docs/project-policies.md](project-policies.ru.md) | как расширять CAW без изменения ядра |
 | [docs/limitations.md](limitations.ru.md) | что известно как сломанное или непроверенное |
 | [SECURITY.md](../SECURITY.md) | что обеспечивается, а что нет (EN) |
 | [CONTRIBUTING.md](contributing.ru.md) | как здесь выглядит полезный вклад |

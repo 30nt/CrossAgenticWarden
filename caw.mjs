@@ -20,7 +20,7 @@
 import { spawnSync, spawn, execFileSync } from 'node:child_process'
 import {
   appendFileSync, chmodSync, closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync,
-  mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync,
+  mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync,
   symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
@@ -248,16 +248,16 @@ function extractReviewCriteria(spec) {
   return found
 }
 
-function renderReviewCriteria(spec) {
-  const criteria = extractReviewCriteria(spec)
+function renderReviewCriteria(spec, additional = []) {
+  const criteria = [...extractReviewCriteria(spec), ...additional]
   return criteria.length
     ? criteria.map((item) => `- ${item.id} [${item.section}] ${item.criterion}`).join('\n')
     : '(none — this spec has no Must cover or Done when bullets)'
 }
 
-function reviewCriteriaIssue(spec, rows, verdict) {
+function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
   if (!Array.isArray(rows)) return 'criteria must be an array'
-  const expected = extractReviewCriteria(spec)
+  const expected = [...extractReviewCriteria(spec), ...additional]
   const byId = new Map(expected.map((item) => [item.id, item]))
   const seen = new Set()
 
@@ -1485,6 +1485,48 @@ const SCHEMA = closeSchema({
   },
 })
 
+const PROJECT_POLICY_OUTPUT_SCHEMAS = Object.freeze({
+  planning: closeSchema({
+    type: 'object',
+    properties: {
+      issues: { type: 'array', items: { type: 'string' } },
+      instructions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['issues', 'instructions'],
+  }),
+  review: closeSchema({
+    type: 'object',
+    properties: {
+      criteria: {
+        type: 'array', items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            section: { type: 'string' },
+            criterion: { type: 'string' },
+          },
+          required: ['id', 'section', 'criterion'],
+        },
+      },
+      instructions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['criteria', 'instructions'],
+  }),
+  gate: closeSchema({
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['continue', 'stop'] },
+      reason: { type: 'string' },
+    },
+    required: ['action', 'reason'],
+  }),
+  commit: closeSchema({
+    type: 'object',
+    properties: { subject: { type: 'string' } },
+    required: ['subject'],
+  }),
+})
+
 // ---------------------------------------------------------------- infrastructure
 
 // A run that dies has no commit to carry its notes, so they go to a file as well as the
@@ -1524,6 +1566,15 @@ const ADAPTER_TRANSPORT_PARENT = join(tmpdir(), 'caw-adapter-transports')
 const INVOCATION_SCRATCH_PARENT = join(tmpdir(), 'caw-invocation-scratch')
 const ACTIVE_REVIEW_SURFACES = new Map()
 const ACTIVE_INVOCATION_SCRATCH = new Set()
+const PROJECT_POLICY_MANIFEST = join('.caw', 'project', 'manifest.json')
+const PROJECT_POLICY_STAGES = ['planning', 'review', 'gate', 'commit']
+const PROJECT_POLICY_OUTPUT_MAX = 256 * 1024
+const PROJECT_POLICY_INPUT_MAX = 1024 * 1024
+const PROJECT_POLICY_FILES_MAX = 2 * 1024 * 1024
+const PROJECT_POLICY_TIMEOUT_DEFAULT_MS = 5000
+const PROJECT_POLICY_TIMEOUT_MAX_MS = 60000
+const PROJECT_POLICY_SCRATCH_PARENT = join(tmpdir(), 'caw-project-policies')
+let projectPolicySet = null
 let runRecord = null
 
 function writeRunManifest(status) {
@@ -1538,6 +1589,15 @@ function writeRunManifest(status) {
     timeout_ms: AGENT_TIMEOUT_MS,
     calls: runRecord.calls,
     diagnostics: runRecord.diagnostics,
+    ...(projectPolicySet?.manifestDigest ? {
+      project_policies: {
+        api_version: projectPolicySet.apiVersion,
+        manifest_digest: projectPolicySet.manifestDigest,
+        policies: Object.fromEntries(Object.entries(projectPolicySet.policies)
+          .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+      },
+      policy_calls: runRecord.policyCalls || [],
+    } : {}),
     ...(runRecord.population === undefined ? {} : {
       population: runRecord.population,
       population_counts: runRecord.populationCounts,
@@ -2342,6 +2402,290 @@ function canonicalIssue(schema, value, path = '$') {
     return { path, message: 'expected finite number' }
   }
   return null
+}
+
+function exactObjectKeys(value, allowed, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`)
+  }
+  const extra = Object.keys(value).filter((key) => !allowed.includes(key))
+  if (extra.length) throw new TypeError(`${label} has unknown field(s): ${extra.join(', ')}`)
+}
+
+function projectPolicyTreeDigest(policyRoot) {
+  let bytes = 0
+  const hash = createHash('sha256')
+  const visit = (directory) => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name)
+      const stat = lstatSync(path)
+      const rel = relative(policyRoot, path).split(sep).join('/')
+      if (stat.isSymbolicLink()) throw new Error(`project policy tree contains symlink: ${rel}`)
+      if (stat.isDirectory()) {
+        hash.update(`directory\0${rel}\0${stat.mode & 0o777}\0`)
+        visit(path)
+      } else if (stat.isFile()) {
+        bytes += stat.size
+        if (bytes > PROJECT_POLICY_FILES_MAX) {
+          throw new Error(`project policy files exceed ${PROJECT_POLICY_FILES_MAX} bytes`)
+        }
+        hash.update(`file\0${rel}\0${stat.mode & 0o777}\0`)
+        hash.update(readFileSync(path))
+      } else {
+        throw new Error(`project policy tree contains unsupported entry: ${rel}`)
+      }
+    }
+  }
+  visit(policyRoot)
+  return hash.digest('hex')
+}
+
+function projectPolicyStateDigest(root = process.cwd()) {
+  const repositoryRoot = realpathSync(root)
+  const hash = createHash('sha256')
+  hash.update(`delivery\0${deliveryDigest()}\0head\0${headCommit() || ''}\0`)
+  const visit = (path) => {
+    const rel = relative(repositoryRoot, path).split(sep).join('/') || '.'
+    if (!existsSync(path)) {
+      hash.update(`missing\0${rel}\0`)
+      return
+    }
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) {
+      hash.update(`symlink\0${rel}\0${readlinkSync(path)}\0`)
+    } else if (stat.isDirectory()) {
+      hash.update(`directory\0${rel}\0${stat.mode & 0o777}\0`)
+      for (const name of readdirSync(path).sort()) visit(join(path, name))
+    } else if (stat.isFile()) {
+      hash.update(`file\0${rel}\0${stat.mode & 0o777}\0`)
+      hash.update(readFileSync(path))
+    } else {
+      hash.update(`other\0${rel}\0${stat.mode}\0`)
+    }
+  }
+  for (const path of ['caw.mjs', '.caw', QUEUE_DIR]) visit(join(repositoryRoot, path))
+  return hash.digest('hex')
+}
+
+function readProjectPolicies(root = process.cwd()) {
+  const repositoryRoot = realpathSync(root)
+  const manifestPath = join(repositoryRoot, PROJECT_POLICY_MANIFEST)
+  if (!existsSync(manifestPath)) {
+    return { apiVersion: null, manifestDigest: null, policies: {}, root: repositoryRoot }
+  }
+  const manifestStat = lstatSync(manifestPath)
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+    throw new Error(`${PROJECT_POLICY_MANIFEST} must be a regular file`)
+  }
+  if (manifestStat.size > PROJECT_POLICY_INPUT_MAX) {
+    throw new Error(`${PROJECT_POLICY_MANIFEST} exceeds ${PROJECT_POLICY_INPUT_MAX} bytes`)
+  }
+  let manifest
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
+  catch (error) { throw new Error(`${PROJECT_POLICY_MANIFEST} is invalid JSON: ${error.message}`) }
+  exactObjectKeys(manifest, ['api_version', 'policies'], 'project policy manifest')
+  if (manifest.api_version !== 1) throw new Error('project policy api_version must be 1')
+  exactObjectKeys(manifest.policies, PROJECT_POLICY_STAGES, 'project policy manifest.policies')
+  const policyRoot = realpathSync(dirname(manifestPath))
+  const treeDigest = projectPolicyTreeDigest(policyRoot)
+  const policies = {}
+  for (const stage of PROJECT_POLICY_STAGES) {
+    const config = manifest.policies[stage]
+    if (config === undefined) continue
+    exactObjectKeys(config, ['id', 'command', 'timeout_ms'], `project ${stage} policy`)
+    if (typeof config.id !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(config.id)) {
+      throw new Error(`project ${stage} policy id is invalid`)
+    }
+    if (!Array.isArray(config.command) || !config.command.length || config.command.length > 16 ||
+        config.command.some((part) => typeof part !== 'string' || !part.length || part.length > 4096)) {
+      throw new Error(`project ${stage} policy command must contain 1-16 non-empty strings`)
+    }
+    const timeoutMs = config.timeout_ms ?? PROJECT_POLICY_TIMEOUT_DEFAULT_MS
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > PROJECT_POLICY_TIMEOUT_MAX_MS) {
+      throw new Error(`project ${stage} policy timeout_ms must be 1-${PROJECT_POLICY_TIMEOUT_MAX_MS}`)
+    }
+    policies[stage] = {
+      id: config.id,
+      command: [...config.command],
+      timeoutMs,
+      root: policyRoot,
+      digest: createHash('sha256').update(JSON.stringify({ stage, config, treeDigest })).digest('hex'),
+    }
+  }
+  return {
+    apiVersion: 1,
+    manifestDigest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
+    policies,
+    root: repositoryRoot,
+  }
+}
+
+function resolvedPolicyCommand(policy, repositoryRoot) {
+  return policy.command.map((part, index) => {
+    const looksLikePath = part.startsWith('.') || part.includes('/') || part.includes('\\')
+    if (!looksLikePath) return part
+    const candidate = resolve(repositoryRoot, part)
+    if (!existsSync(candidate)) return part
+    const canonical = realpathSync(candidate)
+    if (!inside(policy.root, canonical)) {
+      throw new Error(`project policy command path leaves .caw/project: ${part}`)
+    }
+    const stat = lstatSync(canonical)
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`project policy command path is not a regular file: ${part}`)
+    }
+    return canonical
+  })
+}
+
+function validateProjectPolicyOutput(stage, policy, output) {
+  const issue = canonicalIssue(PROJECT_POLICY_OUTPUT_SCHEMAS[stage], output)
+  if (issue) throw new Error(`project ${stage} policy returned invalid output at ${issue.path}: ${issue.message}`)
+  const strings = stage === 'planning' ? [...output.issues, ...output.instructions]
+    : stage === 'review'
+      ? [...output.instructions, ...output.criteria.flatMap((row) =>
+          [row.id, row.section, row.criterion])]
+      : stage === 'gate' ? [output.reason]
+      : [output.subject]
+  if (strings.some((value) => Buffer.byteLength(value) > 8000)) {
+    throw new Error(`project ${stage} policy returned a string over 8000 bytes`)
+  }
+  if (stage === 'planning' && output.issues.some((value) => !value.trim())) {
+    throw new Error('project planning policy returned an empty issue')
+  }
+  if (['planning', 'review'].includes(stage) &&
+      output.instructions.some((value) => !value.trim())) {
+    throw new Error(`project ${stage} policy returned an empty instruction`)
+  }
+  if (stage === 'review') {
+    const ids = output.criteria.map((row) => row.id)
+    if (ids.some((id) => !/^[a-z][a-z0-9.-]{0,63}$/.test(id))) {
+      throw new Error('project review policy returned an invalid criterion id')
+    }
+    if (new Set(ids).size !== ids.length) {
+      throw new Error('project review policy returned duplicate criterion ids')
+    }
+    if (output.criteria.some((row) => !row.section.trim() || !row.criterion.trim())) {
+      throw new Error('project review policy returned an empty criterion')
+    }
+  }
+  if (stage === 'gate' && output.action === 'stop' && !output.reason.trim()) {
+    throw new Error('project gate policy must explain a stop action')
+  }
+  if (stage === 'commit' && (output.subject.includes('\n') || output.subject.length > 120)) {
+    throw new Error('project commit policy subject must be one line of at most 120 characters')
+  }
+}
+
+function recordProjectPolicyCall(policy, stage, startedAt, status) {
+  const run = beginRunRecord()
+  run.policyCalls ||= []
+  run.policyCalls.push({
+    stage, id: policy.id, digest: policy.digest,
+    duration_ms: Date.now() - startedAt, status,
+  })
+  writeRunManifest(status === 'success' ? 'active' : 'failed')
+}
+
+function runProjectPolicy(stage, context, { record = true, set = projectPolicySet } = {}) {
+  const policy = set?.policies?.[stage]
+  if (!policy) return null
+  const request = `${JSON.stringify({ api_version: 1, stage, context })}\n`
+  if (Buffer.byteLength(request) > PROJECT_POLICY_INPUT_MAX) {
+    throw new Error(`project ${stage} policy input exceeds ${PROJECT_POLICY_INPUT_MAX} bytes`)
+  }
+  const command = resolvedPolicyCommand(policy, set.root)
+  mkdirSync(PROJECT_POLICY_SCRATCH_PARENT, { recursive: true, mode: 0o700 })
+  const scratch = mkdtempSync(join(PROJECT_POLICY_SCRATCH_PARENT, `${stage}-`))
+  const startedAt = Date.now()
+  const before = projectPolicyStateDigest(set.root)
+  let callStatus = 'failure'
+  try {
+    const pathValue = process.env.PATH || process.env.Path || ''
+    const env = {
+      PATH: pathValue,
+      ...(process.env.PATHEXT ? { PATHEXT: process.env.PATHEXT } : {}),
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
+      TMPDIR: scratch, TEMP: scratch, TMP: scratch,
+      CAW_POLICY_API_VERSION: '1', CAW_POLICY_STAGE: stage,
+    }
+    const result = spawnSync(command[0], command.slice(1), {
+      cwd: scratch,
+      input: request,
+      encoding: 'utf8',
+      env,
+      shell: false,
+      timeout: policy.timeoutMs,
+      maxBuffer: PROJECT_POLICY_OUTPUT_MAX,
+      windowsHide: true,
+    })
+    if (projectPolicyStateDigest(set.root) !== before) {
+      throw new Error(`project ${stage} policy changed protected project state`)
+    }
+    if (result.error) {
+      const timedOut = result.error.code === 'ETIMEDOUT'
+      throw new Error(`project ${stage} policy ${timedOut ? 'timed out' : 'could not run'}: ${result.error.message}`)
+    }
+    if (result.status !== 0) {
+      const detail = `${result.stderr || ''}\n${result.stdout || ''}`.trim().slice(-8000)
+      throw new Error(`project ${stage} policy exited ${result.status}${detail ? `: ${detail}` : ''}`)
+    }
+    let output
+    try { output = JSON.parse(result.stdout) }
+    catch (error) { throw new Error(`project ${stage} policy returned invalid JSON: ${error.message}`) }
+    validateProjectPolicyOutput(stage, policy, output)
+    callStatus = 'success'
+    return { output, policy }
+  } finally {
+    if (record) recordProjectPolicyCall(policy, stage, startedAt, callStatus)
+    removeTree(scratch)
+  }
+}
+
+function verifyProjectPolicies(set = readProjectPolicies()) {
+  if (!Object.keys(set.policies).length) {
+    say(`no project policies configured at ${PROJECT_POLICY_MANIFEST}`)
+    return
+  }
+  const samples = {
+    planning: { request: 'verify project policies', profile: '' },
+    review: { spec: '', files: [], criteria: [] },
+    gate: { command: 'verify', state: 'green', status: 0, output: '' },
+    commit: { title: 'Verify project policies', spec: '', files: [] },
+  }
+  for (const stage of PROJECT_POLICY_STAGES) {
+    if (!set.policies[stage]) continue
+    const result = runProjectPolicy(stage, samples[stage], { record: false, set })
+    say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid`)
+  }
+}
+
+function applyPlanningPolicy(description, profileText) {
+  const result = runProjectPolicy('planning', { request: description, profile: profileText })
+  if (!result) return profileText
+  if (result.output.issues.length) {
+    say(`\nproject planning policy ${result.policy.id} stopped before enumerator:`)
+    say(`  - ${result.output.issues.join('\n  - ')}`)
+    die('resolve the project policy issues, then run planning again. No provider call ran.')
+  }
+  if (!result.output.instructions.length) return profileText
+  return `${profileText.trimEnd()}\n\n## Project planning policy instructions\n\n` +
+    result.output.instructions.map((item) => `- ${item}`).join('\n') + '\n'
+}
+
+function projectPolicySnapshot() {
+  if (!projectPolicySet?.manifestDigest) return null
+  const snapshot = {
+    api_version: projectPolicySet.apiVersion,
+    manifest_digest: projectPolicySet.manifestDigest,
+    policies: Object.fromEntries(Object.entries(projectPolicySet.policies)
+      .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+  }
+  return {
+    ...snapshot,
+    set_digest: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
+  }
 }
 
 function validateBlockedValue(role, value) {
@@ -3538,7 +3882,7 @@ function sayCollisions({ hits, examined }) {
 }
 
 function plan(description) {
-  const { f, text } = profile()
+  const { f, text: profileText } = profile()
   noticeNotesLog()
 
   // Planning over a queue that still holds specs used to merge two plans in silence:
@@ -3553,6 +3897,7 @@ function plan(description) {
         `  the ones you do not want, then plan again.`)
   }
 
+  const text = applyPlanningPolicy(description, profileText)
   const enumeration = enumerate(description, text, f)
   const population = requireReadyRequest(enumeration)
   const planProvenance = [{ role: 'enumerator', ...runtimeIdentity(population) }]
@@ -3823,6 +4168,20 @@ function build(noFull) {
   if (!noFull && f.gate_full) {
     say(`\n· full gate: ${f.gate_full}`)
     const g = gate(f.gate_full)
+    const gateState = g.status === 75 ? 'refused' : g.ok ? 'green' : 'red'
+    const gatePolicy = runProjectPolicy('gate', {
+      task: null,
+      kind: 'full',
+      command: f.gate_full,
+      state: gateState,
+      status: g.status ?? (g.ok ? 0 : null),
+      output: g.out.slice(-8000),
+    })
+    if (gatePolicy?.output.action === 'stop') {
+      if (g.out) say(g.out)
+      die(`project gate policy ${gatePolicy.policy.id} stopped the full gate: ` +
+        gatePolicy.output.reason.trim())
+    }
     if (!g.ok) {
       say(g.out)
       // 75 (EX_TEMPFAIL) is the gate saying it DID NOT RUN — the convention the README asks
@@ -4532,6 +4891,15 @@ function runTask(file, f, profileText, opts = {}) {
       say(`  RUNTIME DIVERGENCE: carried findings originated under ${resume.runtime_digest.slice(0, 12)}`)
       say(`  and are now judged under ${resolvedRuntime.digest.slice(0, 12)}; origins remain attached.`)
     }
+    const currentPolicies = projectPolicySnapshot()
+    const snapshotDigest = (snapshot) => snapshot?.set_digest || (snapshot
+      ? createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')
+      : null)
+    if (resume.project_policies !== undefined &&
+        snapshotDigest(resume.project_policies) !== snapshotDigest(currentPolicies)) {
+      say(`  PROJECT POLICY DIVERGENCE: saved ${snapshotDigest(resume.project_policies)?.slice(0, 12) || 'none'}`)
+      say(`  and current ${snapshotDigest(currentPolicies)?.slice(0, 12) || 'none'}; the new policy set is recorded.`)
+    }
   }
 
   // Every delivery gets at most one provider-free confirmation. Only a confirmed red gate
@@ -4599,6 +4967,23 @@ function runTask(file, f, profileText, opts = {}) {
     }
 
     const g = gate(f.gate_fast, file)
+    const gateState = g.status === 75 ? 'refused' : g.ok ? 'green' : 'red'
+    const gatePolicy = runProjectPolicy('gate', {
+      task: file,
+      command: f.gate_fast,
+      state: gateState,
+      status: g.status ?? (g.ok ? 0 : null),
+      output: g.out.slice(-8000),
+      executor_retries: retry,
+      confirmation_runs: confirmationRuns,
+    })
+    if (gatePolicy?.output.action === 'stop') {
+      if (g.out) say(g.out)
+      stop(file, spec, ex, history, round, how, noted,
+        `${file} — project gate policy ${gatePolicy.policy.id} stopped the run: ` +
+          gatePolicy.output.reason.trim(),
+        taskAccounting(), runtimeHistory, weakVerification)
+    }
     if (!g.ok) {
       gateRedAttempts += 1
       // A refusal spends no retry, because no executor round changes why a gate refuses to
@@ -4671,6 +5056,17 @@ function runTask(file, f, profileText, opts = {}) {
 
     const open = openItems(history)
     const deliveryBaseline = deliveryDigest()
+    const coreCriteria = extractReviewCriteria(spec)
+    const reviewPolicy = runProjectPolicy('review', { spec, files, criteria: coreCriteria })
+    const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+      ...item,
+      id: `project:${reviewPolicy.policy.id}:${item.id}`,
+      section: `Project: ${item.section}`,
+    }))
+    const projectReviewInstructions = reviewPolicy?.output.instructions.length
+      ? '\n\nProject review policy instructions:\n\n' +
+        reviewPolicy.output.instructions.map((item) => `- ${item}`).join('\n')
+      : ''
     const reviewSurface = createReviewSurface(f)
     const weakBaseline = prepareWeakCapture(reviewSurface)
     let rv
@@ -4684,7 +5080,8 @@ function runTask(file, f, profileText, opts = {}) {
         '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
         ' and finish every row before returning. For a non-met row, the corresponding blocking',
         ' item must quote the criterion text exactly in its evidence:\n\n' +
-          renderReviewCriteria(spec),
+          renderReviewCriteria(spec, projectCriteria),
+        projectReviewInstructions,
         '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
           ` baseline is commit ${weakBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
           ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
@@ -4732,7 +5129,7 @@ function runTask(file, f, profileText, opts = {}) {
     if (deliveryDigest() !== deliveryBaseline) {
       die(`${file} — delivery tree changed while the isolated reviewer ran; refusing the verdict`)
     }
-    const criteriaProblem = reviewCriteriaIssue(spec, rv.criteria, rv)
+    const criteriaProblem = reviewCriteriaIssue(spec, rv.criteria, rv, projectCriteria)
     if (criteriaProblem) schemaFailure('reviewer', '$.criteria', criteriaProblem)
     const reviewerRuntime = runtimeIdentity(rv)
     runtimeHistory.push({ round: round + 1, role: 'reviewer', ...reviewerRuntime })
@@ -4769,7 +5166,6 @@ function runTask(file, f, profileText, opts = {}) {
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
     if (!nowOpen.length) {
-      clearRoundState(file)
       return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline)
     }
 
@@ -4822,7 +5218,7 @@ function runTask(file, f, profileText, opts = {}) {
 function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory = [],
   weakVerification = null) {
   writeRoundState(file, {
-    state_version: 3,
+    state_version: 4,
     spec_digest: specDigest(spec),
     round,
     history,
@@ -4832,6 +5228,7 @@ function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, r
     runtime_digest: taskAccounting?.legacy ? null : resolvedRuntime.digest,
     runtime_provenance: taskAccounting?.legacy ? 'legacy-unknown' : 'explicit-adapter-runtime',
     runtime_history: runtimeHistory,
+    project_policies: projectPolicySnapshot(),
     weak_verification: weakVerification,
     // Kept so that a `review` which approves has a delivery to commit. A hand-finished task has
     // no executor of its own, and a commit with an empty summary line is one nobody can read
@@ -4957,10 +5354,19 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   if (reviewedDigest && deliveryDigest() !== reviewedDigest) {
     die(`${file} — delivery tree differs from the tree the reviewer approved; refusing commit`)
   }
+  const title = (spec.match(/^title:\s*(.+)$/m) || [, file])[1]
+  const commitPolicy = runProjectPolicy('commit', {
+    title,
+    spec,
+    files: changedFiles(),
+    round,
+    gate: f.gate_fast,
+    gate_red_attempts: gateRedAttempts,
+  })
+  const subject = commitPolicy?.output.subject.trim() || title
   git('add', '-A')
   try { git('reset', '-q', '--', QUEUE_DIR) } catch { /* nothing of .caw-tasks/ was staged */ }
   try { git('reset', '-q', '--', LOG_DIR) } catch { /* nothing of .caw-logs/ was staged */ }
-  const title = (spec.match(/^title:\s*(.+)$/m) || [, file])[1]
   // `--cleanup=verbatim` is load-bearing, not tidiness. A spec is markdown: `## Read`,
   // `## Done when`. Under git's `strip` mode every one of those lines is a comment and is
   // silently removed, leaving a message whose headings are gone and whose bullets have lost
@@ -4969,7 +5375,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   // the integrity of this record depend on a setting outside the repository. Naming the mode
   // here takes it back.
   git('commit', '-q', '--cleanup=verbatim', '-m', [
-    title, '',
+    subject, '',
     // The summary line is what a later reader sees first, so it says only what this script
     // actually knows. `review` approves a tree no executor produced under its eye, and until the
     // round was saved before the gate there was only one way to arrive there: a human had
@@ -5009,6 +5415,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
     '',
     spec.trim(),
   ].join('\n'))
+  clearRoundState(file)
 
   // That header used to call this the only durable copy, and the unlink below is what would
   // have made it true. `spec` was read once, before the first executor round, and every pass
@@ -5118,7 +5525,8 @@ function clearSpecs() {
 }
 
 function reviewSpecs(description, noFix) {
-  const { f, text } = profile()
+  const { f, text: profileText } = profile()
+  const text = applyPlanningPolicy(description, profileText)
 
   // ONCE, before the loop — the rule enumerate() states about itself, and which this function
   // broke for as long as it has existed. The call sat inside judgeSpecs(), so a run that fixed
@@ -5594,13 +6002,14 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
   caw.mjs review <NNN_slug.md>            review a task finished by hand, and commit
   caw.mjs done <NNN_slug.md>              remove a spec with no review at all
   caw.mjs probe <provider>                refresh machine-local live evidence
+  caw.mjs verify-project                  validate configured project policies
   caw.mjs artifacts list|purge <id>       inspect or remove retained artifacts
 
 Every pipeline command refuses until all five roles resolve and carry current green probe
 evidence. Run \`caw.mjs probe <provider>\` on the machine that will execute it.`
 
 const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done', 'probe',
-  'artifacts']
+  'verify-project', 'artifacts']
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { say(USAGE); return }
 if (cmd === '--version' || cmd === '-v') { say(VERSION); return }
 if (!KNOWN.includes(cmd)) die(`unknown command: ${cmd}\n\n${USAGE}`)
@@ -5615,8 +6024,16 @@ pruneInvocationScratch()
 // valid binding and target CLI, but deliberately reaches probeProvider before role guarantees are
 // compared: repairing the matrix cannot depend on the matrix already being usable.
 if (cmd === 'artifacts') { artifacts(rest); return }
+if (cmd === 'verify-project') {
+  try { projectPolicySet = readProjectPolicies() }
+  catch (error) { die(error?.message || String(error)) }
+  verifyProjectPolicies(projectPolicySet)
+  return
+}
 await discoverAdapters()
 if (cmd === 'probe') { probeProvider(rest[0]); return }
+try { projectPolicySet = readProjectPolicies() }
+catch (error) { die(error?.message || String(error)) }
 // Pipeline and queue commands retain the all-five preflight selected in slice 2.1.
 profile()
 
@@ -5692,7 +6109,7 @@ export {
   GateFailureAction, PlanningAction, SCHEMA, addAccounting, canonicalAuthorityPaths,
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
   normalizeAccounting, reviewCriteriaIssue,
-  populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
-  removeTree, restoreWeakReplaySurface, retainWeakVerificationEvents, runWeakReplaySession,
-  zeroAccounting,
+  populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
+  roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface, retainWeakVerificationEvents,
+  runProjectPolicy, runWeakReplaySession, verifyProjectPolicies, zeroAccounting,
 }
