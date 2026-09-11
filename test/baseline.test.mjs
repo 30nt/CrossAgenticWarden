@@ -180,6 +180,8 @@ function fixture({
   reviewDependencies = '',
   planningIndependence = '',
   taskIndependence = '',
+  weakSourceProbe = '',
+  weakPositiveControl = '',
 } = {}) {
   const parent = mkdtempSync(join(tmpdir(), 'caw-baseline-'))
   TEMP_ROOTS.add(parent)
@@ -251,6 +253,8 @@ review_dependency_roots: ${reviewDependencies}
 docs_language: English
 planning_independence: ${planningIndependence}
 task_independence: ${taskIndependence}
+weak_source_probe_cmd: ${weakSourceProbe}
+weak_positive_control_cmd: ${weakPositiveControl}
 ---
 
 # CAW profile
@@ -3122,6 +3126,139 @@ test('weak verification retention reports every event lost beyond its ceiling', 
   assert.equal(retained.retained, 32)
   assert.equal(retained.truncated, 3)
   assert.equal(retained.events.length, 32)
+})
+
+test('configured weak controls prove review source use and gate sensitivity',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `node -e "const f=require('fs');process.exit(f.readFileSync('control.txt','utf8')==='ok\\n'?0:1)"`
+  const weakSourceProbe = `node -e "const p=require('path');console.error('probe diagnostic');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const weakPositiveControl = `node -e "require('fs').writeFileSync('control.txt','broken\\n')"`
+  const f = fixture({
+    git: true, gateFast, weakSourceProbe, weakPositiveControl,
+  })
+  writeFileSync(join(f.root, 'control.txt'), 'ok\n')
+  execFileSync('git', ['add', 'control.txt'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add weak control'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the heading',
+      evidence: 'changed README.md in the isolated review surface',
+      mutation: { patch: readmeMutation('controlled'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 1)
+  const state = JSON.parse(readFileSync(
+    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
+  assert.equal(state.weak_verification.state, 'controlled-green')
+  assert.deepEqual(state.weak_verification.controls.source_probe.loaded_paths, ['README.md'])
+  assert.equal(state.weak_verification.controls.positive_control.gate.state, 'red')
+  assert.deepEqual(state.weak_verification.controls.positive_control.paths, ['control.txt'])
+  assert.equal(state.weak_verification.replay_surface.restores, 3)
+  assert.equal(state.history[0].mutation_event.state, 'confirmed-weak')
+  assert.equal(readFileSync(join(f.root, 'control.txt'), 'utf8'), 'ok\n')
+})
+
+test('a weak source probe cannot claim a file outside the review surface',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "console.log(JSON.stringify({loaded_paths:[process.execPath]}))"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl: 'false' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the fixture heading',
+      evidence: 'claimed a source outside the review surface',
+      mutation: { patch: readmeMutation('outside-source'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /source probe invalid/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-source-probe-invalid')
+  assert.match(certification.weak_verification.controls.source_probe.reason,
+    /outside review source/)
+})
+
+test('a weak source probe that mutates the review surface is unavailable',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "const f=require('fs'),p=require('path');f.writeFileSync('README.md','# probe mutation\\n');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl: 'false' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'keep source discovery read-only',
+      evidence: 'the source probe changed a tracked file',
+      mutation: { patch: readmeMutation('mutating-source'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /source probe mutated/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-source-probe-mutated')
+  assert.match(certification.weak_verification.controls.source_probe.reason,
+    /source probe changed the review surface/)
+  assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
+})
+
+test('a green positive control makes weak evidence unavailable and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "const p=require('path');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const weakPositiveControl = `node -e "require('fs').writeFileSync('README.md','# control-still-green\\n')"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the heading',
+      evidence: 'changed README.md in the isolated review surface',
+      mutation: { patch: readmeMutation('unverified-control'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /positive control green/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-positive-control-green')
+  assert.equal(certification.weak_verification.mutations.length, 0)
+})
+
+test('weak controls must be configured as one pair before provider calls', () => {
+  const f = fixture({ git: true, weakSourceProbe: 'node source-probe.mjs' })
+  const result = run(f, ['plan', 'x'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /must configure weak_source_probe_cmd and weak_positive_control_cmd together/)
+  assert.equal(calls(f).length, 0)
 })
 
 test('a nonescaping weak mutation that makes the gate red is refuted and noted',

@@ -1613,6 +1613,7 @@ const BLOCKED_PATCH_MAX = 64 * 1024 * 1024
 const DIVERGED_SPEC_MAX = 1024 * 1024
 const REVIEW_SURFACE_MAX = 2 * 1024 * 1024 * 1024
 const REVIEW_SURFACE_PARENT = join(tmpdir(), 'caw-review-surfaces')
+const WEAK_CONTROL_TIMEOUT_DEFAULT_MS = 5000
 const ADAPTER_TRANSPORT_MAX = 64 * 1024 * 1024
 const ADAPTER_TRANSPORT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const ADAPTER_TRANSPORT_MAX_COUNT = 3
@@ -2186,6 +2187,11 @@ function profile(preflight = true) {
   f.index_format = f.index_format || 'text-v0'
   if (!['text-v0', 'json-v1'].includes(f.index_format)) {
     die(`.caw/CAW.md index_format must be text-v0 or json-v1 — got "${f.index_format}"`)
+  }
+  const weakControls = ['weak_source_probe_cmd', 'weak_positive_control_cmd']
+    .filter((key) => Boolean(f[key]))
+  if (weakControls.length === 1) {
+    die('.caw/CAW.md must configure weak_source_probe_cmd and weak_positive_control_cmd together')
   }
   for (const key of ['planning_independence', 'task_independence']) {
     f[key] = f[key] || 'same-provider'
@@ -5123,6 +5129,128 @@ function captureWeakMutations(items, surface, baseline) {
   return { accepted, noted }
 }
 
+function runWeakControlCommand(command, f, spec, surface) {
+  const timeoutMs = f.gate_fast_timeout_ms || WEAK_CONTROL_TIMEOUT_DEFAULT_MS
+  const env = { ...process.env, PWD: surface.workingRoot }
+  if (spec) env.CAW_SPEC = spec
+  const startedAt = Date.now()
+  const result = spawnSync('bash', ['-lc', command], {
+    cwd: surface.workingRoot,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    env,
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+  })
+  const stdout = (result.stdout || '').slice(-8000)
+  const stderr = (result.stderr || '').slice(-8000)
+  return {
+    status: result.status,
+    timeout_ms: timeoutMs,
+    duration_ms: Date.now() - startedAt,
+    timed_out: result.error?.code === 'ETIMEDOUT',
+    stdout,
+    stderr,
+    output: `${stdout}${stderr}`.slice(-8000),
+  }
+}
+
+function weakVerificationControls(f, spec, expectedDigest, surface, baseline) {
+  if (!f.weak_source_probe_cmd) return null
+  const unavailable = (state, sourceProbe, positiveControl = null) => ({
+    state, source_probe: sourceProbe, positive_control: positiveControl,
+  })
+  const sourceProbe = runWeakControlCommand(f.weak_source_probe_cmd, f, spec, surface)
+  if (deliveryDigest() !== expectedDigest) {
+    throw new WeakMutationInvariantError(
+      'delivery tree changed while the weak source probe ran')
+  }
+  if (sourceProbe.timed_out || sourceProbe.status !== 0) {
+    return unavailable(sourceProbe.timed_out
+      ? 'unverified-source-probe-timeout' : 'unverified-source-probe-failed', sourceProbe)
+  }
+  let answer
+  try { answer = JSON.parse(sourceProbe.stdout) }
+  catch { return unavailable('unverified-source-probe-invalid', sourceProbe) }
+  try {
+    exactObjectKeys(answer, ['loaded_paths'], 'weak source probe')
+    if (!Array.isArray(answer.loaded_paths) || !answer.loaded_paths.length ||
+        answer.loaded_paths.some((path) => typeof path !== 'string' || !isAbsolute(path))) {
+      throw new Error('weak source probe loaded_paths must be a non-empty array of absolute paths')
+    }
+    sourceProbe.loaded_paths = answer.loaded_paths.map((path) => {
+      const sourceRoot = realpathSync(surface.workingRoot)
+      const canonical = realpathSync(path)
+      const stat = lstatSync(canonical)
+      if (!inside(sourceRoot, canonical) ||
+          inside(join(sourceRoot, '.git'), canonical) || !stat.isFile()) {
+        throw new Error(`weak source probe path is outside review source: ${path}`)
+      }
+      return relative(sourceRoot, canonical).split(sep).join('/')
+    })
+  } catch (error) {
+    sourceProbe.reason = error?.message || String(error)
+    return unavailable('unverified-source-probe-invalid', sourceProbe)
+  }
+  const sourceStatus = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (sourceStatus) {
+    sourceProbe.reason = `source probe changed the review surface: ${sourceStatus}`
+    return unavailable('unverified-source-probe-mutated', sourceProbe)
+  }
+
+  const positiveControl = runWeakControlCommand(f.weak_positive_control_cmd, f, spec, surface)
+  if (deliveryDigest() !== expectedDigest) {
+    throw new WeakMutationInvariantError(
+      'delivery tree changed while the weak positive control ran')
+  }
+  if (positiveControl.timed_out || positiveControl.status !== 0) {
+    return unavailable(positiveControl.timed_out
+      ? 'unverified-positive-control-timeout' : 'unverified-positive-control-failed',
+    sourceProbe, positiveControl)
+  }
+  const status = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (!status || status.split('\n').some((line) => line.startsWith('?? '))) {
+    positiveControl.reason = !status
+      ? 'positive control changed no tracked file'
+      : 'positive control created an untracked file'
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  const patch = execFileSync('git', ['diff', '--binary', baseline, '--'], {
+    cwd: surface.workingRoot, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  if (!patch.length || patch.length > REVIEW_PATCH_MAX) {
+    positiveControl.reason = 'positive control patch is empty or oversized'
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  try { positiveControl.paths = weakPatchPaths(surface, patch) }
+  catch (error) {
+    if (error instanceof WeakMutationSecurityError) throw error
+    positiveControl.reason = error?.message || String(error)
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  positiveControl.patch_bytes = patch.length
+  positiveControl.patch_sha256 = createHash('sha256').update(patch).digest('hex')
+  const controlGate = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms)
+  positiveControl.gate = {
+    state: controlGate.state,
+    status: controlGate.status,
+    duration_ms: controlGate.durationMs,
+    timeout_ms: controlGate.timeoutMs,
+    output: controlGate.out,
+  }
+  surface.weakGate = {
+    phase: 'positive-control', state: controlGate.state, gate: f.gate_fast,
+    status: controlGate.status, output: controlGate.out,
+  }
+  if (controlGate.state !== 'red') {
+    return unavailable(`unverified-positive-control-${controlGate.state}`,
+      sourceProbe, positiveControl)
+  }
+  return { state: 'verified', source_probe: sourceProbe, positive_control: positiveControl }
+}
+
 function runWeakReplaySession(items, operations) {
   if (!Array.isArray(items)) throw new TypeError('weak replay items must be an array')
   const required = [
@@ -5144,6 +5272,15 @@ function runWeakReplaySession(items, operations) {
     if (outcome.baseline?.state !== 'green') {
       outcome.state = 'baseline-unavailable'
       return outcome
+    }
+    if (typeof operations.runControls === 'function') {
+      outcome.controls = operations.runControls(surface, baseline)
+      if (outcome.controls?.state !== 'verified') {
+        outcome.state = 'controls-unavailable'
+        return outcome
+      }
+      operations.restoreSurface(surface, baseline, 'controls')
+      outcome.restores += 1
     }
     for (const [index, item] of items.entries()) {
       operations.restoreSurface(surface, baseline, index)
@@ -5266,6 +5403,10 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     prepareSurface: (surface) => prepareWeakCapture(surface),
     restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
     runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
+    ...(f.weak_source_probe_cmd ? {
+      runControls: (surface, baseline) =>
+        weakVerificationControls(f, spec, expectedDigest, surface, baseline),
+    } : {}),
     runMutation: (item, surface) => {
       try {
         return { event: replayWeakMutation(item, f, spec, expectedDigest, surface) }
@@ -5288,6 +5429,9 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
                 `unmutated weak-verification gate was red (status ${baseline.gate_status})`]
         retainReviewSurface(surface,
           baselineReason[0], baselineReason[1])
+      } else if (outcome.state === 'controls-unavailable') {
+        retainReviewSurface(surface, 'weak-controls-unavailable',
+          outcome.controls?.state || 'weak verification controls did not complete')
       } else if (outcome.state === 'error') {
         retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
       } else {
@@ -5322,6 +5466,7 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
       : baseline.state === 'timeout' ? 'unverified-baseline-timeout'
       : 'unverified-baseline-red',
     baseline,
+    controls: session.controls || null,
     mutations: [],
     failures: [],
     replay_surface: {
@@ -5343,6 +5488,15 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     }
     return { accepted, events, noted, verification }
   }
+  if (session.state === 'controls-unavailable') {
+    verification.state = session.controls?.state || 'unverified-controls'
+    const reason = verification.state.replace(/^unverified-/, '').replaceAll('-', ' ')
+    say(`  weak verification DID NOT COMPLETE: ${reason};` +
+      ` recording ${(items || []).length} finding(s) as non-blocking unavailable evidence`)
+    for (const item of items || []) noted.push(weakUnavailable(item, reason))
+    return { accepted, events, noted, verification }
+  }
+  if (session.controls?.state === 'verified') verification.state = 'controlled-green'
   for (const [index, item] of (items || []).entries()) {
     const result = session.mutations[index]
     if (result?.event) {

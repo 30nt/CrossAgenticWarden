@@ -25,6 +25,13 @@ changing another component is unavailable evidence, not a confirmed weak test.
 Captured mutation patches are private run-record artifacts. Verification and certification rows
 retain their file name, byte count, and SHA-256 instead of embedding the patch in JSON.
 
+Projects may make weak verification controlled by configuring both `weak_source_probe_cmd` and
+`weak_positive_control_cmd`. The source probe must report the absolute files it actually loaded
+from the isolated review surface. The positive control must change a tracked file and make
+`gate_fast` red. CAW restores the surface before replaying reviewer mutations. A failed, timed-out,
+invalid, mutating source probe or an uncaught positive control makes weak evidence unavailable and
+the certification `limited`; it does not create work for the executor.
+
 `PLAN.md` carries the population state, counts, and digest from planning into a later build. A
 hand-written task or an old plan has `population: unknown`, so it cannot receive ordinary
 certification. Its commit says `accepted with LIMITED certification`.
