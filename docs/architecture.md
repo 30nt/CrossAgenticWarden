@@ -83,6 +83,10 @@ The derived result is retained as a [certification record](certification.md). Ac
 certification are separate states: missing independent population or unavailable verification is
 visible as `limited`, never silently called `approved`.
 
+Task delivery has two records. The public commit contains the subject, compact gate/review result
+and an audit digest. The private Git audit record contains the full task contract and evidence
+identities, and binds them to both the reviewed delivery digest and the staged Git tree.
+
 Weak verification can have two project-supplied controls. A source probe proves that the check
 loaded files from the isolated review surface, and a positive control proves that `gate_fast` can
 turn red for a known tracked-file change. They run before reviewer mutations and the surface is

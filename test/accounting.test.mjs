@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   addAccounting,
+  compactRunMetrics,
   deltaAccounting,
   formatAccounting,
   normalizeAccounting,
@@ -16,6 +17,31 @@ const counters = (calls, inputTokens, outputTokens) => ({
   cachedReadTokens: 0,
   cachedWrittenTokens: 0,
   reasoningTokens: null,
+})
+
+test('run metrics retain bounded decisions without provider payloads', () => {
+  const metrics = compactRunMetrics({
+    run_id: 'run-1', started_at: 'start', updated_at: 'end', status: 'failed',
+    calls: [
+      { role: 'executor', status: 'success', usage_state: 'reported', duration_ms: 120 },
+      { role: 'reviewer', status: 'failure', usage_state: 'estimated', duration_ms: 80 },
+    ],
+    policy_calls: [{ stage: 'gate', duration_ms: 5, output: 'must not survive' }],
+    certifications: [{ state: 'limited' }],
+    final_response: 'must not survive',
+  })
+  assert.deepEqual(metrics, {
+    version: 1,
+    run_id: 'run-1', started_at: 'start', updated_at: 'end', status: 'failed',
+    provider_calls: 2,
+    provider_calls_by_role: { executor: 1, reviewer: 1 },
+    provider_calls_by_status: { failure: 1, success: 1 },
+    usage_states: { estimated: 1, reported: 1 },
+    provider_duration_ms: 200,
+    policy_calls: 1,
+    policy_duration_ms: 5,
+    certifications: { limited: 1 },
+  })
 })
 
 test('accounting adds only like currencies and formats mixed lower bounds', () => {
