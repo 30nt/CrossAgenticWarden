@@ -47,6 +47,12 @@ const relatedPlan = () => ({
     read: ['src/state.js'],
     change: ['Keep both states explicit.'],
     done_when: ['The empty state survives.', 'The populated state survives.'],
+    surfaces: [{ id: 'state-storage', responsibility: 'Preserve the stored state.' }],
+    state_machines: [{
+      surface: 'state-storage', states: ['empty', 'populated'],
+      transitions: [{ from: 'empty', event: 'store value', to: 'populated' }],
+    }],
+    indivisible_reason: '',
   }],
   coverage: [{
     case: 'empty and populated states',
@@ -69,6 +75,8 @@ test('planning ledger gives stable ids to requirements and case-to-criterion rel
   assert.equal(first.relations[0].criterion_ids.length, 2)
   assert.match(first.tasks[0].id, /^plan-task-[0-9a-f]{12}$/)
   assert.match(first.cases[0].id, /^plan-case-[0-9a-f]{12}$/)
+  assert.deepEqual(first.requirements.map(({ section }) => section),
+    ['read', 'change', 'done_when', 'done_when', 'surface', 'state-transition'])
 })
 
 test('plan relation review requires every known id exactly once with evidence', () => {
@@ -93,4 +101,7 @@ test('plan-reviewer schema requires the complete relation ledger', () => {
     ['covered', 'uncovered'])
   assert.deepEqual(SCHEMA.plan.properties.coverage.items.required,
     ['case', 'task', 'acceptance_criteria'])
+  assert.deepEqual(SCHEMA.plan.properties.tasks.items.required,
+    ['slug', 'title', 'read', 'change', 'done_when', 'surfaces', 'state_machines',
+      'indivisible_reason'])
 })

@@ -72,6 +72,11 @@ The plan reviewer must return one evidenced disposition for every relation id; m
 or unknown ids invalidate the response. The complete ledger stays in `PLAN.md`, while each task
 spec carries its own acceptance links.
 
+Every task also declares independently changeable surfaces and one explicit state machine per
+surface. Surface responsibilities and transitions become stable ledger requirements. The engine
+requires globally unique surface ids and a concrete indivisibility reason whenever one task owns
+more than one surface; otherwise the architect must split the work.
+
 The reviewer states no verdict. Before the call, the engine gives every `Must cover`, `Change`,
 and `Done when` bullet a stable id. The reviewer must return exactly one evidenced disposition
 for each row in that atomic census. It also fills `broken`, `uncovered`, `weak` and `noted`, and

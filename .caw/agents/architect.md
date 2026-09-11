@@ -44,6 +44,13 @@ Split the request into tasks that are each:
   only way to state a dependency — there is no `depends_on` field, because in a sequential
   pipeline "after" is the only relation there is.
 
+For every task, name each independently changeable `surface` with a globally unique kebab-case
+id and one responsibility. Give every surface exactly one `state_machine`: at least two named
+states and at least one event-labelled transition between declared states. Split unrelated
+surfaces into separate tasks. A task may contain several surfaces only when
+`indivisible_reason` says why they cannot be delivered independently; leave it empty for a
+single-surface task.
+
 Write `read`, `change` and `done_when` for someone who has not seen this request and will
 not see it. They are the entire scope the executor gets.
 

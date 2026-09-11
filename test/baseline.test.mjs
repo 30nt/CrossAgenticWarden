@@ -117,6 +117,12 @@ const plan = () => ({
     read: ['README.md'],
     change: ['Write the fixture output.'],
     done_when: ['The fixture output exists.'],
+    surfaces: [{ id: 'fixture-output', responsibility: 'The generated fixture output.' }],
+    state_machines: [{
+      surface: 'fixture-output', states: ['absent', 'present'],
+      transitions: [{ from: 'absent', event: 'write fixture', to: 'present' }],
+    }],
+    indivisible_reason: '',
   }],
   coverage: [{
     case: 'fixture output', task: 'baseline-task',
@@ -3380,6 +3386,32 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   assert.equal(unknownCriterion.status, 1)
   assert.match(unknownCriterion.stderr, /unknown done_when criterion/)
   assert.equal(existsSync(join(acceptance.root, '.caw-tasks')), false)
+
+  const multipleSurfaces = fixture()
+  const missingIndivisibility = plan()
+  missingIndivisibility.tasks[0].surfaces.push({
+    id: 'fixture-display', responsibility: 'Display the generated fixture output.',
+  })
+  missingIndivisibility.tasks[0].state_machines.push({
+    surface: 'fixture-display', states: ['hidden', 'visible'],
+    transitions: [{ from: 'hidden', event: 'show fixture', to: 'visible' }],
+  })
+  const noReason = run(multipleSurfaces, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(missingIndivisibility) },
+  ])
+  assert.equal(noReason.status, 1)
+  assert.match(noReason.stderr, /indivisible_reason/)
+
+  const transition = fixture()
+  const unknownState = plan()
+  unknownState.tasks[0].state_machines[0].transitions[0].to = 'deleted'
+  const badTransition = run(transition, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(unknownState) },
+  ])
+  assert.equal(badTransition.status, 1)
+  assert.match(badTransition.stderr, /declared states/)
 })
 
 test('plan reviewer must adjudicate every engine relation id exactly once', () => {

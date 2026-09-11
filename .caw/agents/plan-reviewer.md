@@ -35,6 +35,11 @@ the code, before you read the plan closely.
 - A task needing something a later task produces is `misordered`.
 - A task doing work the request did not ask for is `out_of_scope`.
 
+Treat each declared surface and state transition as a requirement. A task that combines
+independently deliverable surfaces without a concrete `indivisible_reason` is `unverifiable`:
+its claimed atomic boundary has not been established. A missing state, transition, or surface
+responsibility is `uncovered` when it leaves an implied case without a final-tree check.
+
 The engine also gives every declared `case → task → acceptance criterion` relation a stable id.
 Return exactly one `relations` row for every id. Mark it `covered` only when the named final-tree
 criteria actually establish the case; otherwise mark it `uncovered` and state the missing proof.
