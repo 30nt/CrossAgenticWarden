@@ -6970,15 +6970,22 @@ function adjudicate(history, carried) {
 
 const openItems = (history) => history.filter((i) => i.state === 'open')
 
+function renderOriginRuntime(originRuntime) {
+  if (!originRuntime) return '\n      origin: legacy/unknown'
+  const origins = Array.isArray(originRuntime) ? originRuntime : [originRuntime]
+  return origins.map((origin, index) => {
+    const pass = origins.length > 1 ? `pass ${origin?.pass || index + 1} ` : ''
+    return `\n      origin: ${pass}${origin?.provider || 'unknown'}/${
+      origin?.requested?.model || '?'} runtime=${origin?.runtime_digest?.slice(0, 12) || '?'}`
+  }).join('')
+}
+
 // What the executor is handed. The evidence travels with the item, and it is not padding: "this
 // assertion can be mutated green" and the mutation that proves it are different instructions,
 // and the executor has no other way to see the tree the way the reviewer saw it.
 const renderItems = (items) => items
   .map((i) => `[${i.id}] ${i.slot} — ${i.where}\n      ${i.fix}\n      evidence: ${i.evidence}` +
-    (i.origin_runtime
-      ? `\n      origin: ${i.origin_runtime.provider}/${i.origin_runtime.requested?.model || '?'} ` +
-        `runtime=${i.origin_runtime.runtime_digest?.slice(0, 12) || '?'}`
-      : '\n      origin: legacy/unknown') +
+    renderOriginRuntime(i.origin_runtime) +
     (i.discovery === 'late-same-baseline'
       ? `\n      discovery: challenger pass ${i.review_pass}, late on baseline ${
           i.baseline_digest?.slice(0, 12) || '?'}`
