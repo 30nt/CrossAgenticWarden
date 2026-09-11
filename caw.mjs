@@ -1904,6 +1904,21 @@ function recordWeakVerification(task, round, verification, status = 'active') {
   if (!verification) return
   const run = beginRunRecord()
   const baseline = verification.baseline || {}
+  const retainPatch = (entry, index, kind) => {
+    if (typeof entry?.patch !== 'string') return entry
+    const patch = entry.patch
+    const name = `weak-${taskArtifactBase(task)}-round-${round}-${kind}-${index + 1}.patch`
+    writePrivateFile(join(run.path, name), Buffer.from(patch), REVIEW_PATCH_MAX)
+    delete entry.patch
+    entry.patch_file = name
+    entry.patch_bytes = Buffer.byteLength(patch)
+    entry.patch_sha256 = createHash('sha256').update(patch).digest('hex')
+    return entry
+  }
+  ;(verification.mutations || []).forEach((entry, index) =>
+    retainPatch(entry, index, 'mutation'))
+  ;(verification.failures || []).forEach((entry, index) =>
+    retainPatch(entry, index, 'unavailable'))
   const events = [{
     task,
     round,
@@ -5172,8 +5187,19 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
   }
   const paths = weakPatchPaths(surface, patch)
   const expectedPath = weakExpectedPath(item, surface)
+  const patchEvidence = {
+    patch,
+    patch_sha256: createHash('sha256').update(patch).digest('hex'),
+    patch_bytes: bytes,
+    paths,
+    expected_path: expectedPath,
+    expected_path_matched: expectedPath ? paths.includes(expectedPath) : null,
+  }
   if (expectedPath && !paths.includes(expectedPath)) {
-    throw new Error(`weak mutation changes ${paths.join(', ')} but reviewer location names ${expectedPath}`)
+    const error = new Error(
+      `weak mutation changes ${paths.join(', ')} but reviewer location names ${expectedPath}`)
+    error.weakPatch = patchEvidence
+    throw error
   }
   execFileSync('git', ['apply', '--check', '--binary', '-'], {
     cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
@@ -5187,11 +5213,7 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     state: result.state === 'timeout' ? 'unverified-timeout'
       : result.state === 'refused' ? 'unverified-refused'
       : result.ok ? 'confirmed-weak' : 'mutation-caught',
-    patch_sha256: createHash('sha256').update(patch).digest('hex'),
-    patch_bytes: bytes,
-    paths,
-    expected_path: expectedPath,
-    expected_path_matched: expectedPath ? true : null,
+    ...patchEvidence,
     gate: f.gate_fast,
     gate_status: result.status ?? (result.ok ? 0 : null),
     gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
@@ -5252,7 +5274,7 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
             error instanceof WeakMutationInvariantError) throw error
         const detail = (error?.stderr?.toString() || error?.message || String(error))
           .trim().split('\n').filter(Boolean).pop() || 'replay unavailable'
-        return { error: detail }
+        return { error: detail, ...(error?.weakPatch || {}) }
       }
     },
     finishSurface: (surface, outcome) => {
@@ -5347,6 +5369,14 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
         state: 'unavailable',
         where: item.where,
         reason,
+        ...(result?.patch === undefined ? {} : {
+          patch: result.patch,
+          patch_sha256: result.patch_sha256,
+          patch_bytes: result.patch_bytes,
+          paths: result.paths,
+          expected_path: result.expected_path,
+          expected_path_matched: result.expected_path_matched,
+        }),
       })
       noted.push(weakUnavailable(item, reason))
     }

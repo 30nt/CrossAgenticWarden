@@ -3107,6 +3107,11 @@ test('a committed task retains its confirmed weak verification in the run record
   assert.equal(manifest.weak_verification.events[0].state, 'baseline-green')
   assert.equal(manifest.weak_verification.events[1].task, '001_baseline-task.md')
   assert.equal(manifest.weak_verification.events[1].state, 'confirmed-weak')
+  assert.match(manifest.weak_verification.events[1].patch_file, /^weak-.*\.patch$/)
+  const retainedPatch = readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.weak_verification.events[1].patch_file))
+  assert.equal(createHash('sha256').update(retainedPatch).digest('hex'),
+    manifest.weak_verification.events[1].patch_sha256)
 })
 
 test('weak verification retention reports every event lost beyond its ceiling', () => {
@@ -3246,10 +3251,15 @@ test('a weak mutation against another component is unavailable and never reaches
   assert.deepEqual(manifest.calls.map(({ role }) => role), ['reviewer'])
   assert.equal(manifest.weak_verification.events.at(-1).kind, 'mutation-unavailable')
   assert.equal(manifest.weak_verification.events.at(-1).state, 'unavailable')
+  assert.match(manifest.weak_verification.events.at(-1).patch_file, /^weak-.*\.patch$/)
+  assert.equal(existsSync(join(f.root, '.caw-logs', runName,
+    manifest.weak_verification.events.at(-1).patch_file)), true)
   const certification = JSON.parse(readFileSync(join(
     f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
   assert.equal(certification.weak_verification.state, 'unverified-mutation-replay')
   assert.equal(certification.limitations.includes('unverified-mutation-replay'), true)
+  assert.equal(certification.weak_verification.failures[0].patch_file,
+    manifest.weak_verification.events.at(-1).patch_file)
 })
 
 const activeSurfaceNames = () => existsSync(REVIEW_SURFACE_PARENT)

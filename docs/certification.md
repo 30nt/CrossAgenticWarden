@@ -22,6 +22,8 @@ or replay that cannot complete is `unavailable`: CAW retains its evidence and li
 certification, but does not turn it into a code requirement for the executor.
 When `where` names an existing repository file, the captured mutation must change that exact file;
 changing another component is unavailable evidence, not a confirmed weak test.
+Captured mutation patches are private run-record artifacts. Verification and certification rows
+retain their file name, byte count, and SHA-256 instead of embedding the patch in JSON.
 
 `PLAN.md` carries the population state, counts, and digest from planning into a later build. A
 hand-written task or an old plan has `population: unknown`, so it cannot receive ordinary
