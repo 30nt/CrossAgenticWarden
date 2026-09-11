@@ -52,10 +52,12 @@ the entire surface.
 The enumerator is deliberately blind: it is asked what the request implies *before* it can be
 shaped by the plan, so its list is a check on the architect rather than an echo of it.
 
-The reviewer states no verdict. It fills `broken`, `uncovered`, `weak` and `noted`, and the script
-derives approval from whether anything blocking is open. From round 2 it is handed its own open
-items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An id it
-omits stays open.
+The reviewer states no verdict. Before the call, the engine gives every `Must cover`, `Change`,
+and `Done when` bullet a stable id. The reviewer must return exactly one evidenced disposition
+for each row in that atomic census. It also fills `broken`, `uncovered`, `weak` and `noted`, and
+the script derives approval from whether anything blocking is open. From round 2 it is handed its
+own open items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An
+id it omits stays open.
 
 The derived result is retained as a [certification record](certification.md). Acceptance and full
 certification are separate states: missing independent population or unavailable verification is

@@ -205,6 +205,7 @@ function canonicalAuthorityPaths(profileText) {
 
 const REVIEW_CRITERION_SECTIONS = new Map([
   ['must cover', { label: 'Must cover', prefix: 'must-cover' }],
+  ['change', { label: 'Change', prefix: 'change' }],
   ['done when', { label: 'Done when', prefix: 'done-when' }],
 ])
 
@@ -252,7 +253,7 @@ function renderReviewCriteria(spec, additional = []) {
   const criteria = [...extractReviewCriteria(spec), ...additional]
   return criteria.length
     ? criteria.map((item) => `- ${item.id} [${item.section}] ${item.criterion}`).join('\n')
-    : '(none — this spec has no Must cover or Done when bullets)'
+    : '(none — this spec has no Must cover, Change, or Done when bullets)'
 }
 
 function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
@@ -289,7 +290,7 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
 
   for (const item of verdict?.uncovered || []) {
     if (!expected.some((criterion) => item?.evidence?.includes(criterion.criterion))) {
-      return 'an uncovered item does not quote any exact Must cover or Done when criterion'
+      return 'an uncovered item does not quote any exact Must cover, Change, or Done when criterion'
     }
   }
   return null
@@ -1436,8 +1437,9 @@ const SCHEMA = closeSchema({
     properties: {
       criteria: {
         type: 'array',
-        description: 'exactly one row for every engine-listed Must cover and Done when ' +
-          'criterion. Missing, duplicate, or unknown ids invalidate the response.',
+        description: 'the atomic review census: exactly one row for every engine-listed Must ' +
+          'cover, Change, and Done when criterion. Missing, duplicate, or unknown ids invalidate ' +
+          'the response.',
         items: {
           type: 'object',
           properties: {
@@ -1483,7 +1485,7 @@ const SCHEMA = closeSchema({
       },
       uncovered: {
         type: 'array', items: REVIEW_ITEM,
-        description: "a line of the spec's `## Done when` or `## Must cover` that the tree does " +
+        description: "a line of the spec's `## Must cover`, `## Change`, or `## Done when` that the tree does " +
           'not meet. Quote the line in `evidence`.',
       },
       weak: {

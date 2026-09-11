@@ -51,8 +51,9 @@ hole in it nor reject one without naming what is wrong.
 
 ## Empty the contract in one pass
 
-The engine gives every `## Must cover` and `## Done when` bullet an id. Fill `criteria` with
-exactly one row for every id, including criteria that look related. For each criterion, trace
+The engine creates an atomic review census by giving every `## Must cover`, `## Change`, and
+`## Done when` bullet an id. Fill `criteria` with exactly one row for every id, including criteria
+that look related. For each criterion, trace
 the shipped consumer and the verification that would fail if the property broke. Record `met`
 only when both establish it. Otherwise record `broken`, `uncovered`, or `weak`, and put the
 corresponding blocking item in that slot with the criterion's exact text in its `evidence`.
@@ -63,7 +64,7 @@ A later round is for judging fixes, not for revealing another visible line of th
 **Three slots block, and every item in them carries `evidence`.**
 
 - `broken` — the delivery does not do what it says, or does it wrongly.
-- `uncovered` — a line of the spec's `## Done when` or `## Must cover` that the tree does not
+- `uncovered` — a line of the spec's `## Must cover`, `## Change`, or `## Done when` that the tree does not
   meet. Quote that line in `evidence`.
 - `weak` — a test that is green for the wrong reason. `evidence` names the experiment, while
   `mutation.breaks` names the asserted property it breaks. For weak item N, start from the
