@@ -17,6 +17,10 @@ weak verification, ID открытых findings и digest project policies.
   недоступна;
 - `rejected` — остались блокирующие пункты.
 
+Weak-эксперимент, который поймал gate, записывается как `refuted`. Если baseline, mutation gate
+или replay не удалось завершить, результат считается `unavailable`: CAW сохраняет evidence и
+ограничивает сертификацию, но не превращает такой результат в требование к коду для executor.
+
 `PLAN.md` переносит состояние, счётчики и digest population из планирования в последующий build.
 Ручная задача и старый план получают `population: unknown`, поэтому обычная сертификация для них
 невозможна. В коммите будет `accepted with LIMITED certification`.

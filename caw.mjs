@@ -4862,9 +4862,13 @@ function prepareWeakCapture(surface) {
   return baseline
 }
 
-const weakDowngrade = (item, reason) =>
-  `weak downgraded to noted — ${item.where}: ${item.fix}; ` +
-  `mutation was not reproducible (${reason}). Evidence: ${item.evidence}`
+const weakRefuted = (item, reason) =>
+  `weak refuted experiment, noted only — ${item.where}: ${item.fix}; ` +
+  `the experiment contradicted the finding (${reason}). Evidence: ${item.evidence}`
+
+const weakUnavailable = (item, reason) =>
+  `weak verification unavailable, noted only — ${item.where}: ${item.fix}; ` +
+  `verification could not complete (${reason}). Evidence: ${item.evidence}`
 
 function weakPatchPaths(surface, patch) {
   const raw = execFileSync('git', ['apply', '--numstat', '-z', '-'], {
@@ -4912,7 +4916,7 @@ function captureWeakMutations(items, surface, baseline) {
       if (error instanceof WeakMutationSecurityError) throw error
       const detail = (error?.stderr?.toString() || error?.message || String(error))
         .trim().split('\n').filter(Boolean).pop() || 'capture unavailable'
-      noted.push(weakDowngrade(item, detail))
+      noted.push(weakUnavailable(item, detail))
     }
   }
   return { accepted, noted }
@@ -5115,17 +5119,12 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     say(`  weak verification ${['refused', 'timeout'].includes(baseline.state)
       ? 'DID NOT COMPLETE' : 'unavailable'}:` +
       ` unmutated surface gate status ${baseline.gate_status};` +
-      ` carrying ${(items || []).length} finding(s) unverified`)
+      ` recording ${(items || []).length} finding(s) as non-blocking unavailable evidence`)
     for (const item of items || []) {
-      accepted.push(item)
-      events.push({
-        state: 'unverified',
-        reason: baseline.state === 'refused' ? 'baseline-refused'
-          : baseline.state === 'timeout' ? 'baseline-timeout' : 'baseline-red',
-        gate: baseline.gate,
-        gate_status: baseline.gate_status,
-        gate_output: baseline.gate_output,
-      })
+      noted.push(weakUnavailable(item,
+        baseline.state === 'refused' ? 'unmutated baseline gate refused to run'
+          : baseline.state === 'timeout' ? 'unmutated baseline gate timed out'
+            : `unmutated baseline gate was red (status ${baseline.gate_status})`))
     }
     return { accepted, events, noted, verification }
   }
@@ -5139,18 +5138,16 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
         accepted.push(item)
       } else if (event.state === 'unverified-refused') {
         verification.state = 'unverified-mutation-refused'
-        events.push({ ...event, state: 'unverified', reason: 'mutation-gate-refused' })
-        accepted.push(item)
+        noted.push(weakUnavailable(item, 'mutation gate refused to run'))
       } else if (event.state === 'unverified-timeout') {
         verification.state = 'unverified-mutation-timeout'
-        events.push({ ...event, state: 'unverified', reason: 'mutation-gate-timeout' })
-        accepted.push(item)
+        noted.push(weakUnavailable(item, 'mutation gate timed out'))
       } else {
-        noted.push(weakDowngrade(item,
-          `weak mutation made the gate red (status ${event.gate_status}); finding refused`))
+        noted.push(weakRefuted(item,
+          `weak mutation made the gate red (status ${event.gate_status})`))
       }
     } else {
-      noted.push(weakDowngrade(item, result?.error || 'replay unavailable'))
+      noted.push(weakUnavailable(item, result?.error || 'replay unavailable'))
     }
   }
   return { accepted, events, noted, verification }
