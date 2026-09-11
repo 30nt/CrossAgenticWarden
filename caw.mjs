@@ -1920,6 +1920,11 @@ function recordWeakVerification(task, round, verification, status = 'active') {
     ...mutation,
     gate_output: typeof mutation.gate_output === 'string'
       ? mutation.gate_output.slice(-8000) : '',
+  })), ...(verification.failures || []).map((failure) => ({
+    task,
+    round,
+    kind: 'mutation-unavailable',
+    ...failure,
   }))]
   run.weakVerification = retainWeakVerificationEvents(run.weakVerification, events)
   writeRunManifest(status)
@@ -5064,6 +5069,19 @@ function weakPatchPaths(surface, patch) {
   return paths
 }
 
+function weakExpectedPath(item, surface) {
+  const where = item?.where?.trim().replace(/^`|`$/g, '') || ''
+  const location = where.match(/^(.+?):\d+(?::\d+|[-–]\d+)?$/)?.[1] || where
+  if (!location || isAbsolute(location) || location.includes('\\')) return null
+  const target = resolve(surface.workingRoot, location)
+  if (!inside(surface.workingRoot, target) || !existsSync(target)) return null
+  try {
+    const stat = lstatSync(target)
+    if (!stat.isFile() || stat.isSymbolicLink()) return null
+    return relative(surface.workingRoot, target).split(sep).join('/')
+  } catch { return null }
+}
+
 function captureWeakMutations(items, surface, baseline) {
   const accepted = []
   const noted = []
@@ -5153,6 +5171,10 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
       'delivery tree changed after its green gate; refusing weak replay')
   }
   const paths = weakPatchPaths(surface, patch)
+  const expectedPath = weakExpectedPath(item, surface)
+  if (expectedPath && !paths.includes(expectedPath)) {
+    throw new Error(`weak mutation changes ${paths.join(', ')} but reviewer location names ${expectedPath}`)
+  }
   execFileSync('git', ['apply', '--check', '--binary', '-'], {
     cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
   })
@@ -5168,6 +5190,8 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     patch_sha256: createHash('sha256').update(patch).digest('hex'),
     patch_bytes: bytes,
     paths,
+    expected_path: expectedPath,
+    expected_path_matched: expectedPath ? true : null,
     gate: f.gate_fast,
     gate_status: result.status ?? (result.ok ? 0 : null),
     gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
@@ -5277,6 +5301,7 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
       : 'unverified-baseline-red',
     baseline,
     mutations: [],
+    failures: [],
     replay_surface: {
       strategy: 'single-reusable-surface',
       surfaces_created: 1,
@@ -5315,7 +5340,15 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
           `weak mutation made the gate red (status ${event.gate_status})`))
       }
     } else {
-      noted.push(weakUnavailable(item, result?.error || 'replay unavailable'))
+      const reason = result?.error || 'replay unavailable'
+      verification.state = 'unverified-mutation-replay'
+      verification.failures.push({
+        index,
+        state: 'unavailable',
+        where: item.where,
+        reason,
+      })
+      noted.push(weakUnavailable(item, reason))
     }
   }
   return { accepted, events, noted, verification }
