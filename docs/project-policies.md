@@ -41,7 +41,7 @@ limited to 256 KiB, input to 1 MiB, policy files to 2 MiB, and timeout to at mos
 - `review` returns `{"criteria":[],"instructions":[]}`. Criteria are added to the core ledger
   under engine-namespaced ids; they cannot remove core criteria.
 - `gate` returns `{"action":"continue","reason":""}` or a reasoned `stop`. It cannot turn a
-  red or refused core gate green.
+  red, refused, or timed-out core gate green.
 - `commit` returns `{"subject":""}`. A non-empty value changes only the commit subject. Core
   staging, audit text, and commit ownership remain unchanged.
 

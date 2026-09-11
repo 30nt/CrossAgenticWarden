@@ -172,7 +172,9 @@ test('Windows command-script refusal names the native executable recovery settin
 function fixture({
   git = false,
   gateFast = 'node -e "process.exit(0)"',
+  gateFastTimeout = '',
   gateFull = '',
+  gateFullTimeout = '',
   indexCmd = '',
   reviewDependencies = '',
 } = {}) {
@@ -237,7 +239,9 @@ export default {
 name: Baseline fixture
 main_branch: main
 gate_fast: ${gateFast}
+gate_fast_timeout_ms: ${gateFastTimeout}
 gate_full: ${gateFull}
+gate_full_timeout_ms: ${gateFullTimeout}
 index_cmd: ${indexCmd}
 review_dependency_roots: ${reviewDependencies}
 docs_language: English
@@ -3358,4 +3362,48 @@ test('a gate_full that refuses to start says nothing was tested, and offers no b
   assert.match(text, /full gate DID NOT RUN — it refused to start, and nothing was tested/)
   assert.match(text, /Every task is committed on its own green fast gate; none of that is in doubt/)
   assert.doesNotMatch(text, /git bisect/)
+})
+
+test('a fast gate timeout is neither red nor refused and preserves task recovery', () => {
+  const f = fixture({
+    git: true,
+    gateFast: 'exec node -e "setTimeout(()=>{},2000)"',
+    gateFastTimeout: '30',
+  })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const spec = '001_timeout.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Timeout\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [])
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  assert.match(text, /fast gate TIMED OUT after 30 ms and was killed/)
+  assert.doesNotMatch(text, /gate red — confirming|refused to start/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), true)
+})
+
+test('a full gate timeout has no red verdict and offers no bisect', () => {
+  const f = fixture({
+    git: true,
+    gateFull: 'exec node -e "setTimeout(()=>{},2000)"',
+    gateFullTimeout: '30',
+  })
+  const result = buildOneTask(f)
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  assert.match(text, /full gate TIMED OUT after 30 ms and was killed/)
+  assert.doesNotMatch(text, /full gate is RED|git bisect/)
+})
+
+test('invalid project gate timeouts fail before provider calls', () => {
+  const f = fixture({ git: true, gateFastTimeout: '1.5' })
+  const result = run(f, ['plan', 'x'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /gate_fast_timeout_ms must be a positive whole number/)
+  assert.equal(calls(f).length, 0)
 })

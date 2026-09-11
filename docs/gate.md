@@ -10,6 +10,11 @@ each bought by an install that did without one.
 checks wraps them in a script and names that — `bash scripts/gate_fast.sh`, or a `make check`
 that already does it. Five rules, every one of them bought by an install that did without it:
 
+Set `gate_fast_timeout_ms` and `gate_full_timeout_ms` in `.caw/CAW.md` when the project has a
+defensible limit. They are positive whole milliseconds; an empty value leaves that gate without
+an engine timeout. A timeout is recorded separately from red and exit-75 refusal: CAW kills the
+gate, keeps task recovery state, and does not wake an executor or recommend a bisect.
+
 1. **Exit 0 green, 75 refused-to-start, any other non-zero red.** 75 (`EX_TEMPFAIL`) means
    the gate never looked: a machine too loaded for the suite it shards, a simulator that is
    not there, a service that is down. `caw.mjs` then says the run was *not tested* rather
