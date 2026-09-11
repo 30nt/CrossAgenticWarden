@@ -1603,6 +1603,42 @@ const PROJECT_POLICY_OUTPUT_SCHEMAS = Object.freeze({
   }),
 })
 
+const PROJECT_POLICY_V2_PLANNING_REQUEST_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    issues: { type: 'array', items: { type: 'string' } },
+    instructions: { type: 'array', items: { type: 'string' } },
+    risk: {
+      type: 'object',
+      properties: {
+        class: { type: 'string' },
+        population_requirement: { type: 'string', enum: ['none', 'sample', 'complete'] },
+        require_full_gate_baseline: { type: 'boolean' },
+      },
+      required: ['class', 'population_requirement', 'require_full_gate_baseline'],
+    },
+  },
+  required: ['issues', 'instructions', 'risk'],
+})
+
+const PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    issues: { type: 'array', items: { type: 'string' } },
+    instructions: { type: 'array', items: { type: 'string' } },
+    attestation: {
+      type: 'object',
+      properties: {
+        state: { type: 'string', enum: ['none', 'sample', 'complete'] },
+        population_digest: { type: 'string' },
+        evidence: { type: 'string' },
+      },
+      required: ['state', 'population_digest', 'evidence'],
+    },
+  },
+  required: ['issues', 'instructions', 'attestation'],
+})
+
 // ---------------------------------------------------------------- infrastructure
 
 // A run that dies has no commit to carry its notes, so they go to a file as well as the
@@ -1688,6 +1724,10 @@ function writeRunManifest(status) {
     }),
     ...(runRecord.populationCache === undefined ? {} : {
       population_cache: runRecord.populationCache,
+    }),
+    ...(runRecord.risk === undefined ? {} : { risk: runRecord.risk }),
+    ...(runRecord.fullGateBaseline === undefined ? {} : {
+      full_gate_baseline: runRecord.fullGateBaseline,
     }),
     ...(runRecord.weakVerification === undefined ? {} : {
       weak_verification: runRecord.weakVerification,
@@ -1975,7 +2015,9 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
     state: 'unknown', source: 'no-plan-population-record', digest: null,
   }
   const limitations = []
-  if (population.state !== 'sample') limitations.push(`population-${population.state}`)
+  if (!['sample', 'complete'].includes(population.state)) {
+    limitations.push(`population-${population.state}`)
+  }
   if (!author) limitations.push('author-runtime-unobserved')
   if (weakVerification?.state?.startsWith('unverified')) {
     limitations.push(weakVerification.state)
@@ -2019,6 +2061,154 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
 // excluded by NAME rather than by a `NNN_slug.md` pattern, because a ticket is a spec a human
 // wrote and named, and a pattern would silently drop the ones that do not match it.
 const PLAN = join(QUEUE_DIR, 'PLAN.md')
+const RISK_RECORD = join(QUEUE_DIR, '.risk.json')
+const RISK_RECORD_MAX = 64 * 1024
+
+function validateRiskRecord(value) {
+  exactObjectKeys(value, [
+    'version', 'class', 'population_requirement', 'require_full_gate_baseline',
+    'population_attestation', 'population_digest', 'evidence', 'policy_id', 'policy_digest',
+    'full_gate_baseline',
+  ], 'risk record')
+  if (value.version !== 1) throw new Error('risk record version must be 1')
+  if (!/^[a-z][a-z0-9.-]{0,63}$/.test(value.class) ||
+      !/^[a-z][a-z0-9.-]{0,63}$/.test(value.policy_id)) {
+    throw new Error('risk record class or policy id is invalid')
+  }
+  if (!['none', 'sample', 'complete'].includes(value.population_requirement) ||
+      !['none', 'sample', 'complete'].includes(value.population_attestation)) {
+    throw new Error('risk record population state is invalid')
+  }
+  if (typeof value.require_full_gate_baseline !== 'boolean' ||
+      !/^[0-9a-f]{64}$/.test(value.population_digest) ||
+      !/^[0-9a-f]{64}$/.test(value.policy_digest) || typeof value.evidence !== 'string') {
+    throw new Error('risk record fields are invalid')
+  }
+  if (value.full_gate_baseline !== null) {
+    exactObjectKeys(value.full_gate_baseline,
+      ['head', 'tree_digest', 'gate', 'state'], 'risk full-gate baseline')
+    if (!/^[0-9a-f]{40}$/.test(value.full_gate_baseline.head) ||
+        !/^[0-9a-f]{64}$/.test(value.full_gate_baseline.tree_digest) ||
+        typeof value.full_gate_baseline.gate !== 'string' ||
+        value.full_gate_baseline.state !== 'green') {
+      throw new Error('risk full-gate baseline is invalid')
+    }
+  }
+  return value
+}
+
+function writeRiskRecord(risk) {
+  const value = validateRiskRecord({ version: 1, full_gate_baseline: null, ...risk })
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+  if (bytes.length > RISK_RECORD_MAX) throw new Error('risk record exceeds its size limit')
+  mkdirSync(QUEUE_DIR, { recursive: true, mode: 0o700 })
+  const temp = `${RISK_RECORD}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, RISK_RECORD)
+  try { chmodSync(RISK_RECORD, 0o600) } catch { /* platform does not expose POSIX modes */ }
+}
+
+function readRiskRecord() {
+  if (!existsSync(RISK_RECORD)) return null
+  const stat = lstatSync(RISK_RECORD)
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > RISK_RECORD_MAX) {
+    throw new Error(`${RISK_RECORD} is not a bounded regular file`)
+  }
+  let value
+  try { value = JSON.parse(readFileSync(RISK_RECORD, 'utf8')) }
+  catch (error) { throw new Error(`${RISK_RECORD} is invalid JSON: ${error.message}`) }
+  return validateRiskRecord(value)
+}
+
+function clearRiskRecord() {
+  try { unlinkSync(RISK_RECORD) } catch { /* absent */ }
+}
+
+const RISK_PLAN_FIELD_NAMES = [
+  'risk_class', 'risk_population_requirement', 'risk_population_attestation',
+  'risk_population_digest', 'risk_require_full_gate_baseline', 'risk_policy_id',
+  'risk_policy_digest',
+]
+
+const riskPlanFields = (risk) => ({
+  risk_class: risk.class,
+  risk_population_requirement: risk.population_requirement,
+  risk_population_attestation: risk.population_attestation,
+  risk_population_digest: risk.population_digest,
+  risk_require_full_gate_baseline: String(risk.require_full_gate_baseline),
+  risk_policy_id: risk.policy_id,
+  risk_policy_digest: risk.policy_digest,
+})
+
+function syncPlanRisk(risk) {
+  if (!existsSync(PLAN)) return
+  let text = readFileSync(PLAN, 'utf8')
+  if (!risk) {
+    for (const name of RISK_PLAN_FIELD_NAMES) {
+      text = text.replace(new RegExp(`^${name}:.*\\n?`, 'm'), '')
+    }
+    text = text.replace(
+      /^## Project risk attestation\n\n```json\n[\s\S]*?\n```\n*/m,
+      '',
+    )
+    writeFileSync(PLAN, text)
+    return
+  }
+  const fields = riskPlanFields(risk)
+  for (const [name, value] of Object.entries(fields)) {
+    const line = `${name}: ${value}`
+    if (new RegExp(`^${name}:`, 'm').test(text)) {
+      text = text.replace(new RegExp(`^${name}:.*$`, 'm'), line)
+    } else {
+      const frontmatterEnd = text.indexOf('\n---', 4)
+      if (frontmatterEnd < 0) throw new Error(`${PLAN} has no closing frontmatter delimiter`)
+      text = `${text.slice(0, frontmatterEnd)}\n${line}${text.slice(frontmatterEnd)}`
+    }
+  }
+  const section = [
+    '## Project risk attestation', '',
+    '```json', JSON.stringify(risk, null, 2), '```', '',
+  ].join('\n')
+  if (/^## Project risk attestation$/m.test(text)) {
+    text = text.replace(
+      /^## Project risk attestation\n\n```json\n[\s\S]*?\n```\n*/m,
+      section,
+    )
+  } else {
+    const marker = text.match(/^## (?:Population,|Tasks,)/m)?.[0]
+    text = marker ? text.replace(marker, `${section}${marker}`) : `${text.trimEnd()}\n\n${section}`
+  }
+  writeFileSync(PLAN, text)
+}
+
+function applyRiskPopulationCertification(risk) {
+  activePopulationCertification = {
+    ...activePopulationCertification,
+    ...(risk.population_attestation === 'complete' ? { state: 'complete' } : {}),
+    project_attestation: {
+      state: risk.population_attestation,
+      evidence: risk.evidence,
+      policy_id: risk.policy_id,
+      policy_digest: risk.policy_digest,
+    },
+  }
+}
+
+function requireCurrentRiskPolicy(risk) {
+  const planningPolicy = projectPolicySet?.policies?.planning
+  if (!planningPolicy || planningPolicy.digest !== risk.policy_digest) {
+    die('project risk policy changed or disappeared after attestation; run review-specs again')
+  }
+  return planningPolicy
+}
+
+function requireMatchingPlanRisk(planText, risk) {
+  if (!/^risk_class:\s*\S+/m.test(planText || '')) return
+  const planField = (name) => planText.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim()
+  const mismatch = Object.entries(riskPlanFields(risk))
+    .find(([name, value]) => planField(name) !== value)
+  if (mismatch) die(`${PLAN} and ${RISK_RECORD} disagree at ${mismatch[0]}; run review-specs again`)
+}
 
 // Where a task's review history waits between invocations, so that a run stopping to ask the
 // human is not the same event as the run forgetting what it asked. One file per spec, created
@@ -2778,7 +2968,9 @@ function readProjectPolicies(root = process.cwd()) {
   try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
   catch (error) { throw new Error(`${PROJECT_POLICY_MANIFEST} is invalid JSON: ${error.message}`) }
   exactObjectKeys(manifest, ['api_version', 'policies'], 'project policy manifest')
-  if (manifest.api_version !== 1) throw new Error('project policy api_version must be 1')
+  if (![1, 2].includes(manifest.api_version)) {
+    throw new Error('project policy api_version must be 1 or 2')
+  }
   exactObjectKeys(manifest.policies, PROJECT_POLICY_STAGES, 'project policy manifest.policies')
   const policyRoot = realpathSync(dirname(manifestPath))
   const treeDigest = projectPolicyTreeDigest(policyRoot)
@@ -2807,7 +2999,7 @@ function readProjectPolicies(root = process.cwd()) {
     }
   }
   return {
-    apiVersion: 1,
+    apiVersion: manifest.api_version,
     manifestDigest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
     policies,
     root: repositoryRoot,
@@ -2832,10 +3024,23 @@ function resolvedPolicyCommand(policy, repositoryRoot) {
   })
 }
 
-function validateProjectPolicyOutput(stage, policy, output) {
-  const issue = canonicalIssue(PROJECT_POLICY_OUTPUT_SCHEMAS[stage], output)
+function projectPolicyOutputSchema(stage, apiVersion, context) {
+  if (apiVersion === 2 && stage === 'planning') {
+    return context?.phase === 'population'
+      ? PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA
+      : PROJECT_POLICY_V2_PLANNING_REQUEST_SCHEMA
+  }
+  return PROJECT_POLICY_OUTPUT_SCHEMAS[stage]
+}
+
+function validateProjectPolicyOutput(stage, policy, output, apiVersion = 1, context = {}) {
+  const issue = canonicalIssue(projectPolicyOutputSchema(stage, apiVersion, context), output)
   if (issue) throw new Error(`project ${stage} policy returned invalid output at ${issue.path}: ${issue.message}`)
-  const strings = stage === 'planning' ? [...output.issues, ...output.instructions]
+  const strings = stage === 'planning'
+    ? [...output.issues, ...output.instructions,
+      ...(apiVersion === 2 && context?.phase !== 'population' ? [output.risk.class] : []),
+      ...(apiVersion === 2 && context?.phase === 'population'
+        ? [output.attestation.population_digest, output.attestation.evidence] : [])]
     : stage === 'review'
       ? [...output.instructions, ...output.criteria.flatMap((row) =>
           [row.id, row.section, row.criterion])]
@@ -2850,6 +3055,18 @@ function validateProjectPolicyOutput(stage, policy, output) {
   if (['planning', 'review'].includes(stage) &&
       output.instructions.some((value) => !value.trim())) {
     throw new Error(`project ${stage} policy returned an empty instruction`)
+  }
+  if (stage === 'planning' && apiVersion === 2 && context?.phase !== 'population' &&
+      !/^[a-z][a-z0-9.-]{0,63}$/.test(output.risk.class)) {
+    throw new Error('project planning policy returned an invalid risk class')
+  }
+  if (stage === 'planning' && apiVersion === 2 && context?.phase === 'population') {
+    if (!/^[0-9a-f]{64}$/.test(output.attestation.population_digest)) {
+      throw new Error('project planning policy returned an invalid population digest')
+    }
+    if (output.attestation.state === 'complete' && !output.attestation.evidence.trim()) {
+      throw new Error('project planning policy must evidence a complete population attestation')
+    }
   }
   if (stage === 'review') {
     const ids = output.criteria.map((row) => row.id)
@@ -2871,11 +3088,13 @@ function validateProjectPolicyOutput(stage, policy, output) {
   }
 }
 
-function recordProjectPolicyCall(policy, stage, startedAt, status) {
+function recordProjectPolicyCall(policy, stage, startedAt, status, context = {}, apiVersion = 1) {
   const run = beginRunRecord()
   run.policyCalls ||= []
   run.policyCalls.push({
     stage, id: policy.id, digest: policy.digest,
+    api_version: apiVersion,
+    ...(stage === 'planning' && context.phase ? { phase: context.phase } : {}),
     duration_ms: Date.now() - startedAt, status,
   })
   writeRunManifest(status === 'success' ? 'active' : 'failed')
@@ -2884,7 +3103,8 @@ function recordProjectPolicyCall(policy, stage, startedAt, status) {
 function runProjectPolicy(stage, context, { record = true, set = projectPolicySet } = {}) {
   const policy = set?.policies?.[stage]
   if (!policy) return null
-  const request = `${JSON.stringify({ api_version: 1, stage, context })}\n`
+  const apiVersion = set.apiVersion || 1
+  const request = `${JSON.stringify({ api_version: apiVersion, stage, context })}\n`
   if (Buffer.byteLength(request) > PROJECT_POLICY_INPUT_MAX) {
     throw new Error(`project ${stage} policy input exceeds ${PROJECT_POLICY_INPUT_MAX} bytes`)
   }
@@ -2902,7 +3122,7 @@ function runProjectPolicy(stage, context, { record = true, set = projectPolicySe
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
       TMPDIR: scratch, TEMP: scratch, TMP: scratch,
-      CAW_POLICY_API_VERSION: '1', CAW_POLICY_STAGE: stage,
+      CAW_POLICY_API_VERSION: String(apiVersion), CAW_POLICY_STAGE: stage,
     }
     const result = spawnSync(command[0], command.slice(1), {
       cwd: scratch,
@@ -2928,11 +3148,11 @@ function runProjectPolicy(stage, context, { record = true, set = projectPolicySe
     let output
     try { output = JSON.parse(result.stdout) }
     catch (error) { throw new Error(`project ${stage} policy returned invalid JSON: ${error.message}`) }
-    validateProjectPolicyOutput(stage, policy, output)
+    validateProjectPolicyOutput(stage, policy, output, set.apiVersion || 1, context)
     callStatus = 'success'
     return { output, policy }
   } finally {
-    if (record) recordProjectPolicyCall(policy, stage, startedAt, callStatus)
+    if (record) recordProjectPolicyCall(policy, stage, startedAt, callStatus, context, apiVersion)
     removeTree(scratch)
   }
 }
@@ -2950,22 +3170,106 @@ function verifyProjectPolicies(set = readProjectPolicies()) {
   }
   for (const stage of PROJECT_POLICY_STAGES) {
     if (!set.policies[stage]) continue
-    const result = runProjectPolicy(stage, samples[stage], { record: false, set })
-    say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid`)
+    if (stage === 'planning' && set.apiVersion === 2) {
+      const requestResult = runProjectPolicy(stage, {
+        phase: 'request', ...samples.planning,
+      }, { record: false, set })
+      const populationDigest = createHash('sha256').update(stableJson([])).digest('hex')
+      runProjectPolicy(stage, {
+        phase: 'population', ...samples.planning,
+        risk: requestResult.output.risk,
+        population: {
+          state: 'none', returned: 0, repaired: 0, dropped: 0, retained: 0,
+          witness_withdrawn: false, digest: populationDigest, cases: [],
+        },
+      }, { record: false, set })
+      say(`${stage}: ${requestResult.policy.id} ${requestResult.policy.digest.slice(0, 12)} — valid (request, population)`)
+    } else {
+      const result = runProjectPolicy(stage, samples[stage], { record: false, set })
+      say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid`)
+    }
+  }
+}
+
+function appendPlanningPolicyInstructions(profileText, instructions, phase) {
+  if (!instructions.length) return profileText
+  return `${profileText.trimEnd()}\n\n## Project planning policy instructions` +
+    `${phase ? ` — ${phase}` : ''}\n\n` + instructions.map((item) => `- ${item}`).join('\n') + '\n'
+}
+
+function stopForPlanningPolicy(result, phase = '') {
+  if (result.output.issues.length) {
+    say(`\nproject planning policy ${result.policy.id}` +
+      `${phase ? ` (${phase})` : ''} stopped before ` +
+      `${phase === 'population' ? 'architect' : 'enumerator'}:`)
+    say(`  - ${result.output.issues.join('\n  - ')}`)
+    die('resolve the project policy issues, then run planning again. ' +
+      (phase === 'population'
+        ? 'The enumerator completed, but no architect or plan-reviewer call ran.'
+        : 'No provider call ran.'))
   }
 }
 
 function applyPlanningPolicy(description, profileText) {
-  const result = runProjectPolicy('planning', { request: description, profile: profileText })
-  if (!result) return profileText
-  if (result.output.issues.length) {
-    say(`\nproject planning policy ${result.policy.id} stopped before enumerator:`)
-    say(`  - ${result.output.issues.join('\n  - ')}`)
-    die('resolve the project policy issues, then run planning again. No provider call ran.')
+  const apiVersion = projectPolicySet?.apiVersion || 1
+  const context = apiVersion === 2
+    ? { phase: 'request', request: description, profile: profileText }
+    : { request: description, profile: profileText }
+  const result = runProjectPolicy('planning', context)
+  if (!result) return { text: profileText, risk: null }
+  stopForPlanningPolicy(result, apiVersion === 2 ? 'request' : '')
+  return {
+    text: appendPlanningPolicyInstructions(profileText, result.output.instructions,
+      apiVersion === 2 ? 'request' : ''),
+    risk: apiVersion === 2 ? result.output.risk : null,
   }
-  if (!result.output.instructions.length) return profileText
-  return `${profileText.trimEnd()}\n\n## Project planning policy instructions\n\n` +
-    result.output.instructions.map((item) => `- ${item}`).join('\n') + '\n'
+}
+
+function applyPopulationPolicy(description, profileText, population, requestedRisk) {
+  if (!requestedRisk) return { text: profileText, risk: null }
+  const record = populationPlanRecord(population)
+  const result = runProjectPolicy('planning', {
+    phase: 'population',
+    request: description,
+    profile: profileText,
+    risk: requestedRisk,
+    population: {
+      ...record,
+      cases: population.map((item) => ({ case: item.case, source: item.source })),
+    },
+  })
+  if (!result) throw new Error('project planning policy disappeared before population attestation')
+  stopForPlanningPolicy(result, 'population')
+  const attestation = result.output.attestation
+  if (attestation.population_digest !== record.digest) {
+    throw new Error('project planning policy attested a different population digest')
+  }
+  if (record.state === 'none' && attestation.state !== 'none') {
+    throw new Error(`project planning policy attested ${attestation.state} for an empty population`)
+  }
+  if (record.state === 'sample' && attestation.state === 'none') {
+    throw new Error('project planning policy withdrew a non-empty population')
+  }
+  const ranks = { none: 0, sample: 1, complete: 2 }
+  if (ranks[attestation.state] < ranks[requestedRisk.population_requirement]) {
+    die(`project risk class ${requestedRisk.class} requires population ` +
+      `${requestedRisk.population_requirement}, but policy attested ${attestation.state}`)
+  }
+  const risk = {
+    ...requestedRisk,
+    population_attestation: attestation.state,
+    population_digest: attestation.population_digest,
+    evidence: attestation.evidence,
+    policy_id: result.policy.id,
+    policy_digest: result.policy.digest,
+  }
+  const run = beginRunRecord()
+  run.risk = risk
+  writeRunManifest('active')
+  return {
+    text: appendPlanningPolicyInstructions(profileText, result.output.instructions, 'population'),
+    risk,
+  }
 }
 
 function projectPolicySnapshot() {
@@ -4130,7 +4434,8 @@ function readPlanPopulationRecord(text) {
   return record
 }
 
-function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = []) {
+function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = [],
+  risk = null) {
   const populationRecord = populationPlanRecord(population)
   const ledger = planningLedger(out)
   writeFileSync(PLAN, [
@@ -4143,6 +4448,15 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     `population_retained: ${populationRecord.retained}`,
     `population_witness_withdrawn: ${populationRecord.witness_withdrawn}`,
     `population_digest: ${populationRecord.digest}`,
+    ...(risk ? [
+      `risk_class: ${risk.class}`,
+      `risk_population_requirement: ${risk.population_requirement}`,
+      `risk_population_attestation: ${risk.population_attestation}`,
+      `risk_population_digest: ${risk.population_digest}`,
+      `risk_require_full_gate_baseline: ${risk.require_full_gate_baseline}`,
+      `risk_policy_id: ${risk.policy_id}`,
+      `risk_policy_digest: ${risk.policy_digest}`,
+    ] : []),
     '---', '',
     '# Plan', '',
     'Written by `caw.mjs`, not by an agent. The specs in `.caw-tasks/` are the source of truth for',
@@ -4159,6 +4473,10 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     'Engine-assigned stable IDs for every task requirement and every declared',
     '`case → task → acceptance criterion` relation.', '',
     '```json', JSON.stringify(ledger, null, 2), '```', '',
+    ...(risk ? [
+      '## Project risk attestation', '',
+      '```json', JSON.stringify(risk, null, 2), '```', '',
+    ] : []),
     // Both lists, side by side, and no attempt to reconcile them here. A script cannot match
     // two prose phrasings of the same case, and a human reading the two tables against each
     // other is the only reader who can. This is also the only artifact the blind list survives
@@ -4210,12 +4528,14 @@ function writePlan(description, out, history, unclosed, population, undecidable 
          '`approved:` above. `build` refuses until it does.', '']
       : []),
   ].join('\n'))
+  if (risk) writeRiskRecord(risk)
 }
 
-function planIncomplete(description, out, history, problems, reason, population, provenance) {
+function planIncomplete(description, out, history, problems, reason, population, provenance,
+  risk = null) {
   say(`\n${reason}`)
   writeSpecs(out.tasks, out.coverage)
-  writePlan(description, out, history, problems, population, [], provenance)
+  writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
   say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
   say(`  spent ${formatAccounting(accounting)}`)
@@ -4627,10 +4947,15 @@ function plan(description) {
         `  Planning now would renumber from 001 and interleave two plans. Build them, or delete\n` +
         `  the ones you do not want, then plan again.`)
   }
+  clearRiskRecord()
 
-  const text = applyPlanningPolicy(description, profileText)
+  const planning = applyPlanningPolicy(description, profileText)
+  let text = planning.text
   const enumeration = enumerate(description, text, f)
   const population = requireReadyRequest(enumeration)
+  const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
+  text = populationPolicy.text
+  const risk = populationPolicy.risk
   const planProvenance = [{ role: 'enumerator', ...runtimeIdentity(population) }]
 
   let problems = null
@@ -4755,7 +5080,8 @@ function plan(description) {
           ` —\n  they may themselves rest on it:\n    - ${problems.join('\n    - ')}`
         : `\n  Nothing else in this verdict: the other four slots came back empty.`)
       writeSpecs(out.tasks, out.coverage)
-      writePlan(description, out, history, problems, population, r.undecidable, planProvenance)
+      writePlan(description, out, history, problems, population, r.undecidable, planProvenance,
+        risk)
       say(`\n${PLAN} written, approved: false — the specs below it rest on a guess.`)
       say(`\nDecide the questions and record the answers where a later run will find them — a`)
       say(`file under '## Canonical docs' in .caw/CAW.md. An answer that lives only in the`)
@@ -4767,7 +5093,7 @@ function plan(description) {
     }
     if (!problems.length) {
       writeSpecs(out.tasks, out.coverage)
-      writePlan(description, out, history, [], population, [], planProvenance)
+      writePlan(description, out, history, [], population, [], planProvenance, risk)
       say(`  ${PLAN}`)
       say(`\nRead them, edit or reorder freely, then:  node caw.mjs build`)
       say(`  spent ${formatAccounting(accounting)}`)
@@ -4789,7 +5115,7 @@ function plan(description) {
     // bought was an early exit that has never once been right.
   }
   planIncomplete(description, last, history, problems,
-    `Still has holes after ${MAX_PLAN_ROUNDS} rounds.`, population, planProvenance)
+    `Still has holes after ${MAX_PLAN_ROUNDS} rounds.`, population, planProvenance, risk)
 }
 
 // Writes the specs and says where they went, and nothing else. The next-step line belongs to
@@ -4824,10 +5150,145 @@ function writeSpecs(tasks, coverage) {
 
 // ---------------------------------------------------------------- build
 
+function runRequiredFullGateBaseline(f, risk, startHead) {
+  if (!risk?.require_full_gate_baseline) return null
+  const planningPolicy = projectPolicySet?.policies?.planning
+  if (!planningPolicy || planningPolicy.digest !== risk.policy_digest) {
+    die('project risk policy changed or disappeared after attestation; run review-specs again')
+  }
+  if (!f.gate_full) {
+    die(`project risk class ${risk.class} requires a full-gate baseline, but gate_full is empty`)
+  }
+  say(`\n· required full-gate baseline (${risk.class}): ${f.gate_full}`)
+  const baselineTreeDigest = deliveryDigest()
+  const baselineStateDigest = projectPolicyStateDigest()
+  const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms)
+  const baselineChanged = projectPolicyStateDigest() !== baselineStateDigest
+  const run = beginRunRecord()
+  run.risk = risk
+  run.fullGateBaseline = {
+    head: startHead,
+    tree_digest: baselineTreeDigest,
+    gate: f.gate_full,
+    state: baselineChanged ? 'mutated' : g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  }
+  writeRunManifest(g.ok && !baselineChanged ? 'active' : 'failed')
+  if (baselineChanged) {
+    die('required full-gate baseline changed HEAD, delivery, CAW, policies, or the task queue; ' +
+      'no executor ran')
+  }
+  const gatePolicy = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full-baseline',
+    risk_class: risk.class,
+    command: f.gate_full,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  })
+  if (gatePolicy?.output.action === 'stop') {
+    if (g.out) say(g.out)
+    die(`project gate policy ${gatePolicy.policy.id} stopped the required full baseline: ` +
+      gatePolicy.output.reason.trim())
+  }
+  if (!g.ok) {
+    if (g.out) say(g.out)
+    if (g.state === 'timeout') {
+      die(`required full-gate baseline TIMED OUT after ${formatTimeout(g.timeoutMs)}; ` +
+        'no executor ran')
+    }
+    if (g.state === 'refused') {
+      die('required full-gate baseline DID NOT RUN: it refused to start; no executor ran')
+    }
+    die('required full-gate baseline is RED; no executor ran')
+  }
+  say('  green — final full-gate failures can be attributed to this build range')
+  writeRiskRecord({
+    ...risk,
+    full_gate_baseline: {
+      head: startHead,
+      tree_digest: run.fullGateBaseline.tree_digest,
+      gate: f.gate_full,
+      state: 'green',
+    },
+  })
+  return run.fullGateBaseline
+}
+
+function runFinalFullGate(f, startHead, fullGateBaseline = null) {
+  say(`\n· full gate: ${f.gate_full}`)
+  const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms)
+  const gatePolicy = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full',
+    command: f.gate_full,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  })
+  if (gatePolicy?.output.action === 'stop') {
+    if (g.out) say(g.out)
+    die(`project gate policy ${gatePolicy.policy.id} stopped the full gate: ` +
+      gatePolicy.output.reason.trim())
+  }
+  if (!g.ok) {
+    say(g.out)
+    if (g.state === 'timeout') {
+      die(`full gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed. No full-gate` +
+          ` verdict exists; re-run it or adjust gate_full_timeout_ms in .caw/CAW.md.`)
+    }
+    if (g.state === 'refused') {
+      die(`full gate DID NOT RUN — it refused to start, and nothing was tested.\n` +
+          `  Every task is committed on its own green fast gate; none of that is in doubt.\n` +
+          `  Re-run once the refusal is over:  ${f.gate_full}`)
+    }
+    if (fullGateBaseline?.state === 'green' && fullGateBaseline.head === startHead) {
+      die(`full gate is RED after a green required baseline at ${startHead}. The regression is` +
+        ` inside this build range:\n    git bisect start HEAD ${startHead}`)
+    }
+    die(`full gate is RED. Every task was committed on its own green fast gate, so the fast gate\n` +
+        `  is not what missed this. Whether ${startHead} was green under the FULL gate is unknown —\n` +
+        `  this run never ran it there — so bisect the range rather than assume it:\n` +
+        `    git bisect start HEAD ${startHead}`)
+  }
+  say('  green')
+  return g
+}
+
+function requirePersistedFullGateBaseline(f, risk) {
+  if (!risk.require_full_gate_baseline) return null
+  if (!f.gate_full) {
+    die(`project risk class ${risk.class} requires a full-gate baseline, but gate_full is empty`)
+  }
+  const baseline = risk.full_gate_baseline
+  if (!baseline) {
+    die(`project risk class ${risk.class} has no green full-gate baseline; start with build`)
+  }
+  if (baseline.gate !== f.gate_full) {
+    die('gate_full changed after the required baseline; start again with build')
+  }
+  const ancestry = spawnSync('git', ['merge-base', '--is-ancestor', baseline.head, 'HEAD'], {
+    encoding: 'utf8',
+  })
+  if (ancestry.status !== 0) {
+    die(`required full-gate baseline ${baseline.head} is not an ancestor of HEAD; start again with build`)
+  }
+  return baseline
+}
+
 function build(noFull) {
   const { f, text } = profile()
   noticeNotesLog()
   activePopulationCertification = { state: 'unknown', source: 'no-plan-artifact', digest: null }
+  let planText = null
   // The flag outlives the terminal that printed the holes, which is the whole point of it
   // being on disk. Flipped by `review-specs` when it comes back clean — the one thing in this
   // tool whose job is judging a spec against the request — or by hand, which is an explicit
@@ -4835,6 +5296,7 @@ function build(noFull) {
   // gate here, which is right: there was never a plan to approve.
   if (existsSync(PLAN)) {
     const plan = readFileSync(PLAN, 'utf8')
+    planText = plan
     activePopulationCertification = readPlanPopulationRecord(plan)
     if (/^approved:\s*false\s*$/m.test(plan)) {
       // Two states, one flag, and they are not the same event. A plan that was never approved
@@ -4903,6 +5365,23 @@ function build(noFull) {
   if (changedFiles().length) die('working tree is dirty — commit or stash first')
 
   const startHead = git('rev-parse', 'HEAD').trim()
+  let risk = null
+  try { risk = readRiskRecord() }
+  catch (error) { die(error?.message || String(error)) }
+  const planDeclaresRisk = /^risk_class:\s*\S+/m.test(planText || '')
+  if (planDeclaresRisk && !risk) {
+    die(`${PLAN} declares project risk, but ${RISK_RECORD} is missing; run review-specs again`)
+  }
+  if (risk) {
+    requireMatchingPlanRisk(planText, risk)
+    requireCurrentRiskPolicy(risk)
+    applyRiskPopulationCertification(risk)
+  }
+  if (risk?.require_full_gate_baseline && noFull) {
+    die(`project risk class ${risk.class} requires gate_full before and after the build; ` +
+      '--no-full is not allowed')
+  }
+  const fullGateBaseline = runRequiredFullGateBaseline(f, risk, startHead)
   // Any saved review history here is stale by construction and is dropped rather than resumed.
   // `build` refuses to start on a dirty tree and every task before this one committed, so the
   // tree a state file describes is not the tree in front of us: whatever it held was thrown
@@ -4915,49 +5394,7 @@ function build(noFull) {
   }
 
   if (!noFull && f.gate_full) {
-    say(`\n· full gate: ${f.gate_full}`)
-    const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms)
-    const gatePolicy = runProjectPolicy('gate', {
-      task: null,
-      kind: 'full',
-      command: f.gate_full,
-      state: g.state,
-      status: g.status ?? (g.ok ? 0 : null),
-      output: g.out.slice(-8000),
-      duration_ms: g.durationMs,
-      timeout_ms: g.timeoutMs,
-    })
-    if (gatePolicy?.output.action === 'stop') {
-      if (g.out) say(g.out)
-      die(`project gate policy ${gatePolicy.policy.id} stopped the full gate: ` +
-        gatePolicy.output.reason.trim())
-    }
-    if (!g.ok) {
-      say(g.out)
-      if (g.state === 'timeout') {
-        die(`full gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed. No full-gate` +
-            ` verdict exists; re-run it or adjust gate_full_timeout_ms in .caw/CAW.md.`)
-      }
-      // 75 (EX_TEMPFAIL) is the gate saying it DID NOT RUN — the convention the README asks
-      // a gate to follow when it refuses to start rather than fails: a machine too busy for
-      // the suite it shards, a simulator that is not there, a service it depends on that is
-      // down. A refusal and a failure are different facts and deserve different words.
-      // Calling a refusal RED sends the reader hunting a defect through a range where no test
-      // executed, each bisect step a full suite run. Measured on one install, where the gate
-      // used exit 1 for both and the bisect advice was followed.
-      if (g.state === 'refused') {
-        die(`full gate DID NOT RUN — it refused to start, and nothing was tested.\n` +
-            `  Every task is committed on its own green fast gate; none of that is in doubt.\n` +
-            `  Re-run once the refusal is over:  ${f.gate_full}`)
-      }
-      // "Attributable" needs `startHead` green under gate_full, and this run never ran gate_full
-      // there: it runs once, on HEAD. The range is where to look, not proof the answer is in it.
-      die(`full gate is RED. Every task was committed on its own green fast gate, so the fast gate\n` +
-          `  is not what missed this. Whether ${startHead} was green under the FULL gate is unknown —\n` +
-          `  this run never ran it there — so bisect the range rather than assume it:\n` +
-          `    git bisect start HEAD ${startHead}`)
-    }
-    say('  green')
+    runFinalFullGate(f, startHead, fullGateBaseline)
   } else if (!f.gate_full) {
     say('\n· no gate_full configured — fast gate is the whole gate')
   } else {
@@ -4976,6 +5413,7 @@ function build(noFull) {
     unlinkSync(PLAN)
     say(`  cleared ${PLAN} — the queue it planned is empty`)
   }
+  if (!specFiles().length) clearRiskRecord()
   if (notes.length) {
     // Each of these is already in the commit message of the task that produced it. Reprinted
     // here because a note's value is usually to the PROJECT rather than to its own task — the
@@ -6244,8 +6682,9 @@ function stop(file, spec, ex, history, round, how, noted, why,
 // terminal being closed, which a keystroke does not.
 function resumeTask(cmd, arg) {
   const { f, text } = profile()
-  activePopulationCertification = existsSync(PLAN)
-    ? readPlanPopulationRecord(readFileSync(PLAN, 'utf8'))
+  const planText = existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : null
+  activePopulationCertification = planText
+    ? readPlanPopulationRecord(planText)
     : { state: 'unknown', source: 'no-plan-artifact', digest: null }
   if (!arg) die(`${cmd} needs a spec filename, e.g.: caw.mjs ${cmd} 001_registry-and-scan.md`)
   const name = arg.replace(/^(\.\/)?tasks\//, '')
@@ -6264,6 +6703,25 @@ function resumeTask(cmd, arg) {
         `  If the work is not done yet, do it and run this again; the spec is still on disk.\n` +
         `  If you already committed it by hand, this cannot review a commit — take the spec out\n` +
         `  of the queue with:  node caw.mjs done ${name}`)
+  }
+
+  let risk = null
+  try { risk = readRiskRecord() }
+  catch (error) { die(error?.message || String(error)) }
+  const planDeclaresRisk = /^risk_class:\s*\S+/m.test(planText || '')
+  if (planDeclaresRisk && !risk) {
+    die(`${PLAN} declares project risk, but ${RISK_RECORD} is missing; run review-specs again`)
+  }
+  let fullGateBaseline = null
+  if (risk) {
+    requireMatchingPlanRisk(planText, risk)
+    requireCurrentRiskPolicy(risk)
+    applyRiskPopulationCertification(risk)
+    fullGateBaseline = requirePersistedFullGateBaseline(f, risk)
+    const run = beginRunRecord()
+    run.risk = risk
+    if (fullGateBaseline) run.fullGateBaseline = fullGateBaseline
+    writeRunManifest('active')
   }
 
   const resume = readRoundState(name)
@@ -6288,6 +6746,14 @@ function resumeTask(cmd, arg) {
     rounds: 1,
     how: cmd === 'review' ? 'hand' : 'resumed',
   })
+  if (fullGateBaseline) runFinalFullGate(f, fullGateBaseline.head, fullGateBaseline)
+  if (risk && !specFiles().length) {
+    if (existsSync(PLAN)) {
+      unlinkSync(PLAN)
+      say(`  cleared ${PLAN} — the queue it planned is empty`)
+    }
+    clearRiskRecord()
+  }
   say(`\n  spent ${formatAccounting(accounting)}`)
 }
 
@@ -6512,7 +6978,8 @@ function clearSpecs() {
 
 function reviewSpecs(description, noFix) {
   const { f, text: profileText } = profile()
-  const text = applyPlanningPolicy(description, profileText)
+  const planning = applyPlanningPolicy(description, profileText)
+  let text = planning.text
 
   // ONCE, before the loop — the rule enumerate() states about itself, and which this function
   // broke for as long as it has existed. The call sat inside judgeSpecs(), so a run that fixed
@@ -6530,6 +6997,15 @@ function reviewSpecs(description, noFix) {
   // runs is sampling and how much is the request growing. Nothing else could have told them
   // apart, and after this line it has to be measured on purpose rather than found in the waste.
   const population = requireReadyRequest(enumerate(description, text, f), 'review-specs')
+  const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
+  text = populationPolicy.text
+  if (populationPolicy.risk) {
+    writeRiskRecord(populationPolicy.risk)
+    syncPlanRisk(populationPolicy.risk)
+  } else {
+    clearRiskRecord()
+    syncPlanRisk(null)
+  }
 
   for (let round = 1; round <= FIX_ROUNDS; round++) {
     const verdict = judgeSpecs(description, f, text, population)
@@ -7108,6 +7584,7 @@ else if (cmd === 'done') {
       unlinkSync(PLAN)
       say(`  cleared ${PLAN} — the queue it planned is empty`)
     }
+    clearRiskRecord()
   }
 }
 else die(USAGE)

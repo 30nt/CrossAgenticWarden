@@ -22,8 +22,10 @@ Create `.caw/project/manifest.json`:
 }
 ```
 
-The admitted stages are `planning`, `review`, `gate`, and `commit`. Unknown fields, unknown
-stages, symlinks, oversized policy trees, invalid commands, and timeouts are refused.
+The admitted stages are `planning`, `review`, `gate`, and `commit`. API version 1 remains the
+single-pass contract below. API version 2 adds risk-aware two-phase planning; the other three
+stages keep their version-1 output shapes. Unknown fields, unknown stages, symlinks, oversized
+policy trees, invalid commands, and timeouts are refused.
 
 ## Protocol
 
@@ -36,7 +38,7 @@ CAW starts the command directly, without a shell. It writes one JSON object to s
 The policy must write exactly one JSON object to stdout. Use stderr for diagnostics. Output is
 limited to 256 KiB, input to 1 MiB, policy files to 2 MiB, and timeout to at most 60 seconds.
 
-- `planning` returns `{"issues":[],"instructions":[]}`. Issues stop before provider calls;
+- API v1 `planning` returns `{"issues":[],"instructions":[]}`. Issues stop before provider calls;
   instructions are appended to the planning profile.
 - `review` returns `{"criteria":[],"instructions":[]}`. Criteria are added to the core ledger
   under engine-namespaced ids; they cannot remove core criteria.
@@ -44,6 +46,56 @@ limited to 256 KiB, input to 1 MiB, policy files to 2 MiB, and timeout to at mos
   red, refused, or timed-out core gate green.
 - `commit` returns `{"subject":""}`. A non-empty value changes only the commit subject. Core
   staging, audit text, and commit ownership remain unchanged.
+
+## Risk-aware planning (API v2)
+
+Set the manifest's `api_version` to `2`. CAW calls the planning policy twice.
+
+The `request` phase runs before the enumerator. Its context contains `phase`, `request`, and
+`profile`. Return:
+
+```json
+{
+  "issues": [],
+  "instructions": [],
+  "risk": {
+    "class": "regulated",
+    "population_requirement": "complete",
+    "require_full_gate_baseline": true
+  }
+}
+```
+
+The risk class is a project-owned lowercase id. Population requirement is `none`, `sample`, or
+`complete`.
+
+The `population` phase runs after independent enumeration and before the architect. Its context
+contains the first risk result plus the resolved population, counts, source addresses, and digest.
+Return:
+
+```json
+{
+  "issues": [],
+  "instructions": [],
+  "attestation": {
+    "state": "complete",
+    "population_digest": "<copy context.population.digest exactly>",
+    "evidence": "project-specific closed-set check"
+  }
+}
+```
+
+CAW never infers `complete` from a model sample. It accepts that state only from the trusted
+project policy, for the exact population digest, with non-empty evidence. An attestation weaker
+than the request-phase requirement stops before the architect.
+
+When `require_full_gate_baseline` is true, CAW stores a private queue risk record. `build --no-full`
+is refused, `gate_full` must be configured, and it must be green on the starting commit before the
+first executor call. The final full gate then has a known green baseline, so a red result is
+attributable to the build range. If a task stops for a decision, the baseline stays with the
+queue. `round` and `review` accept it only while its commit is still an ancestor and `gate_full`
+is unchanged, then run the final full gate after the recovered task. The risk record is removed
+when the queue becomes empty.
 
 Policy commands run in a private temporary working directory with a reduced environment. CAW
 checks that the delivery, HEAD, CAW files, policy files, and task queue did not change. This is a
@@ -56,6 +108,7 @@ configured gate command.
 node caw.mjs verify-project
 ```
 
-This executes every configured stage with a verification input and validates its output. Normal
+This executes every configured stage with a verification input and validates its output. API v2
+planning is checked in both phases. Normal
 run records contain the manifest digest, every policy digest, duration, stage, and result. Saved
 task state records the policy set and reports divergence after a policy change.
