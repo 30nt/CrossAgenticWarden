@@ -79,6 +79,12 @@ the script derives approval from whether anything blocking is open. From round 2
 own open items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An
 id it omits stays open.
 
+A review round contains one primary pass plus `review_challenger_passes` blind challenger passes
+(one by default, at most two). Every pass receives the same delivery digest in a fresh isolated
+surface. The engine merges their census rows and findings before another executor can run.
+Disagreement keeps a carried item open; challenger-only findings are labelled
+`late-same-baseline` with that digest.
+
 The derived result is retained as a [certification record](certification.md). Acceptance and full
 certification are separate states: missing independent population or unavailable verification is
 visible as `limited`, never silently called `approved`.
@@ -100,9 +106,15 @@ not trusted on its own. Each role has a set of requirements:
 
 `.caw/CAW.md` separately sets `planning_independence` and `task_independence`. `same-provider`
 permits any pair, `different-model` requires a different vendor or model, and `cross-vendor`
-compares the stable `vendor` owner reported by each adapter. `human-review` disables automated
-approval and currently refuses because CAW has no signed human-attestation command. The resolved
-pairs and whether they satisfy policy are retained in every run manifest.
+compares the stable `vendor` owner reported by each adapter. `human-review` disables the relevant
+automated reviewer and requires an OpenSSH-signed attestation over the exact `PLAN.md` bytes or
+delivery digest. The attestation and signature are retained in Git-private `caw/human-reviews/`.
+The resolved pairs and whether they satisfy policy are retained in every run manifest.
+
+Adapters declare `modelSelection: explicit-id` and their supported CAW reasoning levels. The
+engine validates the binding before a provider call. When `require_role_smoke` is enabled, each
+exact provider/model/reasoning/CLI/adapter/engine tuple must have Git-private evidence from
+`node caw.mjs smoke <role|all>`; changing a model invalidates only the affected role.
 
 ```js
 executor: {

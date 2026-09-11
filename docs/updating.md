@@ -31,6 +31,10 @@ and **against a named ref rather than the clone's `HEAD`**: an install copying f
 from `HEAD:` had another session run a `pull` in the same clone mid-copy, so the source moved
 under it and its first report named the wrong version. A named ref cannot move while you read it.
 
+The engine and adapter digests are part of role-smoke identity. After committing an update, run
+`node caw.mjs smoke all` when the project enables `require_role_smoke`; old model-path evidence is
+intentionally stale even when `runtime.json` did not change.
+
 If your project patched the engine, mark each patch with a `LOCAL CHANGE` comment at its site
 and run `grep -rn 'LOCAL CHANGE' caw.mjs .caw/` **before** copying, not after: the point is to
 make re-application a list rather than a memory. A local change that survives two updates is

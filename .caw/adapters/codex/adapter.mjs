@@ -233,6 +233,7 @@ export default {
   features: {
     schemaTransport: 'file', resultTransport: 'file',
     reportsCost: false, reportsCacheCounters: true, reportsModels: false,
+    modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
   },
   resolveExecutable(env) { return env.CAW_CODEX || 'codex' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },

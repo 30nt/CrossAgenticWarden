@@ -43,6 +43,16 @@ docs_language: English
 # Required separation between the author and reviewer bindings.
 planning_independence: same-provider
 task_independence: different-model
+# Required only when either independence mode is human-review. OpenSSH allowed-signers format.
+human_review_allowed_signers:
+
+# Blind reviewer passes after the primary pass. All passes receive the exact same delivery.
+# 1 means two total passes; allowed range is 0..2.
+review_challenger_passes: 1
+
+# Require a successful role-specific provider call for the exact model/reasoning binding.
+# Run `node caw.mjs smoke all` after changing .caw/runtime.json.
+require_role_smoke: true
 
 # Provider-call budgets. Every limit is checked before a child process starts.
 # Defaults are finite; set smaller project limits here when cost needs a tighter boundary.

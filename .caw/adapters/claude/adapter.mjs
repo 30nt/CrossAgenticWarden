@@ -215,6 +215,7 @@ export default {
   features: {
     schemaTransport: 'inline', resultTransport: 'stdout',
     reportsCost: true, reportsCacheCounters: true, reportsModels: true,
+    modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
   },
   resolveExecutable(env) { return env.CAW_CLAUDE || 'claude' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },

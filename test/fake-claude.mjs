@@ -48,7 +48,13 @@ const belongsTo = (entry) => {
   if (role === 'plan-reviewer') return value && 'unverifiable' in value && !('carried' in value)
   return true
 }
-const selected = queue.findIndex(belongsTo)
+const reviewPass = role === 'reviewer'
+  ? Number(input.match(/^Review pass (\d+) of \d+\./)?.[1] || 1)
+  : 1
+const matching = queue.map((entry, index) => belongsTo(entry) ? index : -1).filter((index) => index >= 0)
+const selected = role === 'reviewer' && reviewPass > 1
+  ? (matching[reviewPass - 1] ?? matching[0] ?? -1)
+  : queue.findIndex(belongsTo)
 const index = selected === -1 ? 0 : selected
 const next = queue[index]
 
