@@ -93,15 +93,18 @@ boolean are the usual collapses. Where one is unavoidable, pin the text.
 Before you return, **enumerate the population**: the cases, states, inputs, call sites and
 surfaces this request implies. Every case of an enum. Both overloads of a method. Each
 caller of the function you are changing. The empty state and the populated one. Then map
-each case to the task that handles it, and return that as `coverage`.
+each case to the task that handles it and to one or more exact `done_when` strings from that
+task. Return that as `coverage`. A task name without an acceptance criterion is not coverage:
+it says where work happens, but not what will prove that this case survived it.
 
 This is not paperwork. Completeness is otherwise a judgement nobody can check; as a mapping
 it is something a reader compares against their own enumeration. A case you did not think
 of is a hole, and writing the mapping is what makes it visible — first of all to you.
 
-Every task must appear in the mapping, and every case must name a task that genuinely
-handles it. If you cannot name the population, say so in `blocked`: a request whose
-population you cannot enumerate has not been stated clearly enough to plan.
+Every task must appear in the mapping, every case must appear exactly once, and every named
+acceptance criterion must be copied exactly from that task's `done_when`. If you cannot name
+the population, say so in `blocked`: a request whose population you cannot enumerate has not
+been stated clearly enough to plan.
 
 ## Do not
 

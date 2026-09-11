@@ -6,6 +6,8 @@ import {
   SCHEMA,
   canonicalAuthorityPaths,
   decidePlanningAction,
+  planRelationIssue,
+  planningLedger,
 } from '../caw.mjs'
 
 test('request issues stop planning before architect', () => {
@@ -36,4 +38,59 @@ Text
 - \`not-authority.md\`
 `)
   assert.deepEqual([...paths], ['.caw/CAW.md', 'docs/product.md', 'docs/stack.md'])
+})
+
+const relatedPlan = () => ({
+  tasks: [{
+    slug: 'preserve-state',
+    title: 'Preserve state',
+    read: ['src/state.js'],
+    change: ['Keep both states explicit.'],
+    done_when: ['The empty state survives.', 'The populated state survives.'],
+  }],
+  coverage: [{
+    case: 'empty and populated states',
+    task: 'preserve-state',
+    acceptance_criteria: ['The empty state survives.', 'The populated state survives.'],
+  }],
+})
+
+test('planning ledger gives stable ids to requirements and case-to-criterion relations', () => {
+  const first = planningLedger(relatedPlan())
+  const reordered = relatedPlan()
+  reordered.tasks[0].done_when.reverse()
+  reordered.coverage[0].acceptance_criteria.reverse()
+  const second = planningLedger(reordered)
+
+  assert.equal(first.version, 1)
+  assert.deepEqual(new Set(first.requirements.map(({ id }) => id)),
+    new Set(second.requirements.map(({ id }) => id)))
+  assert.equal(first.relations[0].id, second.relations[0].id)
+  assert.equal(first.relations[0].criterion_ids.length, 2)
+  assert.match(first.tasks[0].id, /^plan-task-[0-9a-f]{12}$/)
+  assert.match(first.cases[0].id, /^plan-case-[0-9a-f]{12}$/)
+})
+
+test('plan relation review requires every known id exactly once with evidence', () => {
+  const ledger = planningLedger(relatedPlan())
+  const row = {
+    id: ledger.relations[0].id,
+    state: 'covered',
+    evidence: 'both linked final-tree checks exercise the named states',
+  }
+
+  assert.equal(planRelationIssue(ledger, [row]), null)
+  assert.match(planRelationIssue(ledger, []), /missing relation id/)
+  assert.match(planRelationIssue(ledger, [row, row]), /duplicate relation id/)
+  assert.match(planRelationIssue(ledger, [{ ...row, id: 'plan-relation-unknown' }]),
+    /unknown relation id/)
+  assert.match(planRelationIssue(ledger, [{ ...row, evidence: ' ' }]), /empty evidence/)
+})
+
+test('plan-reviewer schema requires the complete relation ledger', () => {
+  assert.ok(SCHEMA.planReview.required.includes('relations'))
+  assert.deepEqual(SCHEMA.planReview.properties.relations.items.properties.state.enum,
+    ['covered', 'uncovered'])
+  assert.deepEqual(SCHEMA.plan.properties.coverage.items.required,
+    ['case', 'task', 'acceptance_criteria'])
 })
