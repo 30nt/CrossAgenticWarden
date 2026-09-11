@@ -26,6 +26,10 @@ Project policy API v2 may classify a confirmed red fast gate as allowlisted flak
 provider-free retry. The engine, not the policy, caps these at two per delivery. A persistent red
 then returns to the normal executor retry or review-stop decision.
 
+Required full-gate baseline caching is fail-safe and project opt-in. CAW combines its own exact
+repository, queue, engine, profile, policy, risk, command, and timeout digests with a v2 gate-policy
+digest for external inputs. Without the project digest, or on any mismatch, the gate runs again.
+
 1. **Exit 0 green, 75 refused-to-start, any other non-zero red.** 75 (`EX_TEMPFAIL`) means
    the gate never looked: a machine too loaded for the suite it shards, a simulator that is
    not there, a service that is down. `caw.mjs` then says the run was *not tested* rather

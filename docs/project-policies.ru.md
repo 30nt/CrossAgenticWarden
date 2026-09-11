@@ -96,6 +96,21 @@ project policy, для точного digest population и с непустым e
 после чего запускают финальный full gate для продолженной задачи. Risk-запись удаляется вместе с
 опустевшей очередью.
 
+Переиспользование baseline включается явно. До полного gate policy v2 получает
+`kind: "full-baseline-inputs"` и `known_inputs`. Чтобы разрешить кэш, она возвращает SHA-256 digest
+всех дополнительных входов, которые может видеть gate:
+
+```json
+{"action":"continue","reason":"","baseline_inputs_digest":"<64 lowercase hex>"}
+```
+
+Обычно сюда входят ignored dependencies и cache, версии SDK или simulator, состояние сервисов и
+значимые внешние настройки. CAW объединяет project digest с digest HEAD, delivery и очереди,
+версией ядра, профилем, окружением gate, набором policies, risk attestation, командой gate и timeout. Прошлый
+зелёный baseline используется только при точном совпадении общего digest. Если поля или gate
+policy v2 нет, CAW снова запускает полный baseline. При cache miss CAW повторно получает project
+digest после gate и отклоняет baseline, если входы изменились во время запуска.
+
 ## Классификация flaky gate (API v2)
 
 Gate policy v2 может добавить `classification`: `defect`, `flaky`, `infrastructure` или `unknown`.
@@ -122,6 +137,6 @@ node caw.mjs verify-project
 ```
 
 Команда выполняет каждый настроенный этап с проверочным входом и валидирует его результат. Для
-API v2 planning проверяются обе фазы. Run record хранит digest манифеста и каждой policy,
-длительность, этап и результат. Состояние задачи запоминает набор policies и сообщает о
-расхождении после их изменения.
+API v2 проверяются обе фазы planning, а gate policy проверяется в обычной фазе и в фазе входов
+baseline. Run record хранит digest манифеста и каждой policy, длительность, этап и результат.
+Состояние задачи запоминает набор policies и сообщает о расхождении после их изменения.

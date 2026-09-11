@@ -97,6 +97,21 @@ queue. `round` and `review` accept it only while its commit is still an ancestor
 is unchanged, then run the final full gate after the recovered task. The risk record is removed
 when the queue becomes empty.
 
+Baseline reuse is opt-in. Before the full gate, a v2 gate policy receives
+`kind: "full-baseline-inputs"` and `known_inputs`. To allow reuse, return a SHA-256 digest of every
+additional input the gate can observe:
+
+```json
+{"action":"continue","reason":"","baseline_inputs_digest":"<64 lowercase hex>"}
+```
+
+Typical additional inputs are ignored dependencies and caches, SDK or simulator versions,
+service state, and relevant environment configuration. CAW combines that project digest with
+HEAD, delivery and queue digests, engine, profile, gate environment, policy set, risk attestation,
+gate command, and timeout. A previous green baseline is reused only when the combined digest matches exactly. If the
+field or a v2 gate policy is absent, CAW runs the full baseline again. On a cacheable miss, CAW
+also resolves the project digest after the gate and refuses the baseline if it changed mid-run.
+
 ## Flaky gate classification (API v2)
 
 A v2 gate policy may add `classification`: `defect`, `flaky`, `infrastructure`, or `unknown`.
@@ -123,6 +138,7 @@ node caw.mjs verify-project
 ```
 
 This executes every configured stage with a verification input and validates its output. API v2
-planning is checked in both phases. Normal
-run records contain the manifest digest, every policy digest, duration, stage, and result. Saved
-task state records the policy set and reports divergence after a policy change.
+planning is checked in both phases; its gate policy is also checked for ordinary gate and baseline
+input phases. Normal run records contain the manifest digest, every policy digest, duration,
+stage, and result. Saved task state records the policy set and reports divergence after a policy
+change.

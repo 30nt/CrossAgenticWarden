@@ -1647,6 +1647,7 @@ const PROJECT_POLICY_V2_GATE_SCHEMA = closeSchema({
     classification: {
       type: 'string', enum: ['defect', 'flaky', 'infrastructure', 'unknown'],
     },
+    baseline_inputs_digest: { type: 'string' },
   },
   required: ['action', 'reason'],
 })
@@ -2099,13 +2100,22 @@ function validateRiskRecord(value) {
   }
   if (value.full_gate_baseline !== null) {
     exactObjectKeys(value.full_gate_baseline,
-      ['head', 'tree_digest', 'gate', 'state'], 'risk full-gate baseline')
-    if (!/^[0-9a-f]{40}$/.test(value.full_gate_baseline.head) ||
-        !/^[0-9a-f]{64}$/.test(value.full_gate_baseline.tree_digest) ||
-        typeof value.full_gate_baseline.gate !== 'string' ||
-        value.full_gate_baseline.state !== 'green') {
+      ['head', 'tree_digest', 'gate', 'state', 'inputs_digest', 'project_inputs_digest'],
+      'risk full-gate baseline')
+    const baseline = {
+      inputs_digest: null,
+      project_inputs_digest: null,
+      ...value.full_gate_baseline,
+    }
+    if (!/^[0-9a-f]{40}$/.test(baseline.head) ||
+        !/^[0-9a-f]{64}$/.test(baseline.tree_digest) ||
+        typeof baseline.gate !== 'string' || baseline.state !== 'green' ||
+        !(baseline.inputs_digest === null || /^[0-9a-f]{64}$/.test(baseline.inputs_digest)) ||
+        !(baseline.project_inputs_digest === null ||
+          /^[0-9a-f]{64}$/.test(baseline.project_inputs_digest))) {
       throw new Error('risk full-gate baseline is invalid')
     }
+    value = { ...value, full_gate_baseline: baseline }
   }
   return value
 }
@@ -3090,6 +3100,15 @@ function validateProjectPolicyOutput(stage, policy, output, apiVersion = 1, cont
       throw new Error('project gate policy retry requires flaky classification and a reason')
     }
   }
+  if (stage === 'gate' && apiVersion === 2 &&
+      output.baseline_inputs_digest !== undefined &&
+      !/^[0-9a-f]{64}$/.test(output.baseline_inputs_digest)) {
+    throw new Error('project gate policy returned an invalid baseline inputs digest')
+  }
+  if (stage === 'gate' && output.baseline_inputs_digest !== undefined &&
+      context?.kind !== 'full-baseline-inputs') {
+    throw new Error('project gate policy returned baseline inputs outside the cache-input phase')
+  }
   if (stage === 'review') {
     const ids = output.criteria.map((row) => row.id)
     if (ids.some((id) => !/^[a-z][a-z0-9.-]{0,63}$/.test(id))) {
@@ -3123,6 +3142,7 @@ function recordProjectPolicyCall(policy, stage, startedAt, status, context = {},
         action: output.action,
         classification: output.classification || null,
         reason: output.reason,
+        baseline_inputs_digest: output.baseline_inputs_digest || null,
       },
     } : {}),
     duration_ms: Date.now() - startedAt, status,
@@ -3218,6 +3238,17 @@ function verifyProjectPolicies(set = readProjectPolicies()) {
         },
       }, { record: false, set })
       say(`${stage}: ${requestResult.policy.id} ${requestResult.policy.digest.slice(0, 12)} — valid (request, population)`)
+    } else if (stage === 'gate' && set.apiVersion === 2) {
+      const result = runProjectPolicy(stage, samples.gate, { record: false, set })
+      runProjectPolicy(stage, {
+        ...samples.gate,
+        task: null,
+        kind: 'full-baseline-inputs',
+        state: 'not-run',
+        status: null,
+        known_inputs: { version: 1 },
+      }, { record: false, set })
+      say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid (gate, baseline-inputs)`)
     } else {
       const result = runProjectPolicy(stage, samples[stage], { record: false, set })
       say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid`)
@@ -5184,6 +5215,69 @@ function writeSpecs(tasks, coverage) {
 
 // ---------------------------------------------------------------- build
 
+function fullGateQueueDigest() {
+  const hash = createHash('sha256')
+  for (const path of [PLAN, ...specFiles().map((name) => join(QUEUE_DIR, name))]) {
+    if (!existsSync(path)) continue
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      die(`full-gate baseline input is not a regular file: ${path}`)
+    }
+    hash.update(`\0${path}\0${stat.mode & 0o777}\0`)
+    hash.update(readFileSync(path))
+  }
+  return hash.digest('hex')
+}
+
+function knownFullGateInputs(f, risk, startHead) {
+  const policySnapshot = projectPolicySnapshot()
+  const gateEnvironment = { ...process.env, PWD: process.cwd() }
+  const riskInput = {
+    class: risk.class,
+    population_requirement: risk.population_requirement,
+    population_attestation: risk.population_attestation,
+    population_digest: risk.population_digest,
+    evidence: risk.evidence,
+    policy_id: risk.policy_id,
+    policy_digest: risk.policy_digest,
+  }
+  return {
+    version: 1,
+    head: startHead,
+    delivery_digest: deliveryDigest(),
+    queue_digest: fullGateQueueDigest(),
+    engine_digest: createHash('sha256')
+      .update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    profile_digest: createHash('sha256').update(readFileSync('.caw/CAW.md')).digest('hex'),
+    environment_digest: createHash('sha256').update(stableJson(gateEnvironment)).digest('hex'),
+    policy_set_digest: policySnapshot?.set_digest || null,
+    risk_digest: createHash('sha256').update(stableJson(riskInput)).digest('hex'),
+    gate: f.gate_full,
+    timeout_ms: f.gate_full_timeout_ms,
+  }
+}
+
+function projectFullGateInputs(f, risk, knownInputs) {
+  if (projectPolicySet?.apiVersion !== 2 || !projectPolicySet.policies?.gate) return null
+  const result = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full-baseline-inputs',
+    risk_class: risk.class,
+    command: f.gate_full,
+    state: 'not-run',
+    status: null,
+    output: '',
+    duration_ms: 0,
+    timeout_ms: f.gate_full_timeout_ms,
+    known_inputs: knownInputs,
+  })
+  if (result.output.action === 'stop') {
+    die(`project gate policy ${result.policy.id} stopped baseline input resolution: ` +
+      result.output.reason.trim())
+  }
+  return result.output.baseline_inputs_digest || null
+}
+
 function runRequiredFullGateBaseline(f, risk, startHead) {
   if (!risk?.require_full_gate_baseline) return null
   const planningPolicy = projectPolicySet?.policies?.planning
@@ -5192,6 +5286,29 @@ function runRequiredFullGateBaseline(f, risk, startHead) {
   }
   if (!f.gate_full) {
     die(`project risk class ${risk.class} requires a full-gate baseline, but gate_full is empty`)
+  }
+  const knownInputs = knownFullGateInputs(f, risk, startHead)
+  const projectInputsDigest = projectFullGateInputs(f, risk, knownInputs)
+  const inputsDigest = projectInputsDigest
+    ? createHash('sha256').update(stableJson({ knownInputs, projectInputsDigest })).digest('hex')
+    : null
+  const cached = risk.full_gate_baseline
+  if (inputsDigest && cached?.inputs_digest === inputsDigest &&
+      cached.project_inputs_digest === projectInputsDigest && cached.head === startHead &&
+      cached.tree_digest === knownInputs.delivery_digest && cached.gate === f.gate_full) {
+    say(`\n· required full-gate baseline (${risk.class}): reused green result for exact inputs`)
+    const run = beginRunRecord()
+    run.risk = risk
+    run.fullGateBaseline = {
+      ...cached,
+      status: 0,
+      output: '(reused exact-input baseline)',
+      duration_ms: 0,
+      timeout_ms: f.gate_full_timeout_ms,
+      cache: 'hit',
+    }
+    writeRunManifest('active')
+    return run.fullGateBaseline
   }
   say(`\n· required full-gate baseline (${risk.class}): ${f.gate_full}`)
   const baselineTreeDigest = deliveryDigest()
@@ -5204,6 +5321,8 @@ function runRequiredFullGateBaseline(f, risk, startHead) {
     head: startHead,
     tree_digest: baselineTreeDigest,
     gate: f.gate_full,
+    inputs_digest: inputsDigest,
+    project_inputs_digest: projectInputsDigest,
     state: baselineChanged ? 'mutated' : g.state,
     status: g.status ?? (g.ok ? 0 : null),
     output: g.out.slice(-8000),
@@ -5214,6 +5333,14 @@ function runRequiredFullGateBaseline(f, risk, startHead) {
   if (baselineChanged) {
     die('required full-gate baseline changed HEAD, delivery, CAW, policies, or the task queue; ' +
       'no executor ran')
+  }
+  if (projectInputsDigest) {
+    const afterProjectInputsDigest = projectFullGateInputs(f, risk, knownInputs)
+    if (afterProjectInputsDigest !== projectInputsDigest) {
+      run.fullGateBaseline.state = 'inputs-changed'
+      writeRunManifest('failed')
+      die('required full-gate baseline project inputs changed while the gate ran; no executor ran')
+    }
   }
   const gatePolicy = runProjectPolicy('gate', {
     task: null,
@@ -5250,6 +5377,8 @@ function runRequiredFullGateBaseline(f, risk, startHead) {
       tree_digest: run.fullGateBaseline.tree_digest,
       gate: f.gate_full,
       state: 'green',
+      inputs_digest: inputsDigest,
+      project_inputs_digest: projectInputsDigest,
     },
   })
   return run.fullGateBaseline

@@ -372,6 +372,21 @@ if (request.stage === 'planning' && request.context.phase === 'request') {
 process.stdout.write(JSON.stringify(output))
 `
 
+const cacheableRiskPolicySource = `
+import { createHash as policyHash } from 'node:crypto'
+import { readFileSync as policyRead } from 'node:fs'
+` + riskPolicySource.replace(
+  "output = { action: 'continue', reason: '' }",
+  `output = {
+    action: 'continue', reason: '',
+    ...(request.context.kind === 'full-baseline-inputs'
+      ? { baseline_inputs_digest: policyHash('sha256').update(policyRead(
+          new URL('../../.caw-logs/baseline-cache-input.txt', import.meta.url)
+        )).digest('hex') }
+      : {}),
+  }`,
+)
+
 const flakyGatePolicySource = `
 let text = ''
 process.stdin.setEncoding('utf8')
@@ -1497,6 +1512,130 @@ test('a stopped high-risk build keeps its baseline through round recovery',
   assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
   assert.equal(existsSync(riskPath), false)
   assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), false)
+})
+
+test('required full-gate baseline cache needs exact engine and project input digests',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, cacheableRiskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const projectInput = join(f.root, '.caw-logs', 'baseline-cache-input.txt')
+  writeFileSync(projectInput, 'sdk-one\n')
+
+  const blockedDelivery = {
+    ...delivery('could not proceed'),
+    blocked: 'the fixture deliberately stops before writing',
+  }
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /executor stopped/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+  let risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.match(risk.full_gate_baseline.inputs_digest, /^[0-9a-f]{64}$/)
+  assert.equal(risk.full_gate_baseline.project_inputs_digest,
+    createHash('sha256').update('sdk-one\n').digest('hex'))
+
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+
+  writeFileSync(projectInput, 'sdk-two\n')
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+
+  writeFileSync(join(f.root, 'README.md'), '# fixture changed\n')
+  execFileSync('git', ['add', 'README.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'change a baseline input'], { cwd: f.root })
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 3)
+  risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline.head,
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim())
+})
+
+test('a project that supplies no external-input digest never reuses a full-gate baseline',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const blockedDelivery = {
+    ...delivery('could not proceed'),
+    blocked: 'the fixture deliberately stops before writing',
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+      CAW_FULL_LOG: fullLog,
+    })
+    assert.equal(result.status, 1)
+    assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  }
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline.inputs_digest, null)
+  assert.equal(risk.full_gate_baseline.project_inputs_digest, null)
+})
+
+test('a cacheable baseline stops if project-owned inputs change while its gate runs',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').writeFileSync(process.env.CAW_PROJECT_INPUT,'sdk-two\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, cacheableRiskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const projectInput = join(f.root, '.caw-logs', 'baseline-cache-input.txt')
+  writeFileSync(projectInput, 'sdk-one\n')
+  writeFileSync(f.calls, '')
+
+  result = run(f, ['build'], [], { CAW_PROJECT_INPUT: projectInput })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /project inputs changed while the gate ran; no executor ran/)
+  assert.equal(calls(f).length, 0)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline, null)
 })
 
 test('a required baseline that mutates protected project state stops before executor',

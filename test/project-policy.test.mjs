@@ -135,6 +135,40 @@ test('v2 gate retries are restricted to evidenced flaky red results', (t) => {
   assert.match(legacyResult.stderr, /expected one of.*continue.*stop/)
 })
 
+test('v2 baseline cache input digests are phase-bound and validated', (t) => {
+  const validCachePolicy = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+process.stdout.write(JSON.stringify({
+  action: 'continue', reason: '',
+  ...(request.context.kind === 'full-baseline-inputs'
+    ? { baseline_inputs_digest: 'b'.repeat(64) }
+    : {}),
+}))
+`
+  const valid = fixture(validCachePolicy, ['gate'], 2)
+  t.after(() => rmSync(valid, { recursive: true, force: true }))
+  const validResult = run(valid)
+  assert.equal(validResult.status, 0, validResult.stderr || validResult.stdout)
+  assert.match(validResult.stdout, /valid \(gate, baseline-inputs\)/)
+
+  const malformed = fixture(validCachePolicy.replace("'b'.repeat(64)", "'short'"), ['gate'], 2)
+  t.after(() => rmSync(malformed, { recursive: true, force: true }))
+  const malformedResult = run(malformed)
+  assert.equal(malformedResult.status, 1)
+  assert.match(malformedResult.stderr, /invalid baseline inputs digest/)
+
+  const wrongPhase = fixture(validCachePolicy.replace(
+    "...(request.context.kind === 'full-baseline-inputs'\n    ? { baseline_inputs_digest: 'b'.repeat(64) }\n    : {})",
+    "baseline_inputs_digest: 'b'.repeat(64)"), ['gate'], 2)
+  t.after(() => rmSync(wrongPhase, { recursive: true, force: true }))
+  const wrongPhaseResult = run(wrongPhase)
+  assert.equal(wrongPhaseResult.status, 1)
+  assert.match(wrongPhaseResult.stderr, /baseline inputs outside the cache-input phase/)
+})
+
 test('policy digests change when any file in the project policy tree changes', (t) => {
   const root = fixture(validPolicy, ['planning'])
   t.after(() => rmSync(root, { recursive: true, force: true }))
