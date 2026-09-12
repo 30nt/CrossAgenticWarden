@@ -20,7 +20,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  mergeReviewPasses, planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
+  groupFindings, mergeReviewPasses, planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
   resolvePopulationSource, retainWeakVerificationEvents,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -137,9 +137,34 @@ const planReview = (subject = plan()) => ({
   })),
   uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [],
 })
-const delivery = (summary) => ({ summary, notes: [], blocked: '' })
-const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) =>
-  ({ criteria, carried, broken, uncovered, weak, noted })
+const delivery = (summary, claims = []) => ({ summary, notes: [], claims, blocked: '' })
+const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) => {
+  const criterionRows = criteria.map((row) => ({
+    ...row, evidence_refs: row.evidence_refs || ['repository:README.md'],
+  }))
+  const decorate = (item, slot) => {
+    const criterion = criterionRows.find((row) => row.state === slot)?.id ||
+      criterionRows.find((row) => row.state !== 'met')?.id || criterionRows[0]?.id || null
+    const path = String(item.where || 'README.md').replace(/:\d.*$/, '')
+    return {
+      criterion_ids: criterion ? [criterion] : [], surface_ids: [], transition_ids: [],
+      property_key: String(item.fix || slot).toLowerCase().replace(/[^a-z0-9.-]+/g, '-')
+        .replace(/^-+|-+$/g, '').slice(0, 128) || `${slot}-property`,
+      evidence_refs: [`repository:${path}`],
+      ...item,
+    }
+  }
+  return {
+    criteria: criterionRows,
+    carried: carried.map((row) => ({
+      ...row, evidence_refs: row.evidence_refs || ['review-experiment:carried-check'],
+    })),
+    broken: broken.map((item) => decorate(item, 'broken')),
+    uncovered: uncovered.map((item) => decorate(item, 'uncovered')),
+    weak: weak.map((item) => decorate(item, 'weak')),
+    noted,
+  }
+}
 
 test('review passes merge conservatively and mark challenger findings against one baseline', () => {
   const criterion = { id: 'done_when:1', state: 'met', evidence: 'primary checked it' }
@@ -170,10 +195,14 @@ test('review passes merge conservatively and mark challenger findings against on
   ], 'a'.repeat(64))
   assert.equal(merged.verdict.criteria[0].state, 'broken')
   assert.equal(merged.verdict.carried[0].state, 'open')
-  assert.equal(merged.verdict.broken.length, 2)
+  assert.equal(merged.verdict.broken.length, 3)
   assert.equal(merged.verdict.broken[0].discovery, 'primary')
   assert.equal(merged.verdict.broken[1].discovery, 'late-same-baseline')
-  assert.equal(merged.verdict.broken[1].baseline_digest, 'a'.repeat(64))
+  assert.equal(merged.verdict.broken[2].discovery, 'late-same-baseline')
+  assert.equal(merged.verdict.broken[2].baseline_digest, 'a'.repeat(64))
+  const groups = groupFindings(merged.verdict.broken)
+  assert.equal(groups.length, 2)
+  assert.equal(groups[0].members.length, 2)
   assert.equal(merged.weakVerification.replay_surface.surfaces_created, 2)
 })
 
@@ -2520,8 +2549,12 @@ title: Human task
   assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
   const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
   const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  assert.equal(attestation.version, 2)
   attestation.statement = 'I reviewed the exact delivery and its gate.'
-  for (const criterion of attestation.criteria) criterion.evidence = 'read README and checked the criterion'
+  for (const criterion of attestation.criteria) {
+    criterion.evidence = 'read README and checked the criterion'
+    criterion.evidence_refs = ['repository:README.md']
+  }
   writeFileSync(packet, `${JSON.stringify(attestation, null, 2)}\n`)
   execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], {
     stdio: 'ignore',
@@ -3223,7 +3256,7 @@ title: Baseline task
   assert.equal(existsSync(state), true)
   const saved = JSON.parse(readFileSync(state, 'utf8'))
   assert.equal(saved.history[0].id, 'r1.1')
-  assert.equal(saved.state_version, 4)
+  assert.equal(saved.state_version, 5)
   assert.match(saved.runtime_digest, /^[0-9a-f]{64}$/)
   assert.equal(saved.runtime_history.some((entry) => entry.role === 'reviewer'), true)
   assert.equal(saved.history[0].origin_runtime.provider, 'test-claude')
@@ -3333,6 +3366,50 @@ test('one resumed carried set preserves and renders several runtime origins',
   const observation = JSON.parse(observationText.slice('fake-review-probe:'.length))
   assert.deepEqual(observation.inputMatches,
     Object.fromEntries(expectedOrigins.map((origin) => [origin, true])))
+})
+
+test('version-4 task state migrates finding provenance without dropping legacy fields',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_legacy-finding.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Legacy finding\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'ready\n')
+  const legacy = {
+    id: 'r1.1', slot: 'broken', round: 1, where: 'delivery.txt:1',
+    fix: 'preserve the old instruction', evidence: 'legacy observed evidence',
+    state: 'open', origin_runtime: null,
+  }
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 4,
+    round: 1,
+    history: [legacy],
+    noted: [],
+    accounting: { priced: {}, unpriced: {} },
+    runtime_history: [],
+    ex: { summary: 'legacy delivery', notes: [] },
+  }, null, 2)}\n`)
+
+  const result = run(f, ['review', spec], [{
+    envelope: envelope(verdict({
+      carried: [{ id: 'r1.1', state: 'open', evidence: 'legacy issue still reproduces' }],
+    })),
+  }])
+
+  assert.equal(result.status, 1)
+  const saved = JSON.parse(readFileSync(
+    join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(saved.state_version, 5)
+  assert.equal(saved.history.length, 1)
+  for (const field of ['id', 'slot', 'round', 'where', 'fix', 'evidence', 'state']) {
+    assert.equal(saved.history[0][field], legacy[field])
+  }
+  assert.deepEqual(saved.history[0].evidence_refs, [])
+  assert.equal(saved.history[0].property_key, null)
+  assert.match(saved.history[0].work_package_id, /^wp-[0-9a-f]{12}$/)
+  assert.deepEqual(saved.history[0].checked_evidence_refs,
+    ['review-experiment:carried-check'])
+  assert.deepEqual(saved.ex.claims, [])
 })
 
 test('fake provider can expose malformed output and structured failures without a network', () => {
@@ -3607,6 +3684,141 @@ test('review confirms a red gate once without waking an executor', () => {
   assert.equal(calls(f).length, 0)
   assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
   assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
+})
+
+test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
+  const f = fixture({ git: true, gateFast: 'node .caw/gate-evidence.mjs' })
+  writeFileSync(join(f.root, '.caw', 'gate-evidence.mjs'), [
+    "import { writeFileSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    "writeFileSync(join(process.env.CAW_GATE_ARTIFACTS_DIR, 'result.txt'), 'green result\\n')",
+    'writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({',
+    '  version: 1, checks: [{',
+    "    id: 'ui-check', criterion_ids: ['done-when-1'],",
+    "    acceptance_case_ids: ['ui-case'], selector: 'settings.language',",
+    "    evidence_kind: 'xcui-result', state: 'passed',",
+    "    summary: 'mounted consumer changed language',",
+    "    artifacts: [{ id: 'ui-result', path: 'result.txt' }],",
+    '  }],',
+    '}))',
+    '',
+  ].join('\n'))
+  execFileSync('git', ['add', '.caw/CAW.md', '.caw/gate-evidence.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure evidence gate'], { cwd: f.root })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'ui-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'SettingsView', scenario: 'switch language',",
+    "  observable: 'mounted label changes', mutation: 'disable locale propagation',",
+    "  evidence_kind: 'xcui-result', selector: 'settings.language',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_acceptance.md'), [
+    '---', 'title: Acceptance', '---', '',
+    '## Surfaces',
+    '- `settings-language` — mounted language consumer', '',
+    '## State machines',
+    '- `settings-language`: states `english`, `ukrainian`',
+    '  - `english` -- select Ukrainian --> `ukrainian`', '',
+    '## Done when',
+    '- The mounted settings consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '001_acceptance.md'], [{
+    envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1',
+      state: 'met',
+      evidence: 'the engine gate check observes the mounted consumer',
+      evidence_refs: ['gate-check:ui-check'],
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const certification = latestTaskAudit(f).review.certification
+  assert.equal(certification.version, 2)
+  assert.deepEqual(certification.acceptance_cases.map((row) => row.id), ['ui-case'])
+  assert.equal(certification.gate_receipt.owner, 'caw-engine')
+  assert.equal(certification.gate_receipt.manifest.checks[0].id, 'ui-check')
+  assert.match(certification.gate_receipt.receipt_id, /^[0-9a-f]{64}$/)
+  const artifact = certification.gate_receipt.artifacts[0]
+  assert.equal(artifact.id, 'ui-result')
+  assert.match(artifact.sha256, /^[0-9a-f]{64}$/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  assert.equal(readFileSync(join(f.root, '.caw-logs', runName, artifact.private_file), 'utf8'),
+    'green result\n')
+})
+
+test('v3 acceptance matrix refuses a green gate without its required evidence', () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'required-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'Consumer', scenario: 'scenario', observable: 'observable',",
+    "  mutation: 'mutation', evidence_kind: 'test-result', selector: 'consumer.selector',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_missing-evidence.md'), [
+    '## Surfaces',
+    '- `consumer` — production consumer', '',
+    '## State machines',
+    '- `consumer`: states `before`, `after`',
+    '  - `before` -- act --> `after`', '',
+    '## Done when',
+    '- Consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '001_missing-evidence.md'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /gate evidence refused:.*acceptance matrix/s)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
+})
+
+test('v3 acceptance matrix still refuses a missing gate during pipeline preflight', () => {
+  const f = fixture({ git: true, gateFast: '' })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'required-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'Consumer', scenario: 'scenario', observable: 'observable',",
+    "  mutation: 'mutation', evidence_kind: 'test-result', selector: 'consumer.selector',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_missing-gate.md'), [
+    '## Surfaces',
+    '- `consumer` — production consumer', '',
+    '## State machines',
+    '- `consumer`: states `before`, `after`',
+    '  - `before` -- act --> `after`', '',
+    '## Done when',
+    '- Consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '001_missing-gate.md'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /sets no gate_fast — refusing/)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
 })
 
 test('project review criteria are additive and commit policy only changes the subject',

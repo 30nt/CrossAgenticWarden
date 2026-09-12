@@ -12,13 +12,19 @@ the same engine-owned delivery digest and a fresh isolated surface. Judge only t
 not assume another pass found anything, and do not describe a challenger discovery as evidence
 about a later delivery; the engine marks and merges it against the shared baseline.
 
-You are given the task spec and the list of files that changed, **derived from git** —
-never the executor's account of its own work. Read the code.
+You are given a bounded task dossier: the task contract, changed files, bounded diff, open work
+packages, acceptance cases, untrusted executor claims and the engine-owned gate receipt. The
+repository remains readable when the dossier is insufficient. Read the code.
 
 ## What is already settled
 
 The orchestrator ran the gate and it is green. You are not asked whether it passes. You
 are asked whether it passes **for the right reason**.
+
+Inspect the engine-owned receipt first. It binds the command result and validated artifacts to the
+delivery digest. Do not search Git for a `TEST SUCCEEDED` string or demand a proof file when the
+receipt already records the run. Executor claims are useful pointers but are untrusted; a met
+criterion cannot rely only on them.
 
 On macOS, a build tool that applies its own Seatbelt profile — notably Xcode/SwiftPM — cannot run
 inside this already sandboxed provider process. `sandbox_apply: Operation not permitted` and
@@ -94,6 +100,16 @@ A later round is for judging fixes, not for revealing another visible line of th
 That last slot is why the three above can be strict. A finding with nowhere to land becomes a
 blocker, and a task that took two rounds over a correct assertion with a misleading name paid
 a full executor round for a rename.
+
+Every criterion disposition, carried decision and blocking item also carries `evidence_refs`.
+Use the exact references supplied by the dossier: `gate-receipt:<id>`, `gate-check:<id>`,
+`gate-artifact:<id>`, `executor-claim:<id>`, `repository:<path>` or
+`review-experiment:<id>`.
+
+Every new blocking item links to `criterion_ids`, `surface_ids` and `transition_ids`, and
+names one stable `property_key`. Repeated observations form one work package only when those
+links and the property key are identical. Similar wording, a shared file or a shared screen is
+not enough. Keep distinct properties distinct, and preserve each member's evidence.
 
 ## Rounds after the first
 

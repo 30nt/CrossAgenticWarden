@@ -35,6 +35,12 @@ the delivery tree are the `delivery-tree` boundary working as designed, not evid
 task is impossible or permission to widen or escape the boundary. This exception is only for a
 gate that cannot run: when the gate does run and fails, investigate and report that real failure.
 
+Record every meaningful check in `claims`. A claim has a stable id, links to the criterion and
+acceptance-case ids it exercised, the command and selector, the observed result, a short summary
+and any artifact references. These are navigation hints for the reviewer, not certification:
+only the orchestrator can produce an engine-owned gate receipt. Do not write proof files into the
+repository merely to make a claim visible.
+
 ## Scope of the edit is not scope of the search
 
 The spec bounds what you may **change**. It does not bound what you may **look at**. When
@@ -59,5 +65,6 @@ end of the run and then it is gone. That is the mechanism, not a gap in it.
 
 ## Return
 
-`summary` is one sentence: what changed. Nothing in your return value reaches the
-reviewer — it reads the spec and the diff, never your account of your own work.
+`summary` is one sentence: what changed. The reviewer receives your structured `claims`,
+explicitly labelled untrusted, alongside the engine-owned receipt. It does not receive your prose
+as proof and must not upgrade a claim into evidence merely because you reported it.

@@ -22,9 +22,11 @@ Project policies настраивают CAW без правок `caw.mjs` и п�
 }
 ```
 
-Допустимые этапы: `planning`, `review`, `gate` и `commit`. API версии 1 сохраняет описанный ниже
+Допустимые этапы: `planning`, `review`, `gate`, `commit` и, для API v3, `acceptance`.
+API версии 1 сохраняет описанный ниже
 однофазный контракт. API версии 2 добавляет двухфазное risk-aware планирование и ограниченный
-повтор flaky gate; review и commit сохраняют формат API v1. Неизвестные поля и этапы, симлинки,
+повтор flaky gate. API версии 3 сохраняет эти контракты и добавляет project acceptance matrix;
+review и commit сохраняют формат API v1. Неизвестные поля и этапы, симлинки,
 слишком большое дерево policies, невалидные команды и превышение времени отклоняются.
 
 ## Протокол
@@ -125,6 +127,48 @@ CAW всё равно сначала выполняет собственное �
 запускается. Если gate остаётся красным, продолжается обычный ограниченный цикл executor/review.
 Allowlist и правила классификации находятся в project policy; run record сохраняет каждое решение.
 
+## Acceptance matrix (API v3)
+
+Укажите `api_version: 3` и при необходимости настройте этап `acceptance`. CAW вызывает его один
+раз для каждой задачи до executor. В context находятся ID задачи и разобранные движком
+`criteria`, `surfaces` и `transitions`.
+
+Policy возвращает `{"cases":[]}`. Каждый case содержит:
+
+- стабильный lowercase `id` и один или несколько `criterion_ids`;
+- известный `surface_id` и необязательный известный `transition_id`;
+- `production_consumer`, `scenario`, `observable` и `mutation`;
+- lowercase `evidence_kind` и стабильный `selector`.
+
+Если этап настроен, matrix обязана покрывать каждый критерий и каждый объявленный transition.
+Неизвестные и повторяющиеся ID, переходы от другой surface, пустые измерения и неполная matrix
+отклоняются до executor.
+
+Fast gate получает `CAW_GATE_EVIDENCE_OUT` и `CAW_GATE_ARTIFACTS_DIR`. В первый путь можно
+записать JSON manifest версии 1:
+
+```json
+{
+  "version": 1,
+  "checks": [{
+    "id": "language-switch",
+    "criterion_ids": ["done-when-1"],
+    "acceptance_case_ids": ["ui-language-switch"],
+    "selector": "settings.language",
+    "evidence_kind": "xcui-result",
+    "state": "passed",
+    "summary": "mounted consumer changed language",
+    "artifacts": [{"id": "result-bundle", "path": "result.xcresult.zip"}]
+  }]
+}
+```
+
+Пути артефактов задаются относительно `CAW_GATE_ARTIFACTS_DIR`. CAW отклоняет traversal,
+symlink, не-regular files, неизвестные ссылки, неверные evidence kinds или selectors, повторяющиеся ID и
+превышение лимитов. Принятые артефакты хешируются и сохраняются приватно. При наличии acceptance
+matrix зелёный gate обязан содержать passed check для каждого case, иначе evidence отклоняется до
+reviewer.
+
 Команды policies работают в отдельном временном каталоге с сокращённым окружением. CAW проверяет,
 что не изменились дерево доставки, HEAD, файлы CAW, policies и очередь задач. Это проверка
 побочного эффекта, а не граница безопасности ОС: policies являются доверенным кодом проекта,
@@ -138,5 +182,6 @@ node caw.mjs verify-project
 
 Команда выполняет каждый настроенный этап с проверочным входом и валидирует его результат. Для
 API v2 проверяются обе фазы planning, а gate policy проверяется в обычной фазе и в фазе входов
-baseline. Run record хранит digest манифеста и каждой policy, длительность, этап и результат.
+baseline. Для API v3 также проверяются полнота matrix и ссылки. Run record хранит digest
+манифеста и каждой policy, длительность, этап и результат.
 Состояние задачи запоминает набор policies и сообщает о расхождении после их изменения.

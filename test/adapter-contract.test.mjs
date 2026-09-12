@@ -81,6 +81,30 @@ test('every shipped adapter declares explicit model ids and bounded reasoning le
   }
 })
 
+test('adapter telemetry reports provider events only when the transport exposes them', () => {
+  const codexEvents = [
+    { type: 'item.completed', item: { type: 'command_execution' } },
+    { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+  const codexResult = codex.decodeSuccess(codexEvents, {
+    binding: { provider: 'codex', model: 'fixture', reasoning: 'low' },
+    requestedNative: {}, finalResponseText: '{}',
+  }).canonical
+  assert.deepEqual(codexResult.telemetry, {
+    eventCount: 2, toolEventCount: 1, eventBytes: Buffer.byteLength(codexEvents),
+  })
+
+  const claudeResult = claude.decodeSuccess(JSON.stringify({
+    structured_output: {}, usage: { input_tokens: 10 }, num_turns: 3,
+  }), {
+    binding: { provider: 'claude', model: 'fixture', reasoning: 'low' },
+    requestedNative: {},
+  }).canonical
+  assert.deepEqual(claudeResult.telemetry, {
+    eventCount: null, toolEventCount: null, eventBytes: null,
+  })
+})
+
 test('role guarantee matcher accepts every exact cell and rejects every missing or incomparable cell', () => {
   const incompatible = {
     repositoryRead: 'unavailable',

@@ -96,6 +96,21 @@ at least $0.11, plus 1 unpriced call
 
 A zero written where a number was unavailable is the one failure this design will not tolerate.
 
+The canonical successful result also contains:
+
+```js
+telemetry: {
+  eventCount: 12,       // provider event records, or null
+  toolEventCount: 4,    // events representing tool use, or null
+  eventBytes: 8192,     // raw provider event-stream bytes, or null
+}
+```
+
+Every field is required and is either a non-negative safe integer or `null`. Do not estimate
+provider events the CLI did not expose. CAW combines this with engine-known original prompt bytes
+and token counters, retaining unknown counts explicitly and exporting summaries by task, round and
+role.
+
 ## Getting it accepted here
 
 1. `test/adapter-contract.test.mjs` green with your adapter added to its table.
