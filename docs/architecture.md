@@ -98,6 +98,12 @@ manifest and artifact paths. CAW validates links, paths, kinds and bounds, hashe
 and creates a receipt bound to the delivery digest. Reviewer evidence references distinguish that
 receipt from claims and from direct repository or isolated-surface experiments.
 
+The engine also supplies the evidence timeline to both planning roles. A task reviewer receives
+the `gate_fast` receipt before commit; the final `gate_full` receipt exists only after all task
+reviews and commits. A task contract that requires the latter is therefore circular and must be
+rejected as unverifiable during planning. Additional pre-review commands are project-owned fast
+gate composition, not executor claims or repository proof artifacts.
+
 An open carried item whose saved evidence quotes a criterion supports that criterion's non-met
 state without becoming a duplicate new finding. If a schema-valid reviewer response is
 semantically inconsistent with either ledger, the engine restores the same review baseline and

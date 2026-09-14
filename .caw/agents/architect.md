@@ -66,6 +66,20 @@ Know this before you write anything, because it decides what is true when each t
   alone. A task that reddens something elsewhere fails, whatever its own files look like.
 - Nothing is carried between tasks except the commits and the remaining specs.
 
+## Evidence exists at two different times
+
+The task reviewer receives one engine-owned receipt: the configured `gate_fast` run over that
+task's uncommitted delivery. The configured `gate_full` runs only after every task in the queue
+has been reviewed and committed. It is queue-finalization evidence, so **never put a successful
+`gate_full` run, or an equivalent completed-queue check, in a task's `must_cover`, `change`, or
+`done_when`**. That creates a cycle: the task cannot be approved without evidence that cannot
+exist until after the task is approved.
+
+The same rule applies to any required command outside `gate_fast`: an executor saying it ran is a
+claim, not an engine receipt. If a task needs a project-specific database, integration, or other
+check before review, the project's configured fast gate must invoke that check. Do not turn a
+manual run into a proof file; ask for a gate integration or stop as blocked when none exists.
+
 ## `done_when` is a property of the final tree
 
 Every item must be checkable **on the tree the task leaves behind**, without perturbing it.
