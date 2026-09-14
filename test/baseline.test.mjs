@@ -3905,8 +3905,9 @@ test('review confirms a red gate once without waking an executor', () => {
   assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
 })
 
-test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
+function assertGateArtifactReview(repairAndChallenge = false) {
   const f = fixture({ git: true, gateFast: 'node .caw/gate-evidence.mjs' })
+  if (repairAndChallenge) configureProfileFields(f, { review_challenger_passes: 1 })
   writeFileSync(join(f.root, '.caw', 'gate-evidence.mjs'), [
     "import { writeFileSync } from 'node:fs'",
     "import { join } from 'node:path'",
@@ -3950,17 +3951,45 @@ test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
   ].join('\n'))
   writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
 
-  const result = run(f, ['review', '001_acceptance.md'], [{
-    envelope: envelope(verdict({ criteria: [{
+  mkdirSync(join(f.root, '.caw-logs'), { recursive: true })
+  const privateLog = join(f.root, '.caw-logs', 'private-control.txt')
+  writeFileSync(privateLog, 'unrelated private log')
+  const reviewer = (reviewPass, semanticRepair = 0, valid = true) => ({
+    reviewPass, semanticRepair,
+    probeGateArtifacts: true, privateLogPaths: [privateLog],
+    envelope: envelope(verdict({ criteria: valid ? [{
       id: 'done-when-1',
       state: 'met',
-      evidence: 'the engine gate check observes the mounted consumer',
-      evidence_refs: ['gate-check:ui-check'],
-    }] })),
-  }])
+      evidence: 'the engine gate artifact records the mounted consumer',
+      evidence_refs: ['gate-artifact:ui-result'],
+    }] : [] })),
+  })
+  const result = run(f, ['review', '001_acceptance.md'], repairAndChallenge
+    ? [reviewer(1, 0, false), reviewer(1, 1), reviewer(2)] : [reviewer(1)])
+  if (repairAndChallenge) assert.match(result.stdout, /retrying pass 1 once/)
+
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
-  const certification = latestTaskAudit(f).review.certification
+  const audit = latestTaskAudit(f)
+  const certification = audit.review.certification
+  const observations = audit.delivery.reviewer_notes
+    .filter((note) => note.includes('fake-gate-artifacts:'))
+    .map((note) => JSON.parse(note.slice(note.indexOf('fake-gate-artifacts:') + 'fake-gate-artifacts:'.length)))
+  assert.equal(observations.length, repairAndChallenge ? 2 : 1)
+  const paths = new Set()
+  for (const observation of observations) {
+    assert.equal(observation.observations.length, 1)
+    const file = observation.observations[0]
+    paths.add(file.path)
+    assert.equal(file.id, 'ui-result')
+    assert.equal(file.content, 'green result\n')
+    assert.equal(file.sha256, certification.gate_receipt.artifacts[0].sha256)
+    for (const error of [file.chmodError, file.writeError, file.removeError, ...observation.privateReadErrors]) {
+      assert.ok(DENIED_BY_BOUNDARY.has(error), `boundary should refuse access, got ${error}`)
+    }
+    assert.equal(existsSync(file.path), false, 'the artifact copy is cleaned up with its review surface')
+  }
+  assert.equal(paths.size, observations.length, 'each pass has its own artifact copies')
   assert.equal(certification.version, 2)
   assert.deepEqual(certification.acceptance_cases.map((row) => row.id), ['ui-case'])
   assert.equal(certification.gate_receipt.owner, 'caw-engine')
@@ -3972,6 +4001,14 @@ test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   assert.equal(readFileSync(join(f.root, '.caw-logs', runName, artifact.private_file), 'utf8'),
     'green result\n')
+}
+
+test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
+  assertGateArtifactReview()
+})
+
+test('gate artifact copies survive semantic repair and remain readable in challenger passes', () => {
+  assertGateArtifactReview(true)
 })
 
 test('v3 acceptance matrix refuses a green gate without its required evidence', () => {
