@@ -6807,6 +6807,11 @@ function requirePersistedFullGateBaseline(f, risk) {
   return baseline
 }
 
+function requireTaskBranch(f) {
+  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
+  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
+}
+
 function build(noFull) {
   setProviderBudgetPhase('delivery')
   const { f, text } = profile()
@@ -6884,8 +6889,7 @@ function build(noFull) {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to build')
 
-  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
-  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits per task`)
+  requireTaskBranch(f)
   if (changedFiles().length) die('working tree is dirty — commit or stash first')
 
   const startHead = git('rev-parse', 'HEAD').trim()
@@ -7874,6 +7878,21 @@ function sayWaysOn(file) {
   say(`  Either commits the task on approval. Run build again for the rest of the queue.`)
 }
 
+function taskGatePolicy(file, f, g, executorRetries, confirmationRuns, projectGateRetries) {
+  return runProjectPolicy('gate', {
+    task: file,
+    command: f.gate_fast,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+    executor_retries: executorRetries,
+    confirmation_runs: confirmationRuns,
+    project_retry_runs: projectGateRetries,
+  })
+}
+
 // `opts.resume` carries what a previous invocation left — the history, the round count, and the
 // last executor's delivery, so that a commit reached from `review` still has a summary to write.
 // `opts.startAt` is 'gate' only for `review`, where the hands that did the work have already put
@@ -8034,18 +8053,7 @@ function runTask(file, f, profileText, opts = {}) {
           'describes the current delivery.',
         taskAccounting(), runtimeHistory, weakVerification)
     }
-    const gatePolicy = runProjectPolicy('gate', {
-      task: file,
-      command: f.gate_fast,
-      state: g.state,
-      status: g.status ?? (g.ok ? 0 : null),
-      output: g.out.slice(-8000),
-      duration_ms: g.durationMs,
-      timeout_ms: g.timeoutMs,
-      executor_retries: retry,
-      confirmation_runs: confirmationRuns,
-      project_retry_runs: projectGateRetries,
-    })
+    const gatePolicy = taskGatePolicy(file, f, g, retry, confirmationRuns, projectGateRetries)
     if (gatePolicy?.output.action === 'stop') {
       if (g.out) say(g.out)
       stop(file, spec, ex, history, round, how, noted,
@@ -8470,31 +8478,11 @@ function stop(file, spec, ex, history, round, how, noted, why,
 // stdout would be written into a file nobody is watching, and the run would hang at a question
 // the human cannot see. A stop that ends the process and a command that resumes it survive the
 // terminal being closed, which a keystroke does not.
-function resumeTask(cmd, arg) {
-  const { f, text } = profile()
+function prepareTaskReviewRisk(f) {
   const planText = existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : null
   activePopulationCertification = planText
     ? readPlanPopulationRecord(planText)
     : { state: 'unknown', source: 'no-plan-artifact', digest: null }
-  if (!arg) die(`${cmd} needs a spec filename, e.g.: caw.mjs ${cmd} 001_registry-and-scan.md`)
-  const name = arg.replace(/^(\.\/)?tasks\//, '')
-  if (!specFiles().includes(name)) {
-    die(`${name} is not in the queue (ls .caw-tasks/ is the queue). A task whose spec is gone was\n` +
-        `  committed — there is nothing left to review.`)
-  }
-
-  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
-  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
-
-  // The work being judged is the dirty tree. A clean one means there is nothing for a reviewer
-  // to read, and the two ways that happens want opposite advice, so both are named.
-  if (!changedFiles().length) {
-    die(`the working tree is clean, so there is no delivery to judge.\n` +
-        `  If the work is not done yet, do it and run this again; the spec is still on disk.\n` +
-        `  If you already committed it by hand, this cannot review a commit — take the spec out\n` +
-        `  of the queue with:  node caw.mjs done ${name}`)
-  }
-
   let risk = null
   try { risk = readRiskRecord() }
   catch (error) { die(error?.message || String(error)) }
@@ -8513,6 +8501,42 @@ function resumeTask(cmd, arg) {
     if (fullGateBaseline) run.fullGateBaseline = fullGateBaseline
     writeRunManifest('active')
   }
+
+  return { risk, fullGateBaseline }
+}
+
+function finishReviewedTask(f, risk, fullGateBaseline) {
+  if (fullGateBaseline) runFinalFullGate(f, fullGateBaseline.head, fullGateBaseline)
+  if (risk && !specFiles().length) {
+    if (existsSync(PLAN)) {
+      unlinkSync(PLAN)
+      say(`  cleared ${PLAN} — the queue it planned is empty`)
+    }
+    clearRiskRecord()
+  }
+}
+
+function resumeTask(cmd, arg) {
+  const { f, text } = profile()
+  if (!arg) die(`${cmd} needs a spec filename, e.g.: caw.mjs ${cmd} 001_registry-and-scan.md`)
+  const name = arg.replace(/^(\.\/)?tasks\//, '')
+  if (!specFiles().includes(name)) {
+    die(`${name} is not in the queue (ls .caw-tasks/ is the queue). A task whose spec is gone was\n` +
+        `  committed — there is nothing left to review.`)
+  }
+
+  requireTaskBranch(f)
+
+  // The work being judged is the dirty tree. A clean one means there is nothing for a reviewer
+  // to read, and the two ways that happens want opposite advice, so both are named.
+  if (!changedFiles().length) {
+    die(`the working tree is clean, so there is no delivery to judge.\n` +
+        `  If the work is not done yet, do it and run this again; the spec is still on disk.\n` +
+        `  If you already committed it by hand, this cannot review a commit — take the spec out\n` +
+        `  of the queue with:  node caw.mjs done ${name}`)
+  }
+
+  const { risk, fullGateBaseline } = prepareTaskReviewRisk(f)
 
   const resume = readRoundState(name)
   if (!resume) {
@@ -8536,14 +8560,7 @@ function resumeTask(cmd, arg) {
     rounds: 1,
     how: cmd === 'review' ? 'hand' : 'resumed',
   })
-  if (fullGateBaseline) runFinalFullGate(f, fullGateBaseline.head, fullGateBaseline)
-  if (risk && !specFiles().length) {
-    if (existsSync(PLAN)) {
-      unlinkSync(PLAN)
-      say(`  cleared ${PLAN} — the queue it planned is empty`)
-    }
-    clearRiskRecord()
-  }
+  finishReviewedTask(f, risk, fullGateBaseline)
   say(`\n  spent ${formatAccounting(accounting)}`)
 }
 
@@ -8562,6 +8579,7 @@ function resumeTask(cmd, arg) {
 // — so the tasks most likely to need a review were exactly the ones guaranteed not to get one.
 function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [],
   reviewedDigest = null, certification = null) {
+  requireTaskBranch(f)
   // .caw-tasks/ must never enter a commit, and it takes both lines because each has a hole.
   // `git add -A` already skips ignored files, so the .gitignore line the README asks for
   // does the job; the reset covers a project that has not added it. An explicit
@@ -9192,9 +9210,11 @@ function acceptHumanReview(attestationPath, signaturePath) {
   }
   if (f.task_independence !== 'human-review') die('task_independence is not human-review')
   const file = a.target
+  requireTaskBranch(f)
   if (!specFiles().includes(file) || !changedFiles().length) die('human-reviewed task is not pending')
   const digest = deliveryDigest()
   if (digest !== a.artifact_digest) die('task delivery changed after the human attestation was prepared')
+  const { risk, fullGateBaseline } = prepareTaskReviewRisk(f)
   const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
   const { topology, projectCriteria, acceptanceCases, contractDigest } = humanTaskContract(file, spec)
   if (contractDigest !== a.contract_digest) {
@@ -9204,11 +9224,34 @@ function acceptHumanReview(attestationPath, signaturePath) {
   const gateContext = {
     task: file, kind: 'fast', deliveryDigest: digest, criteria: coreCriteria, acceptanceCases,
   }
-  const firstGate = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, gateContext)
-  if (!firstGate.ok) {
-    const secondGate = firstGate.state === 'red'
-      ? gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, gateContext) : firstGate
-    die(`${file} — human-reviewed delivery has no current green gate (${secondGate.state})`)
+  let taskGate
+  let confirmationRuns = 0
+  let projectGateRetries = 0
+  let gateRedAttempts = 0
+  for (;;) {
+    taskGate = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, gateContext)
+    if (deliveryDigest() !== digest) {
+      die(`${file} — the fast gate changed the signed delivery tree; refusing acceptance`)
+    }
+    const policy = taskGatePolicy(file, f, taskGate, 0, confirmationRuns, projectGateRetries)
+    if (policy?.output.action === 'stop') {
+      die(`${file} — project gate policy ${policy.policy.id} stopped the run: ${policy.output.reason.trim()}`)
+    }
+    if (taskGate.ok) break
+    if (taskGate.state === 'red') {
+      gateRedAttempts++
+      if (decideGateFailure({ reviewOnly: true, confirmationRuns, executorRetries: 0, maxExecutorRetries: 0 }) ===
+          GateFailureAction.confirm) {
+        confirmationRuns++
+        continue
+      }
+      if (policy?.output.action === 'retry' && projectGateRetries < PROJECT_GATE_RETRIES_MAX) {
+        projectGateRetries++
+        confirmationRuns++
+        continue
+      }
+    }
+    die(`${file} — human-reviewed delivery has no current green gate (${taskGate.state})`)
   }
   const verdict = { criteria: a.criteria, carried: a.carried, broken: [], uncovered: [], weak: [], noted: [] }
   for (const [index, row] of (a.criteria || []).entries()) {
@@ -9226,7 +9269,7 @@ function acceptHumanReview(attestationPath, signaturePath) {
   const criteriaIssue = reviewCriteriaIssue(spec, a.criteria, verdict, projectCriteria)
   const contractIssue = criteriaIssue ? null : reviewContractIssue(verdict, {
     criteria: [...coreCriteria, ...projectCriteria], surfaces: topology.surfaces,
-    transitions: topology.transitions, receipt: firstGate.receipt,
+    transitions: topology.transitions, receipt: taskGate.receipt,
   })
   if (criteriaIssue || contractIssue || a.criteria.some((row) => row.state !== 'met')) {
     die(`human task review does not approve every criterion${
@@ -9247,11 +9290,12 @@ function acceptHumanReview(attestationPath, signaturePath) {
       .find((entry) => entry.role === 'executor') || null,
     reviewer: human, reviewSurface: null, reviewBaseline: null,
     weakVerification: resume?.weak_verification || null,
-    gateReceipt: firstGate.receipt,
+    gateReceipt: taskGate.receipt,
     acceptanceCases,
     executorClaims: resume?.ex?.claims || [],
   })
-  commit(file, spec, resume?.ex || null, f, round, 0, 'human', [], digest, certification)
+  commit(file, spec, resume?.ex || null, f, round, gateRedAttempts, 'human', [], digest, certification)
+  finishReviewedTask(f, risk, fullGateBaseline)
 }
 
 function humanReview(args) {

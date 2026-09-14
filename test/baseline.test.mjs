@@ -2631,6 +2631,88 @@ for (const change of ['requirement', 'read-section', 'project-criterion']) {
   })
 }
 
+test('signed task acceptance enforces main branch protection and stopping gate policies', () => {
+  for (const reason of ['main', 'policy']) {
+    const f = signedHumanTask({}, (f) => {
+      if (reason === 'policy') configureProjectPolicies(f,
+        `process.stdout.write(JSON.stringify({ action: 'stop', reason: 'review is not releasable' }))`,
+        ['gate'])
+    })
+    if (reason === 'main') execFileSync('git', ['branch', '-m', 'main'], { cwd: f.root })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, reason === 'main' ? /on main — branch first/ : /project gate policy .* stopped/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  }
+})
+
+for (const finalState of ['missing-baseline', 'green', 'red']) {
+  test(`signed task acceptance preserves required full gates: ${finalState}`, () => {
+    const f = signedHumanTask({ gateFull: 'exit 0' }, (f) => {
+      const statusPath = join(f.parent, 'full-status.txt')
+      const logPath = join(f.parent, 'full-log.txt')
+      writeFileSync(statusPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); fs.appendFileSync(${JSON.stringify(logPath)}, "full\\n"); process.exit(Number(fs.readFileSync(${JSON.stringify(statusPath)}, "utf8")))'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_full: exit 0', `gate_full: ${cmd}`))
+      execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+      execFileSync('git', ['commit', '-q', '-m', 'configure full gate'], { cwd: f.root })
+      configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+      const description = 'Create the fixture output'
+      const planned = run(f, ['plan', description], [
+        { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+        { envelope: envelope(plan()) }, { envelope: envelope(planReview()) },
+      ])
+      assert.equal(planned.status, 0, planned.stderr || planned.stdout)
+      if (finalState === 'missing-baseline') return
+      const stopped = run(f, ['build'], [{
+        writeFiles: { 'delivery.txt': 'implemented\n' }, envelope: envelope(delivery('Write output')),
+      }])
+      assert.equal(stopped.status, 1)
+      assert.match(stopped.stderr, /automated task review is disabled/)
+      assert.equal(JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+        .full_gate_baseline.state, 'green')
+    })
+    if (finalState === 'red') writeFileSync(join(f.parent, 'full-status.txt'), '1')
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    if (finalState === 'missing-baseline') {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /has no green full-gate baseline/)
+      assert.equal(existsSync(f.specPath), true)
+      assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+      assert.equal(existsSync(join(f.parent, 'full-log.txt')), false)
+    } else {
+      assert.equal(result.status, finalState === 'green' ? 0 : 1, result.stderr || result.stdout)
+      if (finalState === 'red') assert.match(result.stderr, /full gate is RED after a green required baseline/)
+      assert.equal(readFileSync(join(f.parent, 'full-log.txt'), 'utf8'), 'full\nfull\n')
+      assert.equal(existsSync(f.specPath), false)
+      assert.equal(latestTaskAudit(f).review.certification.population.state, 'complete')
+    }
+  })
+}
+
+for (const flaky of [false, true]) {
+  test(`signed task gates use bounded provider-free ${flaky ? 'policy retries' : 'confirmation'}`, () => {
+    const f = signedHumanTask({}, (f) => {
+      const countPath = join(f.parent, 'fast-count.txt')
+      writeFileSync(countPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); const n = Number(fs.readFileSync(${JSON.stringify(countPath)}, "utf8")) + 1; fs.writeFileSync(${JSON.stringify(countPath)}, String(n)); process.exit(${flaky ? '1' : 'n === 1 ? 1 : 0'})'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace(/^gate_fast:.*$/m, `gate_fast: ${cmd}`))
+      if (flaky) configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+    })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, flaky ? 1 : 0, result.stderr || result.stdout)
+    assert.equal(readFileSync(join(f.parent, 'fast-count.txt'), 'utf8'), flaky ? '4' : '2')
+    assert.equal(calls(f).length, 0)
+    if (!flaky) assert.equal(latestTaskAudit(f).gate.earlier_red_attempts, 1)
+    else assert.equal(existsSync(f.specPath), true)
+  })
+}
+
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [
     ['unknown document field', (v) => { v.fallback = 'claude' }, /unknown field.*fallback/],
