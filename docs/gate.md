@@ -15,6 +15,13 @@ defensible limit. They are positive whole milliseconds; an empty value leaves th
 an engine timeout. A timeout is recorded separately from red and exit-75 refusal: CAW kills the
 gate, keeps task recovery state, and does not wake an executor or recommend a bisect.
 
+A project policy API v2 risk class may require a full-gate baseline. In that mode `gate_full`
+runs once on the starting commit before any executor and once after the queue. `--no-full` and an
+empty `gate_full` are refused. Red, refusal, timeout, or a project gate-policy stop at the baseline
+ends the run before delivery changes; a green baseline is retained in the run record and private
+queue state. A stopped task may resume with `round` or `review` only from that ancestry and with
+the same full-gate command; the resumed task is followed by the final full gate.
+
 1. **Exit 0 green, 75 refused-to-start, any other non-zero red.** 75 (`EX_TEMPFAIL`) means
    the gate never looked: a machine too loaded for the suite it shards, a simulator that is
    not there, a service that is down. `caw.mjs` then says the run was *not tested* rather

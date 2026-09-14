@@ -39,6 +39,13 @@ The division is the whole design. `caw.mjs` owns:
 A model owns none of those. It returns JSON and, if it is the executor, it edits files. That is
 the entire surface.
 
+Project-specific additions use the versioned [project policy API](project-policies.md). API v2
+planning policies classify request risk before enumeration and attest the resolved population
+afterwards. A `complete` population is a project-owned claim bound to the exact population digest,
+never an inference from one model draw. A risk class may also require a green `gate_full` on the
+starting commit before any executor runs; the final full gate can then attribute a regression to
+the build range.
+
 ## The five roles
 
 | role | reads | writes | what it produces |

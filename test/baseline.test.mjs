@@ -300,12 +300,13 @@ Deterministic baseline fixture.
   return { parent, root, queue, calls }
 }
 
-function configureProjectPolicies(f, source, stages = ['planning', 'review', 'gate', 'commit']) {
+function configureProjectPolicies(f, source, stages = ['planning', 'review', 'gate', 'commit'],
+  apiVersion = 1) {
   const root = join(f.root, '.caw', 'project')
   mkdirSync(root, { recursive: true })
   writeFileSync(join(root, 'policy.mjs'), source)
   writeFileSync(join(root, 'manifest.json'), `${JSON.stringify({
-    api_version: 1,
+    api_version: apiVersion,
     policies: Object.fromEntries(stages.map((stage) => [stage, {
       id: `${stage}-policy`, command: ['node', '.caw/project/policy.mjs'], timeout_ms: 2000,
     }])),
@@ -333,6 +334,42 @@ const outputs = {
   commit: { subject: 'project: delivered safely' },
 }
 process.stdout.write(JSON.stringify(outputs[request.stage]))
+`
+
+const riskPolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+let output
+if (request.stage === 'planning' && request.context.phase === 'request') {
+  output = {
+    issues: [],
+    instructions: ['treat the request as regulated'],
+    risk: {
+      class: 'regulated',
+      population_requirement: 'complete',
+      require_full_gate_baseline: true,
+    },
+  }
+} else if (request.stage === 'planning') {
+  output = {
+    issues: [],
+    instructions: ['preserve every attested case'],
+    attestation: {
+      state: process.env.CAW_TEST_POPULATION_STATE || 'complete',
+      population_digest: process.env.CAW_TEST_WRONG_DIGEST || request.context.population.digest,
+      evidence: 'project index closes the regulated case set',
+    },
+  }
+} else if (request.stage === 'review') {
+  output = { criteria: [], instructions: [] }
+} else if (request.stage === 'gate') {
+  output = { action: 'continue', reason: '' }
+} else {
+  output = { subject: '' }
+}
+process.stdout.write(JSON.stringify(output))
 `
 
 function run(f, args, responses, extraEnv = {}) {
@@ -1267,6 +1304,212 @@ test('project planning policy can stop or add instructions before provider calls
   assert.match(manifest.project_policies.manifest_digest, /^[0-9a-f]{64}$/)
   assert.deepEqual(manifest.policy_calls.map(({ stage, status }) => [stage, status]),
     [['planning', 'success']])
+})
+
+test('v2 risk policy attests a complete population and requires full-gate baselines',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.match(planText, /^risk_class: regulated$/m)
+  assert.match(planText, /^risk_population_attestation: complete$/m)
+  assert.match(planText, /^risk_require_full_gate_baseline: true$/m)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), true)
+  let manifestNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  let manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', manifestNames.at(-1), 'manifest.json'), 'utf8'))
+  assert.equal(manifest.risk.class, 'regulated')
+  assert.deepEqual(manifest.policy_calls.filter(({ stage }) => stage === 'planning')
+    .map(({ phase }) => phase), ['request', 'population'])
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['build', '--no-full'], [], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /requires gate_full before and after the build/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(fullLog), false)
+
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'output.txt'), 'hand delivery\n')
+  result = run(f, ['review', '001_baseline-task.md'], [], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /has no green full-gate baseline; start with build/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(fullLog), false)
+  rmSync(join(f.root, 'src', 'output.txt'))
+
+  result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+      { id: 'change-1', state: 'met', evidence: 'traced Write the fixture output.' },
+      { id: 'done-when-1', state: 'met', evidence: 'ran The fixture output exists.' },
+    ] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /required full-gate baseline \(regulated\)/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
+  manifestNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', manifestNames.at(-1), 'manifest.json'), 'utf8'))
+  assert.equal(manifest.full_gate_baseline.state, 'green')
+  assert.equal(manifest.full_gate_baseline.head.length, 40)
+})
+
+test('a stopped high-risk build keeps its baseline through round recovery',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+  const criteria = [
+    { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+    { id: 'change-1', state: 'met', evidence: 'traced Write the fixture output.' },
+    { id: 'done-when-1', state: 'met', evidence: 'ran The fixture output exists.' },
+  ]
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'round one\n' }, envelope: envelope(delivery('first pass')) },
+    { envelope: envelope(verdict({ criteria, broken: [{
+      where: 'src/output.txt:1', fix: 'write the final value', evidence: 'read round one',
+    }] })) },
+    { writeFiles: { 'src/output.txt': 'round two\n' }, envelope: envelope(delivery('second pass')) },
+    { envelope: envelope(verdict({ criteria, carried: [{
+      id: 'r1.1', state: 'open', evidence: 'the final value is still absent',
+    }] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /round 2 closed none/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+  const riskPath = join(f.root, '.caw-tasks', '.risk.json')
+  const risk = JSON.parse(readFileSync(riskPath, 'utf8'))
+  assert.equal(risk.full_gate_baseline.state, 'green')
+
+  result = run(f, ['round', '001_baseline-task.md'], [
+    { writeFiles: { 'src/output.txt': 'final\n' }, envelope: envelope(delivery('final pass')) },
+    { envelope: envelope(verdict({ criteria, carried: [{
+      id: 'r1.1', state: 'closed', evidence: 'read final',
+    }] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /full gate:/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  assert.equal(existsSync(riskPath), false)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), false)
+})
+
+test('a required baseline that mutates protected project state stops before executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync('README.md','changed\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning'], 2)
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  writeFileSync(f.calls, '')
+
+  result = run(f, ['build'], [])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr,
+    /required full-gate baseline changed HEAD, delivery, CAW, policies, or the task queue/)
+  assert.equal(calls(f).length, 0)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline, null)
+})
+
+test('v2 risk policy cannot satisfy complete population with a sample attestation', () => {
+  const f = fixture({ git: true })
+  const samplePolicy = riskPolicySource.replace(
+    "process.env.CAW_TEST_POPULATION_STATE || 'complete'", "'sample'")
+  configureProjectPolicies(f, samplePolicy, ['planning'], 2)
+  const description = 'Create the fixture output'
+
+  const result = run(f, ['plan', description], [{
+    envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])),
+  }])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /risk class regulated requires population complete.*attested sample/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
+})
+
+test('review-specs refreshes PLAN risk metadata when the project policy changes',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, riskPolicySource, ['planning'], 2)
+  const description = 'Create the fixture output'
+  const populationResponse = () => ({ envelope: envelope(population([{
+    case: 'fixture output', source: requestSource(description),
+  }])) })
+
+  let result = run(f, ['plan', description], [
+    populationResponse(),
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const policyPath = join(f.root, '.caw', 'project', 'policy.mjs')
+  writeFileSync(policyPath, readFileSync(policyPath, 'utf8')
+    .replace("class: 'regulated'", "class: 'sensitive'"))
+  result = run(f, ['review-specs', description], [
+    populationResponse(),
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.match(planText, /^risk_class: sensitive$/m)
+  assert.match(planText, new RegExp(`^risk_policy_digest: ${risk.policy_digest}$`, 'm'))
+  assert.equal((planText.match(/^## Project risk attestation$/gm) || []).length, 1)
+  assert.match(planText, /"class": "sensitive"/)
+
+  configureProjectPolicies(f, projectPolicySource, ['planning'], 1)
+  result = run(f, ['review-specs', description], [
+    populationResponse(),
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const downgradedPlan = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.doesNotMatch(downgradedPlan, /^risk_/m)
+  assert.doesNotMatch(downgradedPlan, /^## Project risk attestation$/m)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
 })
 
 test('non-executable JavaScript provider fixture runs through Node for version and roles', () => {

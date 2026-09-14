@@ -12,13 +12,13 @@ import { readProjectPolicies } from '../caw.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
-function fixture(script, stages = ['planning', 'review', 'gate', 'commit']) {
+function fixture(script, stages = ['planning', 'review', 'gate', 'commit'], apiVersion = 1) {
   const root = mkdtempSync(join(tmpdir(), 'caw-project-policy-'))
   mkdirSync(join(root, '.caw', 'project'), { recursive: true })
   cpSync(join(ROOT, 'caw.mjs'), join(root, 'caw.mjs'))
   writeFileSync(join(root, '.caw', 'project', 'policy.mjs'), script)
   writeFileSync(join(root, '.caw', 'project', 'manifest.json'), `${JSON.stringify({
-    api_version: 1,
+    api_version: apiVersion,
     policies: Object.fromEntries(stages.map((stage) => [stage, {
       id: `${stage}-policy`, command: ['node', '.caw/project/policy.mjs'], timeout_ms: 1000,
     }])),
@@ -53,6 +53,31 @@ const outputs = {
 process.stdout.write(JSON.stringify(outputs[request.stage]))
 `
 
+const validV2Policy = `
+const request = JSON.parse(await new Promise((resolve) => {
+  let text = ''; process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { text += chunk });
+  process.stdin.on('end', () => resolve(text));
+}))
+if (request.context.phase === 'request') {
+  process.stdout.write(JSON.stringify({
+    issues: [], instructions: [],
+    risk: {
+      class: 'regulated', population_requirement: 'complete',
+      require_full_gate_baseline: true,
+    },
+  }))
+} else {
+  process.stdout.write(JSON.stringify({
+    issues: [], instructions: [],
+    attestation: {
+      state: 'complete', population_digest: request.context.population.digest,
+      evidence: 'the project policy verified its closed index',
+    },
+  }))
+}
+`
+
 test('verify-project runs every configured policy through the strict protocol', (t) => {
   const root = fixture(validPolicy)
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -63,6 +88,33 @@ test('verify-project runs every configured policy through the strict protocol', 
   for (const stage of ['planning', 'review', 'gate', 'commit']) {
     assert.match(result.stdout, new RegExp(`${stage}: ${stage}-policy [0-9a-f]{12} — valid`))
   }
+})
+
+test('v2 planning policy verifies request classification and population attestation', (t) => {
+  const root = fixture(validV2Policy, ['planning'], 2)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+
+  const result = run(root)
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout,
+    /planning: planning-policy [0-9a-f]{12} — valid \(request, population\)/)
+})
+
+test('v2 planning policy rejects unsupported risk and attestation fields', (t) => {
+  const badRisk = fixture(validV2Policy.replace("class: 'regulated'", "class: 'Not Valid'"),
+    ['planning'], 2)
+  t.after(() => rmSync(badRisk, { recursive: true, force: true }))
+  const riskResult = run(badRisk)
+  assert.equal(riskResult.status, 1)
+  assert.match(riskResult.stderr, /invalid risk class/)
+
+  const badAttestation = fixture(validV2Policy.replace(
+    "evidence: 'the project policy verified its closed index'", "evidence: ''"), ['planning'], 2)
+  t.after(() => rmSync(badAttestation, { recursive: true, force: true }))
+  const attestationResult = run(badAttestation)
+  assert.equal(attestationResult.status, 1)
+  assert.match(attestationResult.stderr, /must evidence a complete population attestation/)
 })
 
 test('policy digests change when any file in the project policy tree changes', (t) => {
