@@ -2456,6 +2456,24 @@ test('legacy numeric round spend migrates to known USD without losing recovery',
   assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), false)
 })
 
+test('review retries a red gate without waking an executor', () => {
+  const gateFast = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'red\\n');process.exit(1)"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_baseline-task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /gate still red after 2 retries/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 3)
+  assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
+})
+
 test('weak canonical values without a mutation object fail before history ingestion',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })

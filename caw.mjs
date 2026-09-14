@@ -1376,7 +1376,7 @@ function pruneRunRecords(now = Date.now()) {
   const maxAge = 30 * 24 * 60 * 60 * 1000
   records.forEach((entry, index) => {
     if (index >= 20 || now - entry.stat.mtimeMs > maxAge) {
-      rmSync(entry.path, { recursive: true, force: true })
+      removeTree(entry.path)
     }
   })
 }
@@ -1772,10 +1772,34 @@ function ignoredReadDenials(deliveryRoot, dependencies) {
   return [...new Set(out)]
 }
 
+// Some dependency managers make cached directories read-only. Removing one of CAW's own
+// temporary trees then fails because unlinking a child requires write permission on its parent.
+// Restore owner access on directories only, never follow symlinks, and retry the removal.
+function removeTree(path) {
+  try {
+    rmSync(path, { recursive: true, force: true })
+    return
+  } catch (error) {
+    if (!['EACCES', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) throw error
+  }
+  const pending = [path]
+  while (pending.length) {
+    const current = pending.pop()
+    let stat
+    try { stat = lstatSync(current) } catch { continue }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) continue
+    try { chmodSync(current, (stat.mode & 0o7777) | 0o700) } catch { /* no POSIX modes */ }
+    let names = []
+    try { names = readdirSync(current) } catch { continue }
+    for (const name of names) pending.push(join(current, name))
+  }
+  rmSync(path, { recursive: true, force: true })
+}
+
 function removeReviewSurface(surface) {
   if (!surface) return
   ACTIVE_REVIEW_SURFACES.delete(surface.parent)
-  try { rmSync(surface.parent, { recursive: true, force: true }) } catch { /* retained by the OS */ }
+  try { removeTree(surface.parent) } catch { /* retained by the OS */ }
 }
 
 function pruneInvocationScratch() {
@@ -1790,14 +1814,14 @@ function pruneInvocationScratch() {
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue
       manifest = JSON.parse(readFileSync(join(parent, 'manifest.json'), 'utf8'))
     } catch {
-      rmSync(parent, { recursive: true, force: true })
+      removeTree(parent)
       continue
     }
     let alive = false
     if (Number.isInteger(manifest?.pid)) {
       try { process.kill(manifest.pid, 0); alive = true } catch { /* dead creator */ }
     }
-    if (!alive) rmSync(parent, { recursive: true, force: true })
+    if (!alive) removeTree(parent)
   }
 }
 
@@ -1824,7 +1848,7 @@ function removeInvocationScratch(scratch) {
   const canonicalParent = realpathSync(INVOCATION_SCRATCH_PARENT)
   const canonical = realpathSync(scratch.parent)
   if (!inside(canonicalParent, canonical)) throw new Error('invocation scratch leaves its dedicated parent')
-  rmSync(canonical, { recursive: true, force: true })
+  removeTree(canonical)
 }
 
 function apparentSurfaceBytes(root) {
@@ -1853,7 +1877,7 @@ function removeAdapterTransport(path) {
   const parent = realpathSync(ADAPTER_TRANSPORT_PARENT)
   const canonical = realpathSync(path)
   if (!inside(parent, canonical)) throw new Error('adapter transport leaves its retention parent')
-  rmSync(canonical, { recursive: true, force: true })
+  removeTree(canonical)
 }
 
 function scrubTransportSensitivePath(root, entry) {
@@ -2000,7 +2024,7 @@ function pruneReviewSurfaces(now = Date.now()) {
     if (!reason) return
     const canonical = realpathSync(entry.parent)
     if (!inside(realpathSync(REVIEW_SURFACE_PARENT), canonical)) return
-    rmSync(canonical, { recursive: true, force: true })
+    removeTree(canonical)
     say(`  pruned review surface ${entry.name}: ${reason}`)
   })
 }
@@ -2067,7 +2091,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 process.once('exit', (code) => {
   for (const parent of ACTIVE_INVOCATION_SCRATCH) {
-    try { rmSync(parent, { recursive: true, force: true }) } catch { /* next command prunes it */ }
+    try { removeTree(parent) } catch { /* next command prunes it */ }
   }
   for (const surface of ACTIVE_REVIEW_SURFACES.values()) {
     retainReviewSurface(surface, 'interrupted', 'process exited before cleanup')
@@ -2240,7 +2264,7 @@ function consumeInvocationTransport(invocation, resultTransport) {
     }
     return readFileSync(finalPath, 'utf8')
   } finally {
-    if (root) rmSync(root, { recursive: true, force: true })
+    if (root) removeTree(root)
   }
 }
 
@@ -2251,7 +2275,7 @@ function discardInvocationTransport(invocation) {
     const root = realpathSync(candidate)
     const transportParent = realpathSync(ADAPTER_TRANSPORT_PARENT)
     if (inside(transportParent, root) && root.split(/[\\/]/).pop().startsWith('transport-')) {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   } catch { /* an invalid transport is refused by the caller; never broaden cleanup */ }
 }
@@ -4269,6 +4293,9 @@ function runTask(file, f, profileText, opts = {}) {
       }
       say(`  gate red (retry ${retry}/${MAX_GATE_RETRIES})`)
       gateFact = `The gate \`${f.gate_fast}\` failed. Its output, last 8000 chars:\n\n${g.out}`
+      // `review` judges work already present in the tree. A red gate may be retried, but it must
+      // never hand that work to an executor that the operator did not ask to run.
+      if (how === 'hand') skipExecutor = true
       continue
     }
 
@@ -5102,7 +5129,7 @@ function probeProvider(providerId) {
       ...(reason ? { reason } : {}),
     }
     const path = writeProbeAttestation(providerId, attestation)
-    rmSync(parent, { recursive: true, force: true })
+    removeTree(parent)
     const summary = probeReasonSummary(reason)
     say(`${entry.probe.id}: ${green ? 'green' : 'unavailable'}${summary ? ` — ${summary}` : ''} — ${path}`)
   }
@@ -5142,7 +5169,7 @@ function artifacts(args) {
     if (!path || !existsSync(path) || !inside(realpathSync(root), realpathSync(path))) {
       die(`no retained probe evidence matches ${provider}`)
     }
-    rmSync(path, { recursive: true, force: true })
+    removeTree(path)
     say(`purged probes/${provider}`)
     return
   }
@@ -5168,7 +5195,7 @@ function artifacts(args) {
   }
   const runPath = join(LOG_DIR, target)
   if (target.startsWith('run-') && existsSync(runPath) && inside(resolve(LOG_DIR), resolve(runPath))) {
-    rmSync(runPath, { recursive: true, force: true })
+    removeTree(runPath)
     say(`purged ${target}`)
     return
   }
@@ -5176,7 +5203,7 @@ function artifacts(args) {
   if (target.startsWith('surface-') && existsSync(surfacePath)) {
     const parent = realpathSync(REVIEW_SURFACE_PARENT)
     if (!inside(parent, realpathSync(surfacePath))) die(`refusing surface outside retention parent: ${target}`)
-    rmSync(surfacePath, { recursive: true, force: true })
+    removeTree(surfacePath)
     say(`purged ${target}`)
     return
   }
@@ -5312,5 +5339,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 export {
   SCHEMA, addAccounting, deltaAccounting, formatAccounting, normalizeAccounting,
   populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
-  retainWeakVerificationEvents, zeroAccounting,
+  removeTree, retainWeakVerificationEvents, zeroAccounting,
 }

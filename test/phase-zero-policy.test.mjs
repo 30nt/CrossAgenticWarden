@@ -25,6 +25,7 @@ import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { symlinkSkip } from './host-capabilities.mjs'
+import { removeTree } from '../caw.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -165,6 +166,25 @@ test('surface deletion never follows an allowlisted dependency symlink',
   removeManifestSurface({ root: surface, parent })
   assert.equal(existsSync(surface), false)
   assert.equal(readFileSync(join(dependency, 'keep.txt'), 'utf8'), 'keep\n')
+})
+
+test('CAW-owned trees with read-only directories are removed without following symlinks',
+  { skip: symlinkSkip() }, () => {
+  const root = temporary('caw-read-only-tree-')
+  const outside = temporary('caw-read-only-outside-')
+  const nested = join(root, 'module-cache', 'dependency')
+  mkdirSync(nested, { recursive: true })
+  writeFileSync(join(nested, 'cached.txt'), 'cached\n')
+  writeFileSync(join(outside, 'keep.txt'), 'keep\n')
+  symlinkSync(outside, join(root, 'outside'), 'dir')
+  chmodSync(nested, 0o555)
+  chmodSync(dirname(nested), 0o555)
+  chmodSync(root, 0o555)
+
+  removeTree(root)
+
+  assert.equal(existsSync(root), false)
+  assert.equal(readFileSync(join(outside, 'keep.txt'), 'utf8'), 'keep\n')
 })
 
 test('a manifest cannot delete a surface outside its dedicated parent', () => {
