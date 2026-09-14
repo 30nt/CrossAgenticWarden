@@ -117,6 +117,24 @@ test('v2 planning policy rejects unsupported risk and attestation fields', (t) =
   assert.match(attestationResult.stderr, /must evidence a complete population attestation/)
 })
 
+test('v2 gate retries are restricted to evidenced flaky red results', (t) => {
+  const retryGreen = fixture(`process.stdout.write(JSON.stringify({
+    action: 'retry', classification: 'flaky', reason: 'allowlisted fixture'
+  }))`, ['gate'], 2)
+  t.after(() => rmSync(retryGreen, { recursive: true, force: true }))
+  const greenResult = run(retryGreen)
+  assert.equal(greenResult.status, 1)
+  assert.match(greenResult.stderr, /may retry only a red fast task gate/)
+
+  const legacyRetry = fixture(`process.stdout.write(JSON.stringify({
+    action: 'retry', reason: 'legacy cannot retry'
+  }))`, ['gate'], 1)
+  t.after(() => rmSync(legacyRetry, { recursive: true, force: true }))
+  const legacyResult = run(legacyRetry)
+  assert.equal(legacyResult.status, 1)
+  assert.match(legacyResult.stderr, /expected one of.*continue.*stop/)
+})
+
 test('policy digests change when any file in the project policy tree changes', (t) => {
   const root = fixture(validPolicy, ['planning'])
   t.after(() => rmSync(root, { recursive: true, force: true }))

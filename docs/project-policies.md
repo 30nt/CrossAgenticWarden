@@ -23,9 +23,9 @@ Create `.caw/project/manifest.json`:
 ```
 
 The admitted stages are `planning`, `review`, `gate`, and `commit`. API version 1 remains the
-single-pass contract below. API version 2 adds risk-aware two-phase planning; the other three
-stages keep their version-1 output shapes. Unknown fields, unknown stages, symlinks, oversized
-policy trees, invalid commands, and timeouts are refused.
+single-pass contract below. API version 2 adds risk-aware two-phase planning and a bounded flaky
+retry decision to the gate contract; review and commit keep their version-1 output shapes. Unknown
+fields, unknown stages, symlinks, oversized policy trees, invalid commands, and timeouts are refused.
 
 ## Protocol
 
@@ -42,8 +42,8 @@ limited to 256 KiB, input to 1 MiB, policy files to 2 MiB, and timeout to at mos
   instructions are appended to the planning profile.
 - `review` returns `{"criteria":[],"instructions":[]}`. Criteria are added to the core ledger
   under engine-namespaced ids; they cannot remove core criteria.
-- `gate` returns `{"action":"continue","reason":""}` or a reasoned `stop`. It cannot turn a
-  red, refused, or timed-out core gate green.
+- API v1 `gate` returns `{"action":"continue","reason":""}` or a reasoned `stop`. It cannot
+  turn a red, refused, or timed-out core gate green.
 - `commit` returns `{"subject":""}`. A non-empty value changes only the commit subject. Core
   staging, audit text, and commit ownership remain unchanged.
 
@@ -96,6 +96,20 @@ attributable to the build range. If a task stops for a decision, the baseline st
 queue. `round` and `review` accept it only while its commit is still an ancestor and `gate_full`
 is unchanged, then run the final full gate after the recovered task. The risk record is removed
 when the queue becomes empty.
+
+## Flaky gate classification (API v2)
+
+A v2 gate policy may add `classification`: `defect`, `flaky`, `infrastructure`, or `unknown`.
+After a red result it may return:
+
+```json
+{"action":"retry","classification":"flaky","reason":"matched the project allowlist"}
+```
+
+CAW still performs its own first confirmation. Only a confirmed red result can use the policy
+retry, and the engine allows at most two policy retries for one delivery. No executor runs during
+them. If the gate stays red, the normal bounded executor/review flow resumes. The allowlist and
+classification rules live in project policy code; the run record stores every decision.
 
 Policy commands run in a private temporary working directory with a reduced environment. CAW
 checks that the delivery, HEAD, CAW files, policy files, and task queue did not change. This is a

@@ -44,7 +44,9 @@ Project-specific дополнения подключаются через вер
 запроса до enumeration и аттестуют разрешённую population после неё. Поэтому `complete` —
 project-owned утверждение, связанное с точным digest population, а не вывод из одного model draw.
 Risk class может также потребовать зелёный `gate_full` на стартовом коммите до любого executor;
-тогда финальный full gate позволяет отнести регрессию к диапазону этого build.
+тогда финальный full gate позволяет отнести регрессию к диапазону этого build. Gate policies API
+v2 могут классифицировать project-allowlisted flaky failure, а подтверждение и лимит повторов
+остаются под управлением ядра.
 
 ## Пять ролей
 

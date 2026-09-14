@@ -22,6 +22,10 @@ ends the run before delivery changes; a green baseline is retained in the run re
 queue state. A stopped task may resume with `round` or `review` only from that ancestry and with
 the same full-gate command; the resumed task is followed by the final full gate.
 
+Project policy API v2 may classify a confirmed red fast gate as allowlisted flaky and request a
+provider-free retry. The engine, not the policy, caps these at two per delivery. A persistent red
+then returns to the normal executor retry or review-stop decision.
+
 1. **Exit 0 green, 75 refused-to-start, any other non-zero red.** 75 (`EX_TEMPFAIL`) means
    the gate never looked: a machine too loaded for the suite it shards, a simulator that is
    not there, a service that is down. `caw.mjs` then says the run was *not tested* rather
