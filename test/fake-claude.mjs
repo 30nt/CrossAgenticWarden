@@ -4,7 +4,7 @@
 // each invocation consumes one entry, records exactly what CAW transmitted, optionally changes
 // fixture files as an executor would, and returns the requested envelope. It never uses a network.
 
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, chmodSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -167,6 +167,31 @@ if (role === 'reviewer' && Array.isArray(canonical?.weak)) {
   execFileSync('git', ['reset', '--hard', 'caw-review-baseline'], {
     cwd: process.cwd(), input: '',
   })
+}
+
+// Observe real artifact reads and denied mutations through the normal provider boundary.
+if (next.probeGateArtifacts) {
+  const files = JSON.parse(input.match(/## Read-only gate artifacts:\n(\[[^\n]*\])/)[1])
+  const attempt = (action) => {
+    try { action(); return null } catch (error) { return error.code }
+  }
+  const observations = files.map((file) => {
+    const content = readFileSync(file.path)
+    return {
+      id: file.id,
+      path: file.path,
+      content: content.toString('utf8'),
+      sha256: createHash('sha256').update(content).digest('hex'),
+      chmodError: attempt(() => chmodSync(file.path, 0o600)),
+      writeError: attempt(() => writeFileSync(file.path, 'tampered')),
+      removeError: attempt(() => unlinkSync(file.path)),
+    }
+  })
+  canonical.noted.push(`fake-gate-artifacts:${JSON.stringify({
+    observations,
+    privateReadErrors: (next.privateLogPaths || []).map((path) =>
+      attempt(() => readFileSync(path))),
+  })}`)
 }
 
 // A confined reviewer cannot update the harness call log outside its surface. Return this

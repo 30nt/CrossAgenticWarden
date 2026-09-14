@@ -84,3 +84,9 @@ New runtime records retain vendor identity; older records use the exact original
 when available. Strict `different-model` and `cross-vendor` modes refuse an unknown author before
 calling a reviewer. The permissive `same-provider` mode still allows hand-finished work with
 limited author provenance, and signed human review remains available.
+
+Each automated review pass receives readable copies of its gate artifacts, verified against the
+receipt hashes. The prompt maps artifact ids to exact paths outside the writable review repository
+and provider scratch directory. The outer boundary denies changes to these copies while keeping
+unrelated private logs unreadable. Copies survive experiment resets and are removed with the
+review surface; the original artifacts remain in the owning run record.

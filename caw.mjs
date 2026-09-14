@@ -3642,7 +3642,30 @@ function pruneReviewSurfaces(now = Date.now()) {
   })
 }
 
-function createReviewSurface(f) {
+// Keep evidence beside the writable Git and provider roots, so the existing outer boundary
+// grants reads but denies overwrites, chmod and removal. Never expose the rest of the run log.
+function stageReviewGateArtifacts(surface, receipt) {
+  if (!receipt?.artifacts?.length) return []
+  if (!runRecord) throw new Error('gate artifacts have no owning run record')
+  const root = join(surface.parent, 'gate-evidence')
+  mkdirSync(root, { mode: 0o700 })
+  return receipt.artifacts.map((artifact, index) => {
+    const source = gateEvidenceArtifactPath(resolve(runRecord.path), artifact.private_file)
+    if (source.size !== artifact.bytes || source.size > GATE_EVIDENCE_ARTIFACT_MAX) {
+      throw new Error(`retained gate artifact ${artifact.id} changed size`)
+    }
+    const bytes = readFileSync(source.path)
+    if (bytes.length !== artifact.bytes ||
+        createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+      throw new Error(`retained gate artifact ${artifact.id} changed after the gate`)
+    }
+    const path = join(root, `artifact-${String(index + 1).padStart(3, '0')}.bin`)
+    writePrivateFile(path, bytes, GATE_EVIDENCE_ARTIFACT_MAX)
+    return { id: artifact.id, path, bytes: bytes.length, sha256: artifact.sha256 }
+  })
+}
+
+function createReviewSurface(f, gateReceipt = null) {
   const deliveryRoot = realpathSync(process.cwd())
   if (surfaceGit(deliveryRoot, 'ls-files', '--stage').split('\n')
     .some((line) => line.startsWith('160000 '))) {
@@ -3683,6 +3706,7 @@ function createReviewSurface(f) {
       const exclude = surfaceGit(workingRoot, 'rev-parse', '--git-path', 'info/exclude').trim()
       appendFileSync(join(workingRoot, exclude), `\n/${dependency.entry.replace(/\\/g, '/')}\n`)
     }
+    surface.gateArtifacts = stageReviewGateArtifacts(surface, gateReceipt)
     surface.deniedReadPaths = ignoredReadDenials(deliveryRoot, dependencies)
     const bytes = apparentSurfaceBytes(parent)
     if (bytes > REVIEW_SURFACE_MAX) {
@@ -8220,7 +8244,7 @@ function runTask(file, f, profileText, opts = {}) {
     let weakBaseline = null
     const passCount = 1 + f.review_challenger_passes
     for (let passIndex = 0; passIndex < passCount; passIndex++) {
-      const reviewSurface = createReviewSurface(f)
+      const reviewSurface = createReviewSurface(f, g.receipt)
       reviewSurfaceIds.push(reviewSurface.parent.split(/[\\/]/).pop())
       const passBaseline = prepareWeakCapture(reviewSurface)
       weakBaseline ||= passBaseline
@@ -8228,6 +8252,11 @@ function runTask(file, f, profileText, opts = {}) {
       let semanticProblem = null
       const reviewPrompt = [
         reviewDossier.text,
+        reviewSurface.gateArtifacts.length
+          ? '\n\n## Read-only gate artifacts:\n' + stableJson(reviewSurface.gateArtifacts) +
+            '\nRead these exact files to inspect gate evidence. Reference them as gate-artifact:<id>.' +
+            ' They are outside your writable roots and survive Git experiment resets.'
+          : '',
         '\n\n',
         `Review pass ${passIndex + 1} of ${passCount}. ` +
           (passIndex === 0

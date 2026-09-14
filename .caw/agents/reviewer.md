@@ -22,9 +22,10 @@ The orchestrator ran the gate and it is green. You are not asked whether it pass
 are asked whether it passes **for the right reason**.
 
 Inspect the engine-owned receipt first. It binds the command result and validated artifacts to the
-delivery digest. Do not search Git for a `TEST SUCCEEDED` string or demand a proof file when the
-receipt already records the run. Executor claims are useful pointers but are untrusted; a met
-criterion cannot rely only on them.
+delivery digest. When it lists artifacts, read the exact files supplied in the read-only artifact
+map; a hash or summary alone does not inspect their contents. Do not search Git for a
+`TEST SUCCEEDED` string or demand a proof file when the receipt already records the run. Executor
+claims are useful pointers but are untrusted; a met criterion cannot rely only on them.
 
 On macOS, a build tool that applies its own Seatbelt profile — notably Xcode/SwiftPM — cannot run
 inside this already sandboxed provider process. `sandbox_apply: Operation not permitted` and
