@@ -66,6 +66,17 @@ item of the form "temporarily break X, observe that Y goes red, restore it" is
 identical whether it was observed or not. Whether a test could have gone red is the task
 reviewer's question, asked later against real code.
 
+Evidence also has an ordering boundary. A task reviewer receives an engine-owned receipt only
+for the configured `gate_fast`. The configured `gate_full` runs after every task has already been
+reviewed and committed, so a task criterion requiring that final gate, completed-queue coverage,
+or its receipt is `unverifiable`: satisfying it depends on a later lifecycle state. Keep final
+full-gate validation at queue scope, outside every task contract.
+
+A required database, integration, or other command outside `gate_fast` has the same problem:
+executor prose is not an engine receipt. It is verifiable before task review only when the
+project-owned fast gate invokes it. Do not accept a proof file as a substitute for engine-owned
+execution evidence.
+
 ## What you may not do
 
 **A plan describes a tree that does not exist yet.** Every count you can take is taken

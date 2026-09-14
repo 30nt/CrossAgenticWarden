@@ -6354,6 +6354,35 @@ function sayCollisions({ hits, examined }) {
   hits.forEach((h) => say(`    - ${h.task}: '${h.literal}'`))
 }
 
+// Task review and queue finalization intentionally happen on opposite sides of the task commit.
+// A live project exposed the consequence when an architect copied both `supabase test db` and
+// `gate_full` into the final task's Done when: the task reviewer could see only the fast receipt,
+// kept the criteria open, and the full gate that would have produced the other receipt could run
+// only after that same reviewer committed the task. Two review passes then agreed on a condition
+// the engine had made impossible to satisfy.
+//
+// This block is engine-owned lifecycle evidence, not another project preference. It is handed to
+// both planning roles on generated and hand-written paths. The profile text already names both
+// commands, but it does not state which receipt the later reviewer actually receives; making the
+// temporal boundary explicit is what lets `unverifiable` fire before code exists. Project-specific
+// checks stay out of core: a project composes them into gate_fast when a task needs their receipt.
+function taskEvidenceLifecycleBlock(f) {
+  const fast = f.gate_fast || '(no gate_fast configured)'
+  const full = f.gate_full || '(no gate_full configured)'
+  return [
+    '\n\nEngine-owned verification lifecycle (facts about how this plan will run):',
+    `- Before each task review, CAW runs only gate_fast: \`${fast}\`. The reviewer receives that receipt.`,
+    f.gate_full
+      ? `- After every task is reviewed and committed, CAW runs gate_full once: \`${full}\`.`
+      : '- No separate gate_full is configured; the fast gate is the whole engine gate.',
+    '- A task Must cover, Change, or Done when criterion cannot require gate_full, completed-queue',
+    '  validation, or another command that gate_fast does not run. Such a criterion depends on',
+    '  evidence unavailable at task review and is unverifiable, not a task acceptance check.',
+    '- Project-specific pre-review checks belong inside the project-owned gate_fast. Executor',
+    '  claims and proof files are not substitutes for an engine-owned receipt.',
+  ].join('\n')
+}
+
 function plan(description) {
   setProviderBudgetPhase('planning')
   const { f, text: profileText } = profile()
@@ -6424,6 +6453,7 @@ function plan(description) {
     const out = agent('architect', [
       'Request from the human:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      taskEvidenceLifecycleBlock(f),
       revision,
       '\n\nSplit this into an ordered list of atomic tasks, and return the coverage mapping.',
       ' Give every independently changeable surface a globally unique id and one explicit state',
@@ -6470,6 +6500,7 @@ function plan(description) {
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      taskEvidenceLifecycleBlock(f),
       '\n\nProposed tasks:\n\n' + JSON.stringify(out.tasks, null, 2),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
       '\n\nEngine-owned relation ledger. Return exactly one `relations` row for every id:',
@@ -8920,6 +8951,7 @@ function fixSpecs(description, f, text, specs, problems, round) {
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they run:\n\n' + bodies,
     '\n\nHoles to close:\n- ' + problems.join('\n- '),
     '\n\nReturn the whole plan again with the holes closed, and change only what closing them',
@@ -9004,6 +9036,7 @@ function judgeSpecs(description, f, text, population) {
     ' coverage. They are already on disk and will be built as they stand unless you name a hole.',
     '\n\nRequest they are meant to satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they will run:\n\n' + bodies,
     '\n\nThese were written by hand, so there is no separate coverage mapping: each spec\'s',
     ' "## Must cover" block is its coverage claim, and a spec with no such block is claiming',
@@ -9840,5 +9873,6 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
-  runProjectPolicy, runWeakReplaySession, taskDeliveryDiff, verifyProjectPolicies, zeroAccounting,
+  runProjectPolicy, runWeakReplaySession, taskDeliveryDiff, taskEvidenceLifecycleBlock,
+  verifyProjectPolicies, zeroAccounting,
 }

@@ -70,6 +70,12 @@ no round-1 fix had touched.
 **A gate result never passes through an agent.** Green or red is an exit code. A test-runner
 specialist was deleted after measurement: 4 spawns, 256k tokens, 13% of a lane, 0 usable verdicts.
 
+Task and queue evidence are deliberately separated. Before task review, the reviewer receives
+only the engine-owned `gate_fast` receipt. `gate_full` runs once after every task is reviewed and
+committed, so it is queue-finalization evidence and cannot be a task acceptance criterion.
+Planning roles receive that lifecycle as engine-owned context. A project-specific pre-review
+check belongs inside the project's fast gate; executor claims and proof files are not receipts.
+
 The gate result now has an engine-owned receipt. It binds the command, status, duration, bounded
 output and validated artifact digests to the exact delivery digest. Executor checks are separate
 structured claims and remain untrusted. A reviewer sees both in a bounded task dossier instead of

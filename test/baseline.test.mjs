@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   groupFindings, mergeReviewPasses, planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
-  resolvePopulationSource, retainWeakVerificationEvents,
+  resolvePopulationSource, retainWeakVerificationEvents, taskEvidenceLifecycleBlock,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
 import {
@@ -1341,6 +1341,33 @@ test('request, planning and role budgets stop before the next provider process',
     assert.match(output, new RegExp(`${field} reached`))
     assert.match(output, /no (?:plan-reviewer|architect) provider call was started/)
     assert.equal(calls(f).length, expectedCalls, field)
+  }
+})
+
+test('planning roles receive the task-versus-queue evidence lifecycle', () => {
+  const fullGate = 'node scripts/full-suite.mjs'
+  const f = fixture({ gateFull: fullGate })
+  const result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const block = taskEvidenceLifecycleBlock({
+    gate_fast: 'node -e "process.exit(0)"', gate_full: fullGate,
+  })
+  assert.match(block, /Before each task review, CAW runs only gate_fast/)
+  assert.match(block, /After every task is reviewed and committed, CAW runs gate_full once/)
+  assert.match(block, /proof files are not substitutes/)
+
+  const planningCalls = calls(f).filter((call) =>
+    call.role === 'architect' || call.role === 'plan-reviewer')
+  assert.equal(planningCalls.length, 2)
+  for (const call of planningCalls) {
+    assert.match(call.input, /Engine-owned verification lifecycle/)
+    assert.match(call.input, /node scripts\/full-suite\.mjs/)
+    assert.match(call.input, /evidence unavailable at task review and is unverifiable/)
   }
 })
 
