@@ -146,6 +146,8 @@ const MAX_PLAN_ROUNDS = 3
 // that same install — two rounds, $4.88, five substantive items closed and three fresh ones
 // raised, stopped at the cap with the task one hand-edit from done.
 const MAX_TASK_ROUNDS = 4 // rounds a task runs before the run stops and asks the human
+const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
+const MAX_REVIEW_CHALLENGER_PASSES = 2
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
 
 const GateFailureAction = Object.freeze({
@@ -715,6 +717,60 @@ function localProbeRoot() {
   } catch { return null }
 }
 
+function localRoleSmokeRoot() {
+  try {
+    return resolve(execFileSync('git', ['rev-parse', '--git-path', 'caw/role-smoke'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim())
+  } catch { return null }
+}
+
+function engineDigest() {
+  return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex')
+}
+
+function roleSmokeKey(role, binding, provider) {
+  return {
+    version: 1,
+    role,
+    provider: binding.provider,
+    model: binding.model,
+    reasoning: binding.reasoning,
+    adapter_digest: provider.adapter.digest,
+    cli_version: provider.cliVersion,
+    executable: canonicalExecutable(provider.executable),
+    engine_digest: engineDigest(),
+  }
+}
+
+function currentRoleSmoke(role, binding, provider) {
+  const root = localRoleSmokeRoot()
+  if (!root) return null
+  const path = join(root, `${role}.json`)
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > PROBE_ATTESTATION_MAX) return null
+    const value = JSON.parse(readFileSync(path, 'utf8'))
+    const key = roleSmokeKey(role, binding, provider)
+    return value.green === true && Object.entries(key).every(([name, expected]) =>
+      value[name] === expected) ? value : null
+  } catch { return null }
+}
+
+function writeRoleSmoke(role, value) {
+  const root = localRoleSmokeRoot()
+  if (!root) die('role smoke evidence requires a Git repository')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const target = join(root, `${role}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+  if (bytes.length > PROBE_ATTESTATION_MAX) die('role smoke evidence exceeds its storage bound')
+  writeFileSync(temp, bytes, { mode: 0o600, flag: 'wx' })
+  renameSync(temp, target)
+  try { chmodSync(root, 0o700); chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  return target
+}
+
 // What an attestation is allowed to be about. `cli_version` is deliberately NOT here, and that
 // is a decision rather than an omission: what the probe measures is an OS write boundary, and the
 // kernel enforces that against any build of any provider. Keying evidence to the exact CLI build
@@ -1207,7 +1263,7 @@ function reviewIndependence(mode, authorRole, reviewerRole) {
   }
 }
 
-function preflightRuntime(f) {
+function preflightRuntime(f, skipRoleSmoke = false) {
   if (!resolvedRuntime) resolvedRuntime = loadRuntime(f)
   if (!resolvedRuntime.providers) {
     resolvedRuntime.providers = new Map()
@@ -1232,9 +1288,12 @@ function preflightRuntime(f) {
     for (const role of ROLES) {
       const binding = resolvedRuntime.value.roles[role]
       const provider = resolvedRuntime.providers.get(binding.provider)
-      compareGuarantees(role,
-        provider.adapter.describe({ role, cliVersion: provider.cliVersion }), provider,
-        missingEvidence)
+      const descriptor = provider.adapter.describe({ role, cliVersion: provider.cliVersion })
+      compareGuarantees(role, descriptor, provider, missingEvidence)
+      if (!descriptor.features.reasoningLevels.includes(binding.reasoning)) {
+        die(`${role} requests reasoning=${binding.reasoning}, but adapter ${binding.provider} ` +
+          `supports ${descriptor.features.reasoningLevels.join(', ')}`)
+      }
     }
     if (missingEvidence.length) {
       const providers = [...new Set(missingEvidence.map((entry) => entry.provider))]
@@ -1242,6 +1301,17 @@ function preflightRuntime(f) {
         missingEvidence.map((entry) => `  - ${entry.message}`).join('\n') +
         '\n  Recovery:\n' + providers.map((provider) =>
           `  Run: node caw.mjs probe ${provider}`).join('\n'))
+    }
+  }
+  if (f.require_role_smoke && !skipRoleSmoke) {
+    const missingSmoke = ROLES.filter((role) => {
+      const binding = resolvedRuntime.value.roles[role]
+      return !currentRoleSmoke(role, binding, resolvedRuntime.providers.get(binding.provider))
+    })
+    if (missingSmoke.length) {
+      die('runtime lacks role smoke evidence for the exact model/reasoning binding:\n' +
+        missingSmoke.map((role) => `  - ${role}`).join('\n') +
+        '\n  Recovery: node caw.mjs smoke all')
     }
   }
   const independence = [
@@ -2674,6 +2744,23 @@ function profile(preflight = true) {
       die(`.caw/CAW.md ${key} must be same-provider, different-model, cross-vendor, or ` +
         `human-review — got "${f[key]}"`)
     }
+  }
+  if (f.review_challenger_passes === undefined || f.review_challenger_passes === '') {
+    f.review_challenger_passes = DEFAULT_REVIEW_CHALLENGER_PASSES
+  } else {
+    const passes = Number(f.review_challenger_passes)
+    if (!Number.isSafeInteger(passes) || passes < 0 || passes > MAX_REVIEW_CHALLENGER_PASSES) {
+      die(`.caw/CAW.md review_challenger_passes must be a whole number from 0 to ` +
+        `${MAX_REVIEW_CHALLENGER_PASSES} — got "${f.review_challenger_passes}"`)
+    }
+    f.review_challenger_passes = passes
+  }
+  if (f.require_role_smoke === undefined || f.require_role_smoke === '') {
+    f.require_role_smoke = false
+  } else if (!['true', 'false'].includes(f.require_role_smoke)) {
+    die(`.caw/CAW.md require_role_smoke must be true or false — got "${f.require_role_smoke}"`)
+  } else {
+    f.require_role_smoke = f.require_role_smoke === 'true'
   }
   try {
     f.provider_budgets = resolveProviderBudgets(f)
@@ -7890,6 +7977,60 @@ function probeProvider(providerId) {
   }
 }
 
+function smokeRoles(target) {
+  if (!target || (target !== 'all' && !ROLES.includes(target))) {
+    die(`usage: caw.mjs smoke <all|${ROLES.join('|')}>`)
+  }
+  const { f } = profile(false)
+  resolvedRuntime = loadRuntime(f)
+  preflightRuntime(f, true)
+  setProviderBudgetPhase('smoke')
+  const selected = target === 'all' ? ROLES : [target]
+  const schema = closeSchema({
+    type: 'object',
+    properties: { marker: { type: 'string', enum: ['caw-role-smoke'] } },
+    required: ['marker'],
+  })
+  for (const role of selected) {
+    const before = deliveryDigest()
+    const surface = createReviewSurface(f)
+    let value
+    try {
+      const reviewer = role === 'reviewer'
+      value = agent(role,
+        'Role smoke only. Read README.md, make no project change, and return marker ' +
+          '`caw-role-smoke` exactly. This validates the configured model and reasoning path.',
+        schema, f, null, {
+          workingRoot: surface.workingRoot,
+          scratchRoot: surface.scratchRoot,
+          surfaceId: surface.parent.split(/[\\/]/).pop(),
+          deniedReadPaths: surface.deniedReadPaths,
+          ...(reviewer ? { writeBoundary: {
+            kind: REVIEW_WRITE_BOUNDARY,
+            readOnlyDependencyRoots: surface.dependencies.map((dependency) => dependency.canonical),
+          } } : {}),
+        })
+    } finally {
+      removeReviewSurface(surface)
+    }
+    if (value.marker !== 'caw-role-smoke' || deliveryDigest() !== before) {
+      die(`${role} smoke did not preserve the delivery tree`)
+    }
+    const binding = resolvedRuntime.value.roles[role]
+    const provider = resolvedRuntime.providers.get(binding.provider)
+    const runtime = runtimeIdentity(value)
+    const path = writeRoleSmoke(role, {
+      ...roleSmokeKey(role, binding, provider),
+      green: true,
+      created_at: new Date().toISOString(),
+      requested_native: runtime?.requested?.native || null,
+      observed_models: runtime?.models || [],
+      delivery_digest: before,
+    })
+    say(`${role}: green — ${path}`)
+  }
+}
+
 function artifacts(args) {
   const [action = 'list', target] = args.filter((value) => !value.startsWith('--'))
   const forceActive = args.includes('--force-active')
@@ -7996,13 +8137,16 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
   caw.mjs review <NNN_slug.md>            review a task finished by hand, and commit
   caw.mjs done <NNN_slug.md>              remove a spec with no review at all
   caw.mjs probe <provider>                refresh machine-local live evidence
+  caw.mjs smoke <role|all>                verify exact model/reasoning role bindings
+  caw.mjs human-review prepare|accept ... signed human planning or task review
   caw.mjs verify-project                  validate configured project policies
   caw.mjs artifacts list|purge <id>       inspect or remove retained artifacts
 
 Every pipeline command refuses until all five roles resolve and carry current green probe
 evidence. Run \`caw.mjs probe <provider>\` on the machine that will execute it.`
 
-const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done', 'probe',
+const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done', 'probe', 'smoke',
+  'human-review',
   'verify-project', 'artifacts']
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { say(USAGE); return }
 if (cmd === '--version' || cmd === '-v') { say(VERSION); return }
@@ -8026,6 +8170,7 @@ if (cmd === 'verify-project') {
 }
 await discoverAdapters()
 if (cmd === 'probe') { probeProvider(rest[0]); return }
+if (cmd === 'smoke') { smokeRoles(rest[0]); return }
 try { projectPolicySet = readProjectPolicies() }
 catch (error) { die(error?.message || String(error)) }
 // Pipeline and queue commands retain the all-five preflight selected in slice 2.1.
