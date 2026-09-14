@@ -11,9 +11,13 @@ and commits it has hazards; the choice is whether its users find them here or in
 Measurements name their instrument as a class — "one install, Python", "one install, iOS/Swift".
 They are single-install observations, not benchmarks.
 
-## Hazards you can hit on a real run
+## Historical incidents closed in the current engine
 
-### An interrupted reviewer can leave a mutation in your working tree
+### An interrupted reviewer could leave a mutation in the working tree
+
+Current status: fixed. The engine now creates and owns an isolated review surface, checks the
+delivery digest after every pass, and retains a bounded failed surface when cleanup cannot finish.
+The incident below is kept as the reason for that boundary.
 
 The reviewer copies the working tree somewhere, mutates it to see whether a test can still fail,
 and deletes it. **No role file tells it to.** The copy is made by an agent's shell command, so
@@ -32,9 +36,7 @@ A second install splits the finding: the surface is built there too, unasked, bu
 enumerated subtrees, so its two credential files never left. **The behaviour is 2 of 2; the
 exposure is 1 of 2**, and nothing measured yet predicts which shape you get.
 
-*What you can do:* write the `## Standing authorizations` entry in `.caw/CAW.md`, and name the
-paths the copy must never **receive** — not paths deleted afterwards, which is a narrower window
-and not a closed one.
+## Current hazards
 
 ### A mutation can be inert without anything noticing
 
@@ -44,10 +46,16 @@ symlink survives pointing at the original; and an inert edit can land on a branc
 walks. All four return the same green, and a reviewer reads that green as a weak test — so the
 finding lands as a revision written against a healthy test, which is the expensive direction.
 
-The check that covers all four is a positive control: break the same site outright and require
-*that* to go red first. Nothing the reviewer reads says so today.
+The check that covers all four is a positive control. CAW now supports it through the paired
+`weak_source_probe_cmd` and `weak_positive_control_cmd`; projects that leave both empty retain this
+hazard and receive no controlled weak-verification claim.
+
+## Historical incidents closed in the current engine (continued)
 
 ### A git-based gate reports PASS where it enumerated nothing
+
+Current status: fixed in engine-owned review surfaces, which are Git clones with a delivery overlay.
+The incident remains relevant to project-created copies and explains the clone invariant.
 
 The manual prescribes enumerating with `git ls-files --cached --others --exclude-standard`. Build
 the review surface with `tar` instead of `git clone` and there is no `.git` there, so the
@@ -58,18 +66,18 @@ Measured in both directions on one install: built as a clone and then mutated, t
 and names the test. **Built without a `.git`, it exits 0 and PASSES on every mutation.**
 Confirmed on a second install in a second language.
 
-*What you can do:* if your gate enumerates through git, build the surface with `git clone
---no-hardlinks`, not with `tar`. This is not a preference.
+## Current hazards (continued)
 
 ### The gate runs before anything is staged
 
 A gate that inspects the index rather than the working tree sees the previous state. The script
 sets this trap for every install that writes one.
 
-### `approved: true` is one draw, and `build` treats it as a gate
+### `approved: true` is a bounded sample, and `build` treats it as a gate
 
 Measured on one install with ten byte-identical specs across two runs, clean tree: the same
-question got different answers at different times. An approval is a sample, not a proof.
+question got different answers at different times. Task review now uses a primary plus one blind
+challenger pass by default, but two bounded samples are still not proof.
 
 ### An executor can commit its own work, and only prose stops it
 
@@ -105,19 +113,17 @@ boundary, and a gate that takes an index lock or stashes would break. The falsif
   `.caw/hooks/` answer this for an agent session — not for a hand or a script. Half is now
   instrumented: `review-specs` records a digest per spec at the moment it flips the flag, and
   `build` compares the queue against it. It **reports and does not refuse**, on purpose.
-- **The reviewer can write, and so can the architect.** Both get `Bash` for a real reason, and a
-  shell can write files. The guarantee is that no edit *path* is offered, not that writing is
-  impossible. Two roles rather than one doubles that surface without changing the argument.
-- **The gate has no timeout.** A hung agent call no longer blocks a run; a gate that never
-  returns does. It is open deliberately: how long a suite runs is a property of the project —
-  one install measures 3:20, another's is seconds — so the tool has no basis to pick a bound,
-  and a wrong guess turns a passing suite into a failed run.
-- **The manual approval path is narrowed, not closed.** `build` can tell a hand-flipped `PLAN.md`
+- **Shell-enabled roles retain read and network residuals.** Supported adapters enforce their
+  write scope with an OS boundary; a host without that boundary refuses before a role call.
+- **Gate timeouts are project-owned.** Empty timeout fields mean no deadline. A configured timeout
+  kills the gate and records `timeout`, which is neither red nor refused.
+- **Unsigned manual approval remains possible by editing project files.** `build` can tell a hand-flipped `PLAN.md`
   from a judged one, because `review-specs` removes the `## Unclosed` section when it flips the
   flag. Anyone who also deletes that section by hand gets silence. The override went from editing
   one word to a deliberate second act — which is the whole change. Worth recording why it needed
   narrowing: on one install the person who wrote the refusal text reached for the override
-  reflexively, within an hour.
+  reflexively, within an hour. Projects that require human independence should use the signed
+  `human-review` flow; it binds the decision to exact plan bytes or a delivery digest.
 - **Byte-identity is the graduation rule and is not observable across platforms.** An install is
   a vendored copy whose version is the tag its bytes match. Line endings and file modes both
   break that check invisibly — one install carried `755` on two files tracked as `644` and every
@@ -127,7 +133,7 @@ boundary, and a gate that takes an index lock or stashes would break. The falsif
   has no gate to keep green. A human makes the first commit — skeleton, manifest, one passing
   test, `gate_fast` — by hand.
 
-### Presence is not capability, and a Linux container shows it
+### Historical: presence was mistaken for capability on Linux
 
 `bwrap` on `PATH` does not mean `bwrap` can run. A default Docker container ships it and denies
 the unprivileged user namespace it needs; Ubuntu 24.04 restricts the same namespace through

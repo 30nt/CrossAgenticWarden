@@ -20,7 +20,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
+  mergeReviewPasses, planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
   resolvePopulationSource, retainWeakVerificationEvents,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -134,6 +134,42 @@ const planReview = (subject = plan()) => ({
 const delivery = (summary) => ({ summary, notes: [], blocked: '' })
 const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) =>
   ({ criteria, carried, broken, uncovered, weak, noted })
+
+test('review passes merge conservatively and mark challenger findings against one baseline', () => {
+  const criterion = { id: 'done_when:1', state: 'met', evidence: 'primary checked it' }
+  const verification = {
+    state: 'baseline-green', baseline: { state: 'green' }, mutations: [], failures: [],
+    replay_surface: { restores: 1 },
+  }
+  const merged = mergeReviewPasses([
+    {
+      verdict: verdict({
+        criteria: [criterion],
+        carried: [{ id: 'r1.1', state: 'closed', evidence: 'primary closed it' }],
+        broken: [{ where: 'src/a.js:1', fix: 'fix A', evidence: 'primary evidence' }],
+      }),
+      weakEvents: [], weakVerification: verification,
+    },
+    {
+      verdict: verdict({
+        criteria: [{ ...criterion, state: 'broken', evidence: 'challenger disproved it' }],
+        carried: [{ id: 'r1.1', state: 'open', evidence: 'challenger still reproduces it' }],
+        broken: [
+          { where: 'src/a.js:1', fix: 'fix A', evidence: 'duplicate evidence' },
+          { where: 'src/b.js:2', fix: 'fix B', evidence: 'late evidence' },
+        ],
+      }),
+      weakEvents: [], weakVerification: verification,
+    },
+  ], 'a'.repeat(64))
+  assert.equal(merged.verdict.criteria[0].state, 'broken')
+  assert.equal(merged.verdict.carried[0].state, 'open')
+  assert.equal(merged.verdict.broken.length, 2)
+  assert.equal(merged.verdict.broken[0].discovery, 'primary')
+  assert.equal(merged.verdict.broken[1].discovery, 'late-same-baseline')
+  assert.equal(merged.verdict.broken[1].baseline_digest, 'a'.repeat(64))
+  assert.equal(merged.weakVerification.replay_surface.surfaces_created, 2)
+})
 
 test('JavaScript provider paths use the current Node executable on every platform', () => {
   for (const platformName of ['darwin', 'linux', 'win32']) {
@@ -259,6 +295,8 @@ review_dependency_roots: ${reviewDependencies}
 docs_language: English
 planning_independence: ${planningIndependence}
 task_independence: ${taskIndependence}
+review_challenger_passes: 0
+require_role_smoke: false
 weak_source_probe_cmd: ${weakSourceProbe}
 weak_positive_control_cmd: ${weakPositiveControl}
 ---
@@ -2410,12 +2448,85 @@ test('project review independence is enforced before provider calls', () => {
   assert.match(crossRefused.stderr, /anthropic\/sonnet -> anthropic\/opus/)
   assert.equal(calls(crossVendor).length, 0)
 
-  const human = fixture({ planningIndependence: 'human-review' })
-  const humanRefused = run(human, ['plan', 'x'], [])
-  assert.equal(humanRefused.status, 1)
-  assert.match(humanRefused.stderr, /planning independence requires human-review/)
-  assert.match(humanRefused.stderr, /Automated approval is disabled/)
-  assert.equal(calls(human).length, 0)
+})
+
+test('human planning review is signed, exact to PLAN.md, and runs no plan reviewer', () => {
+  const f = fixture({ git: true, planningIndependence: 'human-review' })
+  const key = join(f.parent, 'human-review-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  const publicKey = readFileSync(`${key}.pub`, 'utf8').trim()
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'), `reviewer@example ${publicKey}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  const planned = run(f, ['plan', 'human-reviewed plan'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(planned.status, 1)
+  assert.match(`${planned.stdout}\n${planned.stderr}`, /signed human planning review required/)
+  assert.equal(calls(f).some((call) => call.role === 'plan-reviewer'), false)
+
+  const prepared = run(f, ['human-review', 'prepare', 'plan', 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-plan.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed the plan and its complete relation ledger.'
+  for (const relation of attestation.relations) relation.evidence = 'checked against request and task'
+  writeFileSync(packet, `${JSON.stringify(attestation, null, 2)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], {
+    stdio: 'ignore',
+  })
+  const accepted = run(f, ['human-review', 'accept', packet, `${packet}.sig`], [])
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: true$/m)
+  const retained = readdirSync(join(f.root, '.git', 'caw', 'human-reviews'))
+  assert.equal(retained.some((name) => name.endsWith('.json')), true)
+  assert.equal(retained.some((name) => name.endsWith('.sig')), true)
+})
+
+test('human task review verifies a signed exact delivery and commits without an agent reviewer', () => {
+  const f = fixture({ git: true, taskIndependence: 'human-review' })
+  const key = join(f.parent, 'human-task-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'),
+    `reviewer@example ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_human.md'), `---
+title: Human task
+---
+
+## Change
+
+- Change the fixture heading.
+
+## Done when
+
+- README contains the human heading.
+`)
+  writeFileSync(join(f.root, 'README.md'), '# human heading\n')
+  const stopped = run(f, ['review', '001_human.md'], [])
+  assert.equal(stopped.status, 1)
+  assert.match(`${stopped.stdout}\n${stopped.stderr}`, /automated task review is disabled/)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
+
+  const prepared = run(f,
+    ['human-review', 'prepare', 'task', '001_human.md', 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed the exact delivery and its gate.'
+  for (const criterion of attestation.criteria) criterion.evidence = 'read README and checked the criterion'
+  writeFileSync(packet, `${JSON.stringify(attestation, null, 2)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], {
+    stdio: 'ignore',
+  })
+  const accepted = run(f, ['human-review', 'accept', packet, `${packet}.sig`], [])
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout)
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: f.root, encoding: 'utf8' }), '')
+  const audit = latestTaskAudit(f)
+  assert.equal(audit.review.certification.reviewer.kind, 'human')
+  assert.equal(audit.review.certification.reviewer.identity, 'reviewer@example')
+  assert.match(audit.review.certification.reviewer.attestation_digest, /^[0-9a-f]{64}$/)
 })
 
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
@@ -2949,6 +3060,64 @@ test('an independent third adapter completes the public contract without an engi
   assert.equal(calls(f).length, 3)
   assert.equal(createHash('sha256').update(readFileSync(join(f.root, 'caw.mjs'))).digest('hex'), engineBefore)
   assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /test-third/)
+})
+
+test('challenger review uses the same delivery and retains late findings before an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { review_challenger_passes: 1 })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_challenger.md'), 'title: Challenger review\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_challenger.md'], [
+    { envelope: envelope(verdict()) },
+    { envelope: envelope(verdict({ broken: [{
+      where: 'README.md:1', fix: 'restore the contract', evidence: 'challenger reproduced it',
+    }] })) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /one round this command runs is done/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 2)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks',
+    '.round-001_challenger.md.json'), 'utf8'))
+  assert.equal(saved.history.length, 1)
+  assert.equal(saved.history[0].discovery, 'late-same-baseline')
+  assert.equal(saved.history[0].review_pass, 2)
+  assert.match(saved.history[0].baseline_digest, /^[0-9a-f]{64}$/)
+  const reviewers = saved.runtime_history.filter((entry) => entry.role === 'reviewer')
+  assert.equal(reviewers.length, 2)
+  assert.equal(reviewers[0].baseline_digest, reviewers[1].baseline_digest)
+  assert.equal(reviewers[0].baseline_digest, saved.history[0].baseline_digest)
+})
+
+test('role smoke is exact to model and reasoning and model changes fail before a provider call',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { require_role_smoke: 'true' })
+  const marker = { marker: 'caw-role-smoke' }
+  const smoked = run(f, ['smoke', 'all'], [
+    ...['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
+      .map((role) => ({ role, envelope: envelope(marker) })),
+  ])
+  assert.equal(smoked.status, 0, smoked.stderr || smoked.stdout)
+  const smokeRoot = join(f.root, '.git', 'caw', 'role-smoke')
+  for (const role of ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']) {
+    const evidence = JSON.parse(readFileSync(join(smokeRoot, `${role}.json`), 'utf8'))
+    assert.equal(evidence.green, true)
+    assert.equal(evidence.role, role)
+    assert.match(evidence.engine_digest, /^[0-9a-f]{64}$/)
+  }
+  writeFileSync(f.calls, '')
+  const runtimePath = join(f.root, '.caw', 'runtime.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.roles.reviewer.model = 'new-explicit-model-id'
+  writeFileSync(runtimePath, `${JSON.stringify(runtime, null, 2)}\n`)
+  const refused = run(f, ['plan', 'must not launch'], [])
+  assert.equal(refused.status, 1)
+  assert.match(refused.stderr, /lacks role smoke evidence.*reviewer/s)
+  assert.equal(calls(f).length, 0)
 })
 
 test('current build stop and round resume preserve carried findings and commit',

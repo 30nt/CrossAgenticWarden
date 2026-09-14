@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "plan": {
+    "tasks": [
+      {
+        "slug": "store-token",
+        "title": "Store token",
+        "read": ["src/token.js"],
+        "change": ["Store a token without logging it."],
+        "done_when": ["A test proves the token is stored.", "A test proves logs contain no token."]
+      }
+    ],
+    "coverage": [
+      {
+        "case": "successful storage",
+        "task": "store-token",
+        "acceptance_criteria": ["A test proves the token is stored."]
+      },
+      {
+        "case": "secret-safe logging",
+        "task": "store-token",
+        "acceptance_criteria": ["A test proves logs contain no token."]
+      }
+    ]
+  },
+  "expect": {
+    "tasks": 1,
+    "requirements": 4,
+    "cases": 2,
+    "relations": 2,
+    "incomplete_review_is_rejected": true
+  }
+}

@@ -5,9 +5,13 @@
 Every task review writes `certification-<task>-round-<n>.json` into the current run record before
 CAW prints or acts on the verdict.
 
-The record contains the actual author and reviewer runtimes, enforced independence mode, complete
+The record contains the actual author and reviewer runtimes (or signed human identity), enforced independence mode, complete
 criterion ledger, population state, review-surface baseline, delivery digest, weak-verification
 state, open finding ids, and project-policy digests.
+
+Automated task rounds merge a primary pass with the configured blind challenger passes over one
+delivery digest. Certification retains every pass runtime. New challenger findings carry
+`late-same-baseline`; disagreement on a carried item cannot approve it.
 
 Its state is:
 
@@ -46,3 +50,8 @@ and exact staged tree. This private storage is local Git state and is not pushed
 Before an old run record is pruned or explicitly purged, CAW appends compact call, usage-state,
 duration and certification counters to `caw/metrics/runs.jsonl`. Provider responses, prompts and
 diagnostic payloads are not copied into this metrics stream.
+
+For `human-review`, `.caw/CAW.md` names an OpenSSH allowed-signers file. `human-review prepare`
+creates the exact plan or task census, and `human-review accept` verifies an `ssh-keygen -Y`
+signature in namespace `caw-review`. The signed JSON and signature are retained under Git-private
+`caw/human-reviews/`; any plan-byte or delivery-digest change invalidates the attestation.

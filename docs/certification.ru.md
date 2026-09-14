@@ -5,9 +5,13 @@
 Каждый task review записывает `certification-<task>-round-<n>.json` в текущий run record до того,
 как CAW напечатает или применит verdict.
 
-Запись содержит фактические runtime автора и reviewer, проверенный режим независимости, полный
+Запись содержит фактические runtime автора и reviewer (или подписанную identity человека), проверенный режим независимости, полный
 criterion ledger, состояние population, baseline review-поверхности, digest дерева, состояние
 weak verification, ID открытых findings и digest project policies.
+
+Автоматический task-раунд объединяет primary-проход и настроенные слепые challenger-проходы по
+одному digest доставки. Certification сохраняет runtime каждого прохода. Новая находка challenger
+получает `late-same-baseline`; спор по carried-пункту не может его одобрить.
 
 Состояния записи:
 
@@ -48,3 +52,8 @@ certification содержат имя файла, размер и SHA-256, а н
 Перед автоматическим или явным удалением старого run record CAW дописывает компактные счётчики
 вызовов, usage state, длительности и certification в `caw/metrics/runs.jsonl`. Prompts, ответы
 провайдеров и диагностические payload туда не копируются.
+
+Для `human-review` `.caw/CAW.md` указывает OpenSSH allowed-signers файл. `human-review prepare`
+создаёт точный census плана или задачи, а `human-review accept` проверяет подпись `ssh-keygen -Y`
+в namespace `caw-review`. Подписанные JSON и signature сохраняются в Git-приватном
+`caw/human-reviews/`; любое изменение байтов плана или digest доставки инвалидирует аттестацию.

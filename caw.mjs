@@ -1247,8 +1247,8 @@ function reviewIndependence(mode, authorRole, reviewerRole) {
   const scope = authorRole === 'architect' ? 'planning' : 'task'
   if (mode === 'human-review') {
     return {
-      scope, mode, author, reviewer, satisfied: false,
-      reason: 'Automated approval is disabled; CAW has no signed human-attestation command yet.',
+      scope, mode, author, reviewer: { kind: 'human', role: reviewerRole }, satisfied: true,
+      reason: 'Automated approval is disabled; a signed human attestation is required.',
     }
   }
   const satisfied = mode === 'same-provider'
@@ -1336,8 +1336,11 @@ function preflightRuntime(f, skipRoleSmoke = false) {
     }
     for (const line of observedProbeDrift) say(line)
     for (const entry of independence) {
+      const reviewerLabel = entry.reviewer.kind === 'human'
+        ? 'signed-human-attestation'
+        : `${entry.reviewer.vendor}/${entry.reviewer.model}`
       say(`  ${entry.scope} independence: ${entry.mode} — ${entry.author.vendor}/${entry.author.model}` +
-        ` -> ${entry.reviewer.vendor}/${entry.reviewer.model}`)
+        ` -> ${reviewerLabel}`)
     }
     resolvedRuntime.printed = true
   }
@@ -4981,7 +4984,11 @@ function planIncomplete(description, out, history, problems, reason, population,
   writeSpecs(out.tasks, out.coverage)
   writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
-  say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+  if (problems.length === 1 && problems[0] === 'signed human planning review required') {
+    say(`\nPrepare the signed review: node caw.mjs human-review prepare plan <identity>`)
+  } else {
+    say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+  }
   say(`  spent ${formatAccounting(accounting)}`)
   // Non-zero: the run did not succeed, and nothing reading this script may conclude otherwise.
   process.exit(1)
@@ -5471,6 +5478,13 @@ function plan(description) {
 
     const collided = collisions(out.tasks)
     sayCollisions(collided)
+
+    if (f.planning_independence === 'human-review') {
+      planIncomplete(description, out, history,
+        ['signed human planning review required'],
+        'automated plan review is disabled by planning_independence: human-review',
+        population, planProvenance, risk)
+    }
 
     const reviewerBudgetIssue = providerBudgetIssue('plan-reviewer', f.provider_budgets)
     if (reviewerBudgetIssue) {
@@ -6699,6 +6713,9 @@ function ingest(history, rv, round, weakEvents = [], originRuntime = null) {
         evidence: (it.evidence || '').trim(),
         state: 'open',
         origin_runtime: originRuntime,
+        review_pass: it.review_pass || 1,
+        discovery: it.discovery || 'primary',
+        baseline_digest: it.baseline_digest || null,
       }
       if (slot === 'weak') item.mutation_event = weakEvents[weakIndex++]
       history.push(item)
@@ -6706,6 +6723,89 @@ function ingest(history, rv, round, weakEvents = [], originRuntime = null) {
     }
   }
   return added
+}
+
+// Reviewer passes are independent samples over one immutable delivery digest. The merge is
+// conservative: one dissent keeps a carried item open and the strongest non-met criterion wins.
+// New findings from challenger passes are retained and explicitly marked as late discoveries
+// against the same baseline; they are never silently presented as facts about a later delivery.
+function mergeReviewPasses(passes, baselineDigest) {
+  if (!Array.isArray(passes) || !passes.length) {
+    throw new TypeError('at least one review pass is required')
+  }
+  const stateRank = { met: 0, weak: 1, uncovered: 2, broken: 3 }
+  const criteriaOrder = passes[0].verdict.criteria.map((row) => row.id)
+  const criteria = criteriaOrder.map((id) => {
+    const rows = passes.map((pass) => pass.verdict.criteria.find((row) => row.id === id))
+    const state = rows.reduce((worst, row) =>
+      stateRank[row.state] > stateRank[worst] ? row.state : worst, 'met')
+    return {
+      id,
+      state,
+      evidence: rows.map((row, index) => `pass ${index + 1}: ${row.evidence}`).join('\n'),
+    }
+  })
+  const carriedIds = passes[0].verdict.carried.map((row) => row.id)
+  const carried = carriedIds.map((id) => {
+    const rows = passes.map((pass) => pass.verdict.carried.find((row) => row.id === id))
+    const states = new Set(rows.map((row) => row.state))
+    return {
+      id,
+      state: states.size === 1 ? rows[0].state : 'open',
+      evidence: rows.map((row, index) => `pass ${index + 1}: ${row.evidence}`).join('\n'),
+    }
+  })
+  const merged = { criteria, carried, broken: [], uncovered: [], weak: [], noted: [] }
+  const weakEvents = []
+  const seen = new Map()
+  for (const [passIndex, pass] of passes.entries()) {
+    for (const slot of SLOTS) {
+      for (const [itemIndex, source] of (pass.verdict[slot] || []).entries()) {
+        const item = {
+          ...source,
+          review_pass: passIndex + 1,
+          discovery: passIndex === 0 ? 'primary' : 'late-same-baseline',
+          baseline_digest: baselineDigest,
+        }
+        const key = `${slot}\0${(item.where || '').trim()}\0${(item.fix || '').trim()}`
+        if (slot !== 'weak' && seen.has(key)) {
+          const prior = seen.get(key)
+          prior.evidence = `${prior.evidence}\npass ${passIndex + 1}: ${item.evidence}`
+          continue
+        }
+        seen.set(key, item)
+        merged[slot].push(item)
+        if (slot === 'weak') weakEvents.push(pass.weakEvents[itemIndex])
+      }
+    }
+    for (const note of pass.verdict.noted || []) {
+      const tagged = passIndex === 0 ? note : `[late on ${baselineDigest.slice(0, 12)}] ${note}`
+      if (!merged.noted.includes(tagged)) merged.noted.push(tagged)
+    }
+  }
+  const weakPasses = passes.map((pass, index) => ({
+    pass: index + 1,
+    state: pass.weakVerification?.state || 'not-requested',
+    verification: pass.weakVerification,
+  }))
+  const limited = weakPasses.find((pass) => pass.state.startsWith('unverified'))
+  const weakVerification = passes.length === 1 ? passes[0].weakVerification : {
+    state: limited?.state || (weakPasses.some((pass) => pass.state === 'controlled-green')
+      ? 'controlled-green' : 'baseline-green'),
+    baseline: passes[0].weakVerification?.baseline || null,
+    controls: passes[0].weakVerification?.controls || null,
+    mutations: weakPasses.flatMap((pass) => pass.verification?.mutations || []),
+    failures: weakPasses.flatMap((pass) => pass.verification?.failures || []),
+    replay_surface: {
+      strategy: 'one-reusable-surface-per-review-pass',
+      passes: weakPasses.length,
+      surfaces_created: weakPasses.length,
+      restores: weakPasses.reduce((sum, pass) =>
+        sum + (pass.verification?.replay_surface?.restores || 0), 0),
+    },
+    passes: weakPasses,
+  }
+  return { verdict: merged, weakEvents, weakVerification }
 }
 
 // The reviewer's judgement on what this task was already holding. An item it does not mention
@@ -6751,6 +6851,10 @@ const renderItems = (items) => items
       ? `\n      origin: ${i.origin_runtime.provider}/${i.origin_runtime.requested?.model || '?'} ` +
         `runtime=${i.origin_runtime.runtime_digest?.slice(0, 12) || '?'}`
       : '\n      origin: legacy/unknown') +
+    (i.discovery === 'late-same-baseline'
+      ? `\n      discovery: challenger pass ${i.review_pass}, late on baseline ${
+          i.baseline_digest?.slice(0, 12) || '?'}`
+      : '') +
     (i.checked ? `\n      still open after the last round: ${i.checked}` : ''))
   .join('\n  - ')
 
@@ -7048,82 +7152,113 @@ function runTask(file, f, profileText, opts = {}) {
       ? '\n\nProject review policy instructions:\n\n' +
         reviewPolicy.output.instructions.map((item) => `- ${item}`).join('\n')
       : ''
-    const reviewSurface = createReviewSurface(f)
-    const weakBaseline = prepareWeakCapture(reviewSurface)
-    let rv
-    try {
-      rv = agent('reviewer', [
-        'Task spec:\n\n' + spec,
-        '\n\nProfile:\n\n' + profileText,
-        '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
-        `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
-        ' Whether it passes is settled. Judge whether it passes for the right reason.',
-        '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
-        ' and finish every row before returning. For a non-met row, the corresponding blocking',
-        ' item must quote the criterion text exactly in its evidence:\n\n' +
-          renderReviewCriteria(spec, projectCriteria),
-        projectReviewInstructions,
-        '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
-          ` baseline is commit ${weakBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
-          ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
-          ` it, force branch caw-weak-N to that commit, then reset to the baseline before the next` +
-          ` item and before returning. Do not type or return a diff: the engine derives each` +
-          ` \`git diff --binary\` from those branches, replays it from the unchanged delivery` +
-          ` baseline and runs the gate itself.`,
-        open.length
-          ? `\n\nThis is round ${round + 1} of this task. The items below are open against it:` +
-            ' an earlier verdict raised each one, and the executor has since been told to close' +
-            ' it.' +
-            (open.some((i) => i.round < round)
-              ? ' Some have been carried through more than one round.'
-              : '') +
-            '\n\n  - ' + renderItems(open) +
-            '\n\nFill `carried` with one entry per id above, and do that BEFORE looking for' +
-            ' anything new — whether the tree now satisfies what was already raised is the' +
-            ' question this round exists to answer, and an id you leave out stays open.' +
-            ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
-            ' was raised should be retracted rather than carried, and retracting your own costs' +
-            ' this task less than the executor bending the code to satisfy it.'
-          : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
-      ].join(''), SCHEMA.verdict, f, file, {
-        workingRoot: reviewSurface.workingRoot,
-        scratchRoot: reviewSurface.scratchRoot,
-        surfaceId: reviewSurface.parent.split(/[\\/]/).pop(),
-        deniedReadPaths: reviewSurface.deniedReadPaths,
-        writeBoundary: {
-          kind: REVIEW_WRITE_BOUNDARY,
-          writableRoot: reviewSurface.workingRoot,
-          deniedReadPaths: reviewSurface.deniedReadPaths,
-          readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
-        },
-      })
+    if (f.task_independence === 'human-review') {
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification)
+      die(`${file} — automated task review is disabled by task_independence: human-review.\n` +
+        `  The green-gate delivery is preserved. Prepare its signed review with:\n` +
+        `    node caw.mjs human-review prepare task ${file} <identity>`)
+    }
+    const reviewPasses = []
+    const reviewSurfaceIds = []
+    let weakBaseline = null
+    const passCount = 1 + f.review_challenger_passes
+    for (let passIndex = 0; passIndex < passCount; passIndex++) {
+      const reviewSurface = createReviewSurface(f)
+      reviewSurfaceIds.push(reviewSurface.parent.split(/[\\/]/).pop())
+      const passBaseline = prepareWeakCapture(reviewSurface)
+      weakBaseline ||= passBaseline
+      let passVerdict
       try {
-        const captured = captureWeakMutations(rv.weak, reviewSurface, weakBaseline)
-        rv.weak = captured.accepted
-        rv.noted.push(...captured.noted)
+        passVerdict = agent('reviewer', [
+          `Review pass ${passIndex + 1} of ${passCount}. ` +
+            (passIndex === 0
+              ? 'This is the primary pass.'
+              : 'This is a blind challenger pass. Do not assume the primary pass found everything.'),
+          `\n\nAll passes judge the exact delivery digest ${deliveryBaseline}.`,
+          '\n\nTask spec:\n\n' + spec,
+          '\n\nProfile:\n\n' + profileText,
+          '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
+          `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
+          ' Whether it passes is settled. Judge whether it passes for the right reason.',
+          '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
+          ' and finish every row before returning. For a non-met row, the corresponding blocking',
+          ' item must quote the criterion text exactly in its evidence:\n\n' +
+            renderReviewCriteria(spec, projectCriteria),
+          projectReviewInstructions,
+          '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
+            ` baseline is commit ${passBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
+            ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
+            ` it, force branch caw-weak-N to that commit, then reset to the baseline before the next` +
+            ` item and before returning. Do not type or return a diff: the engine derives each` +
+            ` \`git diff --binary\` from those branches, replays it from the unchanged delivery` +
+            ` baseline and runs the gate itself.`,
+          open.length
+            ? `\n\nThis is round ${round + 1} of this task. The items below are open against it:` +
+              ' an earlier verdict raised each one, and the executor has since been told to close' +
+              ' it.' +
+              (open.some((i) => i.round < round)
+                ? ' Some have been carried through more than one round.'
+                : '') +
+              '\n\n  - ' + renderItems(open) +
+              '\n\nFill `carried` with one entry per id above, and do that BEFORE looking for' +
+              ' anything new — whether the tree now satisfies what was already raised is the' +
+              ' question this round exists to answer, and an id you leave out stays open.' +
+              ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
+              ' was raised should be retracted rather than carried, and retracting your own costs' +
+              ' this task less than the executor bending the code to satisfy it.'
+            : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
+        ].join(''), SCHEMA.verdict, f, file, {
+          workingRoot: reviewSurface.workingRoot,
+          scratchRoot: reviewSurface.scratchRoot,
+          surfaceId: reviewSurfaceIds.at(-1),
+          deniedReadPaths: reviewSurface.deniedReadPaths,
+          writeBoundary: {
+            kind: REVIEW_WRITE_BOUNDARY,
+            writableRoot: reviewSurface.workingRoot,
+            deniedReadPaths: reviewSurface.deniedReadPaths,
+            readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
+          },
+        })
+        try {
+          const captured = captureWeakMutations(passVerdict.weak, reviewSurface, passBaseline)
+          passVerdict.weak = captured.accepted
+          passVerdict.noted.push(...captured.noted)
+        } catch (error) {
+          die(`${file} — invalid weak evidence: ${error?.message || error}`)
+        }
       } catch (error) {
-        die(`${file} — invalid weak evidence: ${error?.message || error}`)
+        throw error
+      } finally {
+        removeReviewSurface(reviewSurface)
       }
-    } finally {
-      removeReviewSurface(reviewSurface)
+      if (deliveryDigest() !== deliveryBaseline) {
+        die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
+      }
+      const criteriaProblem = reviewCriteriaIssue(spec, passVerdict.criteria, passVerdict,
+        projectCriteria)
+      if (criteriaProblem) schemaFailure('reviewer', '$.criteria', criteriaProblem)
+      validateCarriedSet(passVerdict.carried, open)
+      let verified
+      try { verified = verifyWeakMutations(passVerdict.weak, f, file, deliveryBaseline) }
+      catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }
+      passVerdict.weak = verified.accepted
+      passVerdict.noted.push(...verified.noted)
+      const runtime = runtimeIdentity(passVerdict)
+      runtimeHistory.push({ round: round + 1, role: 'reviewer', pass: passIndex + 1,
+        baseline_digest: deliveryBaseline, ...runtime })
+      reviewPasses.push({ verdict: passVerdict, runtime, weakEvents: verified.events,
+        weakVerification: verified.verification })
     }
-    if (deliveryDigest() !== deliveryBaseline) {
-      die(`${file} — delivery tree changed while the isolated reviewer ran; refusing the verdict`)
-    }
-    const criteriaProblem = reviewCriteriaIssue(spec, rv.criteria, rv, projectCriteria)
-    if (criteriaProblem) schemaFailure('reviewer', '$.criteria', criteriaProblem)
-    const reviewerRuntime = runtimeIdentity(rv)
-    runtimeHistory.push({ round: round + 1, role: 'reviewer', ...reviewerRuntime })
-    validateCarriedSet(rv.carried, open)
-    let weakEvents
-    try {
-      const verified = verifyWeakMutations(rv.weak, f, file, deliveryBaseline)
-      rv.weak = verified.accepted
-      rv.noted.push(...verified.noted)
-      weakEvents = verified.events
-      weakVerification = verified.verification
-    }
-    catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }
+    const mergedReview = mergeReviewPasses(reviewPasses, deliveryBaseline)
+    const rv = mergedReview.verdict
+    const weakEvents = mergedReview.weakEvents
+    weakVerification = mergedReview.weakVerification
+    const reviewerRuntime = reviewPasses.length === 1 ? reviewPasses[0].runtime
+      : reviewPasses.map((pass, index) => ({
+        pass: index + 1, baseline_digest: deliveryBaseline, ...pass.runtime,
+      }))
+    const reviewSurface = { id: reviewSurfaceIds.join(',') }
 
     // The reviewer's own sightings go where the executor's go — printed once at the end of the
     // run, carried in the commit — and they are labelled, because the commit message names who
@@ -7442,6 +7577,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
       how === 'hand' ? " — approved by `review`: no executor ran in the approving round, so the"
                        + ' code above it was written by a hand or by an earlier round this'
                        + ' pipeline did not get to judge'
+      : how === 'human' ? ' — approved by a signed human attestation'
       : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
       : ''}.`,
     // Notes and the exact spec live in the audit record above. Keeping them out of the public
@@ -7780,6 +7916,236 @@ function approveSpecs(specs) {
   }
   say(`\n${specs.length} spec(s), no holes. Ready for: node caw.mjs build`)
   say(`  spent ${formatAccounting(accounting)}`)
+}
+
+const HUMAN_REVIEW_MAX = 1024 * 1024
+
+function exactObject(value, keys, where) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) die(`${where} must be an object`)
+  const extra = Object.keys(value).filter((key) => !keys.includes(key))
+  const missing = keys.filter((key) => !Object.prototype.hasOwnProperty.call(value, key))
+  if (extra.length || missing.length) {
+    die(`${where} is malformed${extra.length ? `; unknown ${extra.join(', ')}` : ''}` +
+      `${missing.length ? `; missing ${missing.join(', ')}` : ''}`)
+  }
+}
+
+function planningLedgerFromArtifact(text) {
+  const encoded = text.match(/## Planning relation ledger[\s\S]*?```json\n([\s\S]*?)\n```/)?.[1]
+  if (!encoded) die(`${PLAN} has no readable planning relation ledger`)
+  try { return JSON.parse(encoded) }
+  catch (error) { die(`${PLAN} planning relation ledger is invalid: ${error?.message || error}`) }
+}
+
+function humanReviewSigners(f) {
+  const configured = f.human_review_allowed_signers
+  if (!configured || isAbsolute(configured) || configured.split(/[\\/]+/).includes('..')) {
+    die('.caw/CAW.md human_review_allowed_signers must name a repository-relative allowed-signers file')
+  }
+  const root = realpathSync('.')
+  const candidate = resolve(root, configured)
+  try {
+    const stat = lstatSync(candidate)
+    if (!inside(root, candidate) || !stat.isFile() || stat.isSymbolicLink()) throw new Error('not regular')
+  } catch {
+    die(`human review allowed-signers file is missing or unsafe: ${configured}`)
+  }
+  return candidate
+}
+
+function writeHumanReviewTemplate(name, value) {
+  mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
+  const path = join(LOG_DIR, name)
+  writePrivateFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), HUMAN_REVIEW_MAX)
+  say(`wrote ${path}`)
+  say(`fill every evidence field, then sign the exact file bytes:`)
+  say(`  ssh-keygen -Y sign -f <private-key> -n caw-review ${path}`)
+  say(`accept it with:`)
+  say(`  node caw.mjs human-review accept ${path} ${path}.sig`)
+}
+
+function prepareHumanReview(args) {
+  const [scope, targetOrIdentity, maybeIdentity] = args
+  const { f } = profile()
+  humanReviewSigners(f)
+  if (scope === 'plan') {
+    const identity = targetOrIdentity
+    if (f.planning_independence !== 'human-review') {
+      die('planning_independence is not human-review')
+    }
+    if (!identity || /[\r\n]/.test(identity) || !existsSync(PLAN)) {
+      die('usage: caw.mjs human-review prepare plan <identity>')
+    }
+    const text = readFileSync(PLAN, 'utf8')
+    const ledger = planningLedgerFromArtifact(text)
+    writeHumanReviewTemplate('human-review-plan.json', {
+      version: 1, scope: 'plan', identity, target: PLAN,
+      artifact_digest: createHash('sha256').update(text).digest('hex'),
+      decision: 'approve', statement: '',
+      relations: ledger.relations.map((relation) => ({
+        id: relation.id, state: 'covered', evidence: '',
+      })),
+    })
+    return
+  }
+  if (scope !== 'task') die('human-review scope must be plan or task')
+  const file = targetOrIdentity?.replace(/^(?:\.\/)?(?:\.caw-tasks\/)?/, '')
+  const identity = maybeIdentity
+  if (f.task_independence !== 'human-review') die('task_independence is not human-review')
+  if (!file || !identity || /[\r\n]/.test(identity) || !specFiles().includes(file)) {
+    die('usage: caw.mjs human-review prepare task <spec> <identity>')
+  }
+  if (!changedFiles().length) die('the delivery tree is clean — there is no task delivery to review')
+  const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
+  const coreCriteria = extractReviewCriteria(spec)
+  const reviewPolicy = runProjectPolicy('review', { spec, files: changedFiles(), criteria: coreCriteria })
+  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
+  }))
+  const resume = readRoundState(file)
+  writeHumanReviewTemplate(`human-review-${taskArtifactBase(file)}.json`, {
+    version: 1, scope: 'task', identity, target: file,
+    artifact_digest: deliveryDigest(), decision: 'approve', statement: '',
+    criteria: [...coreCriteria, ...projectCriteria].map((criterion) => ({
+      id: criterion.id, state: 'met', evidence: '',
+    })),
+    carried: openItems(resume?.history || []).map((item) => ({
+      id: item.id, state: 'closed', evidence: '',
+    })),
+  })
+}
+
+function readSignedHumanReview(attestationPath, signaturePath, f) {
+  let bytes, value, signature
+  try {
+    const stat = lstatSync(attestationPath)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > HUMAN_REVIEW_MAX) throw new Error('unsafe')
+    bytes = readFileSync(attestationPath)
+    value = JSON.parse(bytes.toString('utf8'))
+    if (typeof value.identity !== 'string' || !value.identity || value.identity.length > 256 ||
+        /[\r\n]/.test(value.identity)) throw new Error('identity is invalid')
+    const signatureStat = lstatSync(signaturePath)
+    if (!signatureStat.isFile() || signatureStat.isSymbolicLink() ||
+        signatureStat.size > HUMAN_REVIEW_MAX) throw new Error('signature is unsafe')
+    signature = readFileSync(signaturePath)
+  } catch (error) { die(`cannot read human review attestation: ${error?.message || error}`) }
+  const signers = humanReviewSigners(f)
+  const verify = spawnSync(process.env.CAW_SSH_KEYGEN || 'ssh-keygen',
+    ['-Y', 'verify', '-f', signers, '-I', value.identity || '', '-n', 'caw-review', '-s', signaturePath],
+    { input: bytes, encoding: 'utf8', timeout: 10000 })
+  if (verify.error || verify.status !== 0) {
+    die(`human review signature is invalid: ${verify.error?.message || verify.stderr || verify.stdout}`)
+  }
+  return { value, bytes, signature }
+}
+
+function retainHumanReview(value, bytes, signature) {
+  const root = resolve(execFileSync('git', ['rev-parse', '--git-path', 'caw/human-reviews'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim())
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  writePrivateFile(join(root, `${digest}.json`), bytes, HUMAN_REVIEW_MAX)
+  writePrivateFile(join(root, `${digest}.sig`), signature, HUMAN_REVIEW_MAX)
+  return { identity: value.identity, attestation_digest: digest,
+    signature_digest: createHash('sha256').update(signature).digest('hex') }
+}
+
+function acceptHumanReview(attestationPath, signaturePath) {
+  if (!attestationPath || !signaturePath) {
+    die('usage: caw.mjs human-review accept <attestation.json> <attestation.json.sig>')
+  }
+  const { f } = profile()
+  const signed = readSignedHumanReview(attestationPath, signaturePath, f)
+  const a = signed.value
+  if (a.scope === 'plan') {
+    exactObject(a, ['version', 'scope', 'identity', 'target', 'artifact_digest', 'decision',
+      'statement', 'relations'], 'human plan review')
+    if (a.version !== 1 || a.target !== PLAN || a.decision !== 'approve' || !a.statement?.trim()) {
+      die('human plan review must be version 1, approve PLAN.md, and contain a statement')
+    }
+    if (f.planning_independence !== 'human-review') die('planning_independence is not human-review')
+    const text = readFileSync(PLAN, 'utf8')
+    if (createHash('sha256').update(text).digest('hex') !== a.artifact_digest) {
+      die('PLAN.md changed after the human attestation was prepared')
+    }
+    for (const [index, row] of (a.relations || []).entries()) {
+      exactObject(row, ['id', 'state', 'evidence'], `human plan review relations[${index}]`)
+    }
+    const issue = planRelationIssue(planningLedgerFromArtifact(text), a.relations)
+    if (issue || a.relations.some((row) => row.state !== 'covered')) {
+      die(`human plan review does not approve every relation${issue ? `: ${issue}` : ''}`)
+    }
+    retainHumanReview(a, signed.bytes, signed.signature)
+    const approved = text.replace(/^approved:\s*false\s*$/m, 'approved: true')
+      .replace(/\n## Unclosed — this plan was NOT approved[\s\S]*$/, '\n')
+    writeFileSync(PLAN, approved)
+    say(`${PLAN} approved by signed human review from ${a.identity}`)
+    return
+  }
+  exactObject(a, ['version', 'scope', 'identity', 'target', 'artifact_digest', 'decision',
+    'statement', 'criteria', 'carried'], 'human task review')
+  if (a.version !== 1 || a.scope !== 'task' || a.decision !== 'approve' || !a.statement?.trim()) {
+    die('human task review must be version 1, approve one task, and contain a statement')
+  }
+  if (f.task_independence !== 'human-review') die('task_independence is not human-review')
+  const file = a.target
+  if (!specFiles().includes(file) || !changedFiles().length) die('human-reviewed task is not pending')
+  const digest = deliveryDigest()
+  if (digest !== a.artifact_digest) die('task delivery changed after the human attestation was prepared')
+  const firstGate = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms)
+  if (!firstGate.ok) {
+    const secondGate = firstGate.state === 'red'
+      ? gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms) : firstGate
+    die(`${file} — human-reviewed delivery has no current green gate (${secondGate.state})`)
+  }
+  const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
+  const coreCriteria = extractReviewCriteria(spec)
+  const reviewPolicy = runProjectPolicy('review', { spec, files: changedFiles(), criteria: coreCriteria })
+  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
+  }))
+  const verdict = { criteria: a.criteria, carried: a.carried, broken: [], uncovered: [], weak: [], noted: [] }
+  for (const [index, row] of (a.criteria || []).entries()) {
+    exactObject(row, ['id', 'state', 'evidence'], `human task review criteria[${index}]`)
+    if (!['met', 'broken', 'uncovered', 'weak'].includes(row.state)) {
+      die(`human task review criteria[${index}] has an invalid state`)
+    }
+  }
+  for (const [index, row] of (a.carried || []).entries()) {
+    exactObject(row, ['id', 'state', 'evidence'], `human task review carried[${index}]`)
+    if (!['closed', 'open', 'withdrawn'].includes(row.state)) {
+      die(`human task review carried[${index}] has an invalid state`)
+    }
+  }
+  const criteriaIssue = reviewCriteriaIssue(spec, a.criteria, verdict, projectCriteria)
+  if (criteriaIssue || a.criteria.some((row) => row.state !== 'met')) {
+    die(`human task review does not approve every criterion${criteriaIssue ? `: ${criteriaIssue}` : ''}`)
+  }
+  const resume = readRoundState(file)
+  const history = resume?.history || []
+  validateCarriedSet(a.carried, openItems(history))
+  if (a.carried.some((row) => row.state === 'open' || !row.evidence.trim())) {
+    die('human task review must settle and evidence every carried item')
+  }
+  adjudicate(history, a.carried)
+  const human = { kind: 'human', ...retainHumanReview(a, signed.bytes, signed.signature) }
+  const round = (resume?.round || 0) + 1
+  const certification = recordTaskCertification({
+    task: file, round, criteria: a.criteria, open: openItems(history),
+    author: [...(resume?.runtime_history || [])].reverse()
+      .find((entry) => entry.role === 'executor') || null,
+    reviewer: human, reviewSurface: null, reviewBaseline: null,
+    weakVerification: resume?.weak_verification || null,
+  })
+  commit(file, spec, resume?.ex || null, f, round, 0, 'human', [], digest, certification)
+}
+
+function humanReview(args) {
+  const [action, ...rest] = args
+  if (action === 'prepare') return prepareHumanReview(rest)
+  if (action === 'accept') return acceptHumanReview(...rest)
+  die('usage: caw.mjs human-review prepare plan <identity> | prepare task <spec> <identity> | accept <json> <sig>')
 }
 
 function probeProvider(providerId) {
@@ -8173,6 +8539,7 @@ if (cmd === 'probe') { probeProvider(rest[0]); return }
 if (cmd === 'smoke') { smokeRoles(rest[0]); return }
 try { projectPolicySet = readProjectPolicies() }
 catch (error) { die(error?.message || String(error)) }
+if (cmd === 'human-review') { humanReview(rest); return }
 // Pipeline and queue commands retain the all-five preflight selected in slice 2.1.
 profile()
 
@@ -8249,7 +8616,7 @@ export {
   GateFailureAction, PlanningAction, SCHEMA, addAccounting, canonicalAuthorityPaths,
   compactRunMetrics,
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
-  normalizeAccounting, planRelationIssue, planningLedger, reviewCriteriaIssue,
+  mergeReviewPasses, normalizeAccounting, planRelationIssue, planningLedger, reviewCriteriaIssue,
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,

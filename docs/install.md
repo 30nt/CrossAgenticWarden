@@ -206,12 +206,25 @@ reported. Every value is a positive integer and is checked before the next provi
 starts. Defaults are finite and appear in the distributed profile; lower them per project when
 the project needs a tighter spending boundary.
 
+`review_challenger_passes` is the number of blind passes after the primary task review: `1` gives
+two total passes and is the distributed default; the allowed range is `0..2`. Every pass costs a
+reviewer call. `require_role_smoke: true` requires exact binding evidence after any model,
+reasoning, CLI, adapter or engine change.
+
+For human independence, set `human_review_allowed_signers` to a repository-relative OpenSSH
+allowed-signers file. CAW signs no decision itself: `human-review prepare` writes the exact census,
+the reviewer fills it and signs its bytes in namespace `caw-review`, and `human-review accept`
+verifies the signature and unchanged artifact.
+
 ## Bind all five roles in `.caw/runtime.json`
 
 The runtime file is explicit and closed: `architect`, `enumerator`, `plan-reviewer`, `executor`
 and `reviewer` each name `provider`, provider-native `model`, and CAW reasoning
 `low | medium | high | max`. There are no inherited role defaults and no executable or credential
 paths in this file.
+
+Every shipped adapter declares explicit model-id selection and its supported CAW reasoning levels.
+Model ids are passed through as written; CAW does not require aliases.
 
 ### Clean machine with Claude only
 
@@ -282,6 +295,15 @@ test "$(find "$probe_dir" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' '
 
 Missing, red or evicted evidence correctly makes every pipeline command refuse before its first
 role call and print `node caw.mjs probe claude` as the recovery command.
+
+When the distributed profile keeps `require_role_smoke: true`, also run:
+
+```bash
+node caw.mjs smoke all
+```
+
+This makes one bounded call per role and stores Git-private evidence for the exact binding. Change
+one model or reasoning value and only that role's evidence becomes stale.
 
 The planning roles run with `writeScope: engine-private-only`: provider transport and scratch may
 write, but delivery may not. That scope is enforced by the probe-backed `os-boundary`; it is not an

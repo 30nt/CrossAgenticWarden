@@ -16,9 +16,9 @@
                 ▲             │
            enumerator ────────┘   (что запрос подразумевал — сказано вслепую)
 
-спека ──▶ executor ──▶ быстрый гейт ──▶ reviewer ──▶ коммит
-              ▲                            │
-              └──── открытые пункты, по id ┘   (максимум 4 раунда, затем остановка и вопрос вам)
+спека ──▶ executor ──▶ быстрый гейт ──▶ primary + challenger review ──▶ коммит
+              ▲                                       │
+              └──────── открытые пункты, по id ───────┘   (максимум 4 раунда, затем остановка)
 ```
 
 ## Правило, из которого следует остальное
@@ -44,6 +44,10 @@
 До этих слотов движок строит атомарный census из каждого пункта `## Must cover`, `## Change` и
 `## Done when`. Ревьюер обязан вернуть disposition и evidence для каждого стабильного id;
 пропущенные, повторные и неизвестные id делают ответ невалидным.
+
+По умолчанию primary и один слепой challenger-проход проверяют один и тот же digest доставки до
+следующего запуска executor. Находки объединяются консервативно. Находка только challenger получает
+метку `late-same-baseline`, а спор о старой находке оставляет её открытой.
 
 Слабость, которую никто не продемонстрировал, — не `weak`. Четвёртый слот, `noted`, никогда не
 блокирует и по нему ничего не происходит: он существует ровно затем, чтобы остальные три могли
@@ -107,7 +111,10 @@ $EDITOR .caw/runtime.json    # провайдер + модель + reasoning, д
 # 3. доказываем границу на этой машине — этот шаг стоит денег
 node caw.mjs probe claude
 
-# 4. запускаем что-то маленькое и настоящее
+# 4. проверяем точные model/reasoning-привязки всех ролей — это тоже provider-вызовы
+node caw.mjs smoke all
+
+# 5. запускаем что-то маленькое и настоящее
 mkdir -p .caw-logs
 node caw.mjs plan "<something small>" > .caw-logs/plan.log 2>&1
 ```
@@ -126,6 +133,10 @@ node caw.mjs round <spec>            # one more review round on a task that stop
 node caw.mjs review <spec>           # review a task you finished by hand, and commit it
 node caw.mjs done <spec>             # remove a spec with no review at all
 node caw.mjs probe <provider>        # write current machine-local guarantee evidence
+node caw.mjs smoke <role|all>        # verify exact model/reasoning role bindings
+node caw.mjs human-review prepare plan <identity>
+node caw.mjs human-review prepare task <spec> <identity>
+node caw.mjs human-review accept <json> <sig>
 node caw.mjs verify-project          # validate project policy extensions
 node caw.mjs artifacts list          # retained run/recovery/probe/transport artifacts
 ```
