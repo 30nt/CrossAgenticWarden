@@ -9048,6 +9048,26 @@ function writeHumanReviewTemplate(name, value) {
   say(`  node caw.mjs human-review accept ${path} ${path}.sig`)
 }
 
+// Sign the task text and resolved policy contract, not just ordinal criterion ids.
+function humanTaskContract(file, spec) {
+  const topology = extractTaskTopology(spec)
+  const reviewPolicy = runProjectPolicy('review', {
+    spec, files: changedFiles(), criteria: topology.criteria,
+  })
+  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
+  }))
+  const acceptancePolicy = runProjectPolicy('acceptance', {
+    task: file, criteria: topology.criteria, surfaces: topology.surfaces,
+    transitions: topology.transitions,
+  })
+  const acceptanceCases = acceptancePolicy?.output.cases || []
+  const contractDigest = createHash('sha256').update(stableJson({
+    spec, topology, projectCriteria, acceptanceCases,
+  })).digest('hex')
+  return { topology, projectCriteria, acceptanceCases, contractDigest }
+}
+
 function prepareHumanReview(args) {
   const [scope, targetOrIdentity, maybeIdentity] = args
   const { f } = profile()
@@ -9081,14 +9101,12 @@ function prepareHumanReview(args) {
   }
   if (!changedFiles().length) die('the delivery tree is clean — there is no task delivery to review')
   const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
-  const coreCriteria = extractReviewCriteria(spec)
-  const reviewPolicy = runProjectPolicy('review', { spec, files: changedFiles(), criteria: coreCriteria })
-  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
-    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
-  }))
+  const { topology, projectCriteria, contractDigest } = humanTaskContract(file, spec)
+  const coreCriteria = topology.criteria
   const resume = readRoundState(file)
   writeHumanReviewTemplate(`human-review-${taskArtifactBase(file)}.json`, {
-    version: 2, scope: 'task', identity, target: file,
+    version: 3, scope: 'task', identity, target: file,
+    contract_digest: contractDigest,
     artifact_digest: deliveryDigest(), decision: 'approve', statement: '',
     criteria: [...coreCriteria, ...projectCriteria].map((criterion) => ({
       id: criterion.id, state: 'met', evidence: '', evidence_refs: [],
@@ -9168,9 +9186,9 @@ function acceptHumanReview(attestationPath, signaturePath) {
     return
   }
   exactObject(a, ['version', 'scope', 'identity', 'target', 'artifact_digest', 'decision',
-    'statement', 'criteria', 'carried'], 'human task review')
-  if (a.version !== 2 || a.scope !== 'task' || a.decision !== 'approve' || !a.statement?.trim()) {
-    die('human task review must be version 2, approve one task, and contain a statement')
+    'statement', 'contract_digest', 'criteria', 'carried'], 'human task review')
+  if (a.version !== 3 || a.scope !== 'task' || a.decision !== 'approve' || !a.statement?.trim()) {
+    die('human task review must be version 3, approve one task, and contain a statement')
   }
   if (f.task_independence !== 'human-review') die('task_independence is not human-review')
   const file = a.target
@@ -9178,13 +9196,11 @@ function acceptHumanReview(attestationPath, signaturePath) {
   const digest = deliveryDigest()
   if (digest !== a.artifact_digest) die('task delivery changed after the human attestation was prepared')
   const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
-  const topology = extractTaskTopology(spec)
+  const { topology, projectCriteria, acceptanceCases, contractDigest } = humanTaskContract(file, spec)
+  if (contractDigest !== a.contract_digest) {
+    die('task contract changed after the human attestation was prepared; prepare and sign it again')
+  }
   const coreCriteria = topology.criteria
-  const acceptancePolicy = runProjectPolicy('acceptance', {
-    task: file, criteria: coreCriteria, surfaces: topology.surfaces,
-    transitions: topology.transitions,
-  })
-  const acceptanceCases = acceptancePolicy?.output.cases || []
   const gateContext = {
     task: file, kind: 'fast', deliveryDigest: digest, criteria: coreCriteria, acceptanceCases,
   }
@@ -9194,10 +9210,6 @@ function acceptHumanReview(attestationPath, signaturePath) {
       ? gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, gateContext) : firstGate
     die(`${file} — human-reviewed delivery has no current green gate (${secondGate.state})`)
   }
-  const reviewPolicy = runProjectPolicy('review', { spec, files: changedFiles(), criteria: coreCriteria })
-  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
-    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
-  }))
   const verdict = { criteria: a.criteria, carried: a.carried, broken: [], uncovered: [], weak: [], noted: [] }
   for (const [index, row] of (a.criteria || []).entries()) {
     exactObject(row, ['id', 'state', 'evidence', 'evidence_refs'], `human task review criteria[${index}]`)

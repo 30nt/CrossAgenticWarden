@@ -2549,7 +2549,7 @@ title: Human task
   assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
   const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
   const attestation = JSON.parse(readFileSync(packet, 'utf8'))
-  assert.equal(attestation.version, 2)
+  assert.equal(attestation.version, 3)
   attestation.statement = 'I reviewed the exact delivery and its gate.'
   for (const criterion of attestation.criteria) {
     criterion.evidence = 'read README and checked the criterion'
@@ -2567,6 +2567,69 @@ title: Human task
   assert.equal(audit.review.certification.reviewer.identity, 'reviewer@example')
   assert.match(audit.review.certification.reviewer.attestation_digest, /^[0-9a-f]{64}$/)
 })
+
+function signedHumanTask(options = {}, configure = () => {}) {
+  const f = fixture({ git: true, taskIndependence: 'human-review', ...options })
+  configure(f)
+  const key = join(f.parent, 'human-task-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'),
+    `reviewer@example ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const file = '001_human.md'
+  const specPath = join(f.root, '.caw-tasks', file)
+  writeFileSync(specPath, '---\ntitle: Human task\n---\n\n## Done when\n\n- README has a heading.\n')
+  writeFileSync(join(f.root, 'README.md'), '# human heading\n')
+  const prepared = run(f, ['human-review', 'prepare', 'task', file, 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed this delivery against the task contract.'
+  for (const criterion of attestation.criteria) {
+    criterion.evidence = 'read README against the requirement'
+    criterion.evidence_refs = ['repository:README.md']
+  }
+  writeFileSync(packet, `${JSON.stringify(attestation)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], { stdio: 'ignore' })
+  return { ...f, packet, key, file, specPath }
+}
+
+function acceptSignedTask(f) {
+  return run(f, ['human-review', 'accept', f.packet, `${f.packet}.sig`], [])
+}
+
+for (const change of ['requirement', 'read-section', 'project-criterion']) {
+  test(`human task signature rejects a changed ${change} with unchanged criterion ids`, () => {
+    const f = signedHumanTask({}, (f) => {
+      if (change !== 'project-criterion') return
+      // The policy resolves an external input without changing repository delivery bytes.
+      const policyInput = join(f.parent, 'criterion.txt')
+      writeFileSync(policyInput, 'No private value is logged.')
+      configureProjectPolicies(f, `
+        import { readFileSync } from 'node:fs'
+        process.stdout.write(JSON.stringify({
+          criteria: [{ id: 'privacy', section: 'Privacy', criterion: readFileSync(${JSON.stringify(policyInput)}, 'utf8') }],
+          instructions: [],
+        }))
+      `, ['review'])
+    })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    if (change === 'project-criterion') {
+      writeFileSync(join(f.parent, 'criterion.txt'), 'Every private value is logged.')
+    } else {
+      const spec = readFileSync(f.specPath, 'utf8')
+      writeFileSync(f.specPath, change === 'requirement'
+        ? spec.replace('README has a heading.', 'README has a different required heading.')
+        : spec + '\n## Read\n\n- another-contract.md\n')
+    }
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /task contract changed/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  })
+}
 
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [

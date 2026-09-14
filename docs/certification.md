@@ -68,4 +68,7 @@ For `human-review`, `.caw/CAW.md` names an OpenSSH allowed-signers file. `human-
 creates the exact plan or task census, and `human-review accept` verifies an `ssh-keygen -Y`
 signature in namespace `caw-review`. The signed JSON and signature are retained under Git-private
 `caw/human-reviews/`; any plan-byte or delivery-digest change invalidates the attestation.
-Task attestations use version 2 and require `evidence_refs` for every criterion and carried item.
+Task attestations use version 3 and require `evidence_refs` for every criterion and carried item.
+They also sign a contract digest covering the exact spec, topology, resolved project criteria and
+acceptance cases. Changing any of these requires preparing and signing a new attestation; ordinal
+criterion ids alone cannot preserve approval across a changed requirement.
