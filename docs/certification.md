@@ -68,4 +68,19 @@ For `human-review`, `.caw/CAW.md` names an OpenSSH allowed-signers file. `human-
 creates the exact plan or task census, and `human-review accept` verifies an `ssh-keygen -Y`
 signature in namespace `caw-review`. The signed JSON and signature are retained under Git-private
 `caw/human-reviews/`; any plan-byte or delivery-digest change invalidates the attestation.
-Task attestations use version 2 and require `evidence_refs` for every criterion and carried item.
+Task attestations use version 3 and require `evidence_refs` for every criterion and carried item.
+They also sign a contract digest covering the exact spec, topology, resolved project criteria and
+acceptance cases. Changing any of these requires preparing and signing a new attestation; ordinal
+criterion ids alone cannot preserve approval across a changed requirement.
+
+Signed task acceptance retains the ordinary delivery safeguards: branch protection, project gate
+policy, persisted required full-gate baseline and final full gate. A red fast gate receives the
+same provider-free confirmation and bounded policy retries; accepting a signature never invokes
+an executor to change the signed delivery.
+
+Task independence is checked against the recorded executor of the delivery, including on resume.
+Changing the current executor binding cannot make that earlier author independent of a reviewer.
+New runtime records retain vendor identity; older records use the exact original adapter digest
+when available. Strict `different-model` and `cross-vendor` modes refuse an unknown author before
+calling a reviewer. The permissive `same-provider` mode still allows hand-finished work with
+limited author provenance, and signed human review remains available.

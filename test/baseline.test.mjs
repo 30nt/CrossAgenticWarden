@@ -2549,7 +2549,7 @@ title: Human task
   assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
   const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
   const attestation = JSON.parse(readFileSync(packet, 'utf8'))
-  assert.equal(attestation.version, 2)
+  assert.equal(attestation.version, 3)
   attestation.statement = 'I reviewed the exact delivery and its gate.'
   for (const criterion of attestation.criteria) {
     criterion.evidence = 'read README and checked the criterion'
@@ -2567,6 +2567,225 @@ title: Human task
   assert.equal(audit.review.certification.reviewer.identity, 'reviewer@example')
   assert.match(audit.review.certification.reviewer.attestation_digest, /^[0-9a-f]{64}$/)
 })
+
+function signedHumanTask(options = {}, configure = () => {}) {
+  const f = fixture({ git: true, taskIndependence: 'human-review', ...options })
+  configure(f)
+  const key = join(f.parent, 'human-task-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'),
+    `reviewer@example ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const file = '001_human.md'
+  const specPath = join(f.root, '.caw-tasks', file)
+  writeFileSync(specPath, '---\ntitle: Human task\n---\n\n## Done when\n\n- README has a heading.\n')
+  writeFileSync(join(f.root, 'README.md'), '# human heading\n')
+  const prepared = run(f, ['human-review', 'prepare', 'task', file, 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed this delivery against the task contract.'
+  for (const criterion of attestation.criteria) {
+    criterion.evidence = 'read README against the requirement'
+    criterion.evidence_refs = ['repository:README.md']
+  }
+  writeFileSync(packet, `${JSON.stringify(attestation)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], { stdio: 'ignore' })
+  return { ...f, packet, key, file, specPath }
+}
+
+function acceptSignedTask(f) {
+  return run(f, ['human-review', 'accept', f.packet, `${f.packet}.sig`], [])
+}
+
+for (const change of ['requirement', 'read-section', 'project-criterion']) {
+  test(`human task signature rejects a changed ${change} with unchanged criterion ids`, () => {
+    const f = signedHumanTask({}, (f) => {
+      if (change !== 'project-criterion') return
+      // The policy resolves an external input without changing repository delivery bytes.
+      const policyInput = join(f.parent, 'criterion.txt')
+      writeFileSync(policyInput, 'No private value is logged.')
+      configureProjectPolicies(f, `
+        import { readFileSync } from 'node:fs'
+        process.stdout.write(JSON.stringify({
+          criteria: [{ id: 'privacy', section: 'Privacy', criterion: readFileSync(${JSON.stringify(policyInput)}, 'utf8') }],
+          instructions: [],
+        }))
+      `, ['review'])
+    })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    if (change === 'project-criterion') {
+      writeFileSync(join(f.parent, 'criterion.txt'), 'Every private value is logged.')
+    } else {
+      const spec = readFileSync(f.specPath, 'utf8')
+      writeFileSync(f.specPath, change === 'requirement'
+        ? spec.replace('README has a heading.', 'README has a different required heading.')
+        : spec + '\n## Read\n\n- another-contract.md\n')
+    }
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /task contract changed/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  })
+}
+
+test('signed task acceptance enforces main branch protection and stopping gate policies', () => {
+  for (const reason of ['main', 'policy']) {
+    const f = signedHumanTask({}, (f) => {
+      if (reason === 'policy') configureProjectPolicies(f,
+        `process.stdout.write(JSON.stringify({ action: 'stop', reason: 'review is not releasable' }))`,
+        ['gate'])
+    })
+    if (reason === 'main') execFileSync('git', ['branch', '-m', 'main'], { cwd: f.root })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, reason === 'main' ? /on main — branch first/ : /project gate policy .* stopped/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  }
+})
+
+for (const finalState of ['missing-baseline', 'green', 'red']) {
+  test(`signed task acceptance preserves required full gates: ${finalState}`, () => {
+    const f = signedHumanTask({ gateFull: 'exit 0' }, (f) => {
+      const statusPath = join(f.parent, 'full-status.txt')
+      const logPath = join(f.parent, 'full-log.txt')
+      writeFileSync(statusPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); fs.appendFileSync(${JSON.stringify(logPath)}, "full\\n"); process.exit(Number(fs.readFileSync(${JSON.stringify(statusPath)}, "utf8")))'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_full: exit 0', `gate_full: ${cmd}`))
+      execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+      execFileSync('git', ['commit', '-q', '-m', 'configure full gate'], { cwd: f.root })
+      configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+      const description = 'Create the fixture output'
+      const planned = run(f, ['plan', description], [
+        { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+        { envelope: envelope(plan()) }, { envelope: envelope(planReview()) },
+      ])
+      assert.equal(planned.status, 0, planned.stderr || planned.stdout)
+      if (finalState === 'missing-baseline') return
+      const stopped = run(f, ['build'], [{
+        writeFiles: { 'delivery.txt': 'implemented\n' }, envelope: envelope(delivery('Write output')),
+      }])
+      assert.equal(stopped.status, 1)
+      assert.match(stopped.stderr, /automated task review is disabled/)
+      assert.equal(JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+        .full_gate_baseline.state, 'green')
+    })
+    if (finalState === 'red') writeFileSync(join(f.parent, 'full-status.txt'), '1')
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    if (finalState === 'missing-baseline') {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /has no green full-gate baseline/)
+      assert.equal(existsSync(f.specPath), true)
+      assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+      assert.equal(existsSync(join(f.parent, 'full-log.txt')), false)
+    } else {
+      assert.equal(result.status, finalState === 'green' ? 0 : 1, result.stderr || result.stdout)
+      if (finalState === 'red') assert.match(result.stderr, /full gate is RED after a green required baseline/)
+      assert.equal(readFileSync(join(f.parent, 'full-log.txt'), 'utf8'), 'full\nfull\n')
+      assert.equal(existsSync(f.specPath), false)
+      assert.equal(latestTaskAudit(f).review.certification.population.state, 'complete')
+    }
+  })
+}
+
+for (const flaky of [false, true]) {
+  test(`signed task gates use bounded provider-free ${flaky ? 'policy retries' : 'confirmation'}`, () => {
+    const f = signedHumanTask({}, (f) => {
+      const countPath = join(f.parent, 'fast-count.txt')
+      writeFileSync(countPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); const n = Number(fs.readFileSync(${JSON.stringify(countPath)}, "utf8")) + 1; fs.writeFileSync(${JSON.stringify(countPath)}, String(n)); process.exit(${flaky ? '1' : 'n === 1 ? 1 : 0'})'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace(/^gate_fast:.*$/m, `gate_fast: ${cmd}`))
+      if (flaky) configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+    })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, flaky ? 1 : 0, result.stderr || result.stdout)
+    assert.equal(readFileSync(join(f.parent, 'fast-count.txt'), 'utf8'), flaky ? '4' : '2')
+    assert.equal(calls(f).length, 0)
+    if (!flaky) assert.equal(latestTaskAudit(f).gate.earlier_red_attempts, 1)
+    else assert.equal(existsSync(f.specPath), true)
+  })
+}
+
+function pausedAuthoredTask() {
+  const f = fixture({ git: true, taskIndependence: 'different-model', gateFast: 'exit 75' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const file = '001_resume.md'
+  writeFileSync(join(f.root, '.caw-tasks', file),
+    '---\ntitle: Resume\n---\n\n## Done when\n\n- Output exists.\n')
+  const stopped = run(f, ['build', '--no-full'], [{
+    writeFiles: { 'output.txt': 'result\n' }, envelope: envelope(delivery('Write output')),
+  }])
+  assert.equal(stopped.status, 1)
+  assert.match(stopped.stdout + stopped.stderr, /fast gate DID NOT RUN/)
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_fast: exit 75', 'gate_fast: exit 0'))
+  return { ...f, file, profilePath, statePath: join(f.root, '.caw-tasks', `.round-${file}.json`) }
+}
+
+for (const scenario of ['same-author-model', 'same-author-vendor', 'independent', 'legacy-author']) {
+  test(`resumed task independence uses its recorded author: ${scenario}`, () => {
+    const f = pausedAuthoredTask()
+    const state = JSON.parse(readFileSync(f.statePath, 'utf8'))
+    assert.equal(state.runtime_history[0].vendor, 'anthropic')
+    if (scenario === 'legacy-author') {
+      delete state.runtime_history[0].vendor
+      writeFileSync(f.statePath, JSON.stringify(state))
+    }
+    const runtimePath = join(f.root, '.caw', 'runtime.json')
+    const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+    runtime.roles.executor.model = 'opus'
+    runtime.roles.reviewer.model = scenario === 'same-author-model' ? 'sonnet' : 'opus'
+    writeFileSync(runtimePath, JSON.stringify(runtime))
+    if (scenario === 'same-author-vendor') {
+      writeFileSync(f.profilePath, readFileSync(f.profilePath, 'utf8')
+        .replace('task_independence: different-model', 'task_independence: cross-vendor'))
+    }
+    const result = run(f, ['review', f.file], [{ envelope: envelope(verdict({ criteria: [
+      { id: 'done-when-1', state: 'met', evidence: 'read output' },
+    ] })) }])
+    if (scenario.startsWith('same-author')) {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is anthropic\/sonnet/)
+      assert.equal(calls(f).filter((call) => call.role === 'reviewer').length, 0)
+      assert.equal(existsSync(f.statePath), true)
+      assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'result\n')
+    } else {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.independence.satisfied, true)
+      assert.equal(certification.independence.author.model, 'sonnet')
+      assert.equal(certification.independence.reviewer.model, 'opus')
+    }
+  })
+}
+
+for (const mode of ['same-provider', 'different-model', 'cross-vendor']) {
+  test(`review with an unknown author obeys ${mode} independence`, () => {
+    const f = fixture({ git: true, taskIndependence: mode })
+    mkdirSync(join(f.root, '.caw-tasks'))
+    writeFileSync(join(f.root, '.caw-tasks', '001_hand.md'), '---\ntitle: Hand delivery\n---\n')
+    writeFileSync(join(f.root, 'output.txt'), 'hand delivery\n')
+    const result = run(f, ['review', '001_hand.md'], [{ envelope: envelope(verdict()) }])
+    if (mode === 'same-provider') {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.state, 'limited')
+      assert.equal(certification.independence.author.model, null)
+      assert.ok(certification.limitations.includes('author-runtime-unobserved'))
+    } else {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is unknown\/unknown/)
+      assert.equal(calls(f).length, 0)
+    }
+  })
+}
 
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [
