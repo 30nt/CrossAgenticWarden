@@ -1489,7 +1489,7 @@ function compareGuarantees(role, descriptor, provider, missingEvidence = null) {
   }
 }
 
-function reviewIndependence(mode, authorRole, reviewerRole) {
+function reviewIndependence(mode, authorRole, reviewerRole, recordedAuthor = undefined) {
   const participant = (role) => {
     const binding = resolvedRuntime.value.roles[role]
     const adapter = adapters.get(binding.provider)
@@ -1500,7 +1500,15 @@ function reviewIndependence(mode, authorRole, reviewerRole) {
       model: binding.model,
     }
   }
-  const author = participant(authorRole)
+  const authorAdapter = recordedAuthor && adapters.get(recordedAuthor.provider)
+  const author = recordedAuthor === undefined ? participant(authorRole) : {
+    role: authorRole,
+    provider: recordedAuthor?.provider || null,
+    // Older records can borrow vendor identity only from the exact adapter they used.
+    vendor: recordedAuthor?.vendor || (authorAdapter?.digest === recordedAuthor?.adapter_digest
+      ? authorAdapter?.vendor : null) || null,
+    model: recordedAuthor?.requested?.model || null,
+  }
   const reviewer = participant(reviewerRole)
   const scope = authorRole === 'architect' ? 'planning' : 'task'
   if (mode === 'human-review') {
@@ -1509,13 +1517,16 @@ function reviewIndependence(mode, authorRole, reviewerRole) {
       reason: 'Automated approval is disabled; a signed human attestation is required.',
     }
   }
+  const authorKnown = Boolean(author.vendor && author.model)
   const satisfied = mode === 'same-provider'
-    || (mode === 'different-model' &&
+    || (mode === 'different-model' && authorKnown &&
       (author.vendor !== reviewer.vendor || author.model !== reviewer.model))
-    || (mode === 'cross-vendor' && author.vendor !== reviewer.vendor)
+    || (mode === 'cross-vendor' && authorKnown && author.vendor !== reviewer.vendor)
   return {
     scope, mode, author, reviewer, satisfied,
-    reason: satisfied ? '' : mode === 'cross-vendor'
+    reason: satisfied ? '' : !authorKnown
+      ? 'The recorded author is unknown; run a fresh executor round or use signed human review.'
+      : mode === 'cross-vendor'
       ? 'Select adapters owned by different vendors.'
       : 'Select a different model or a different vendor for the reviewer.',
   }
@@ -1574,7 +1585,9 @@ function preflightRuntime(f, skipRoleSmoke = false) {
   }
   const independence = [
     reviewIndependence(f.planning_independence, 'architect', 'plan-reviewer'),
-    reviewIndependence(f.task_independence, 'executor', 'reviewer'),
+    // A review-only invocation judges the saved author, resolved in runTask, not a future executor.
+    ...(providerBudgetState.command === 'review' ? []
+      : [reviewIndependence(f.task_independence, 'executor', 'reviewer')]),
   ]
   const independenceFailure = independence.find((entry) => !entry.satisfied)
   if (independenceFailure) {
@@ -4761,6 +4774,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     attempt_id: attempt.id,
     runtime_digest: resolvedRuntime.digest,
     provider: result.provider,
+    vendor: provider.adapter.vendor,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
     requested: result.requested,
@@ -7878,6 +7892,20 @@ function sayWaysOn(file) {
   say(`  Either commits the task on approval. Run build again for the rest of the queue.`)
 }
 
+function requireTaskReviewIndependence(f, author) {
+  const independence = reviewIndependence(f.task_independence, 'executor', 'reviewer', author)
+  resolvedRuntime.independence = [
+    ...(resolvedRuntime.independence || []).filter((entry) => entry.scope !== 'task'),
+    independence,
+  ]
+  if (!independence.satisfied) {
+    const label = (participant) => `${participant.vendor || 'unknown'}/${participant.model || 'unknown'}`
+    die(`task independence requires ${independence.mode}; recorded author is ` +
+      `${label(independence.author)} and reviewer is ${label(independence.reviewer)}. ` +
+      independence.reason)
+  }
+}
+
 function taskGatePolicy(file, f, g, executorRetries, confirmationRuns, projectGateRetries) {
   return runProjectPolicy('gate', {
     task: file,
@@ -8175,6 +8203,8 @@ function runTask(file, f, profileText, opts = {}) {
         `  The green-gate delivery is preserved. Prepare its signed review with:\n` +
         `    node caw.mjs human-review prepare task ${file} <identity>`)
     }
+    const authorRuntime = [...runtimeHistory].reverse().find((entry) => entry.role === 'executor') || null
+    requireTaskReviewIndependence(f, authorRuntime)
     const reviewPasses = []
     const reviewSurfaceIds = []
     const reviewDossier = buildTaskDossier({
@@ -8365,7 +8395,6 @@ function runTask(file, f, profileText, opts = {}) {
     // anything is printed about it.
     saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
       weakVerification)
-    const authorRuntime = [...runtimeHistory].reverse().find((entry) => entry.role === 'executor') || null
     const certification = recordTaskCertification({
       task: file,
       round,
@@ -9281,13 +9310,15 @@ function acceptHumanReview(attestationPath, signaturePath) {
   if (a.carried.some((row) => row.state === 'open' || !row.evidence.trim())) {
     die('human task review must settle and evidence every carried item')
   }
+  const authorRuntime = [...(resume?.runtime_history || [])].reverse()
+    .find((entry) => entry.role === 'executor') || null
+  requireTaskReviewIndependence(f, authorRuntime)
   adjudicate(history, a.carried)
   const human = { kind: 'human', ...retainHumanReview(a, signed.bytes, signed.signature) }
   const round = (resume?.round || 0) + 1
   const certification = recordTaskCertification({
     task: file, round, criteria: a.criteria, open: openItems(history),
-    author: [...(resume?.runtime_history || [])].reverse()
-      .find((entry) => entry.role === 'executor') || null,
+    author: authorRuntime,
     reviewer: human, reviewSurface: null, reviewBaseline: null,
     weakVerification: resume?.weak_verification || null,
     gateReceipt: taskGate.receipt,

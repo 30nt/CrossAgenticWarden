@@ -2713,6 +2713,80 @@ for (const flaky of [false, true]) {
   })
 }
 
+function pausedAuthoredTask() {
+  const f = fixture({ git: true, taskIndependence: 'different-model', gateFast: 'exit 75' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const file = '001_resume.md'
+  writeFileSync(join(f.root, '.caw-tasks', file),
+    '---\ntitle: Resume\n---\n\n## Done when\n\n- Output exists.\n')
+  const stopped = run(f, ['build', '--no-full'], [{
+    writeFiles: { 'output.txt': 'result\n' }, envelope: envelope(delivery('Write output')),
+  }])
+  assert.equal(stopped.status, 1)
+  assert.match(stopped.stdout + stopped.stderr, /fast gate DID NOT RUN/)
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_fast: exit 75', 'gate_fast: exit 0'))
+  return { ...f, file, profilePath, statePath: join(f.root, '.caw-tasks', `.round-${file}.json`) }
+}
+
+for (const scenario of ['same-author-model', 'same-author-vendor', 'independent', 'legacy-author']) {
+  test(`resumed task independence uses its recorded author: ${scenario}`, () => {
+    const f = pausedAuthoredTask()
+    const state = JSON.parse(readFileSync(f.statePath, 'utf8'))
+    assert.equal(state.runtime_history[0].vendor, 'anthropic')
+    if (scenario === 'legacy-author') {
+      delete state.runtime_history[0].vendor
+      writeFileSync(f.statePath, JSON.stringify(state))
+    }
+    const runtimePath = join(f.root, '.caw', 'runtime.json')
+    const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+    runtime.roles.executor.model = 'opus'
+    runtime.roles.reviewer.model = scenario === 'same-author-model' ? 'sonnet' : 'opus'
+    writeFileSync(runtimePath, JSON.stringify(runtime))
+    if (scenario === 'same-author-vendor') {
+      writeFileSync(f.profilePath, readFileSync(f.profilePath, 'utf8')
+        .replace('task_independence: different-model', 'task_independence: cross-vendor'))
+    }
+    const result = run(f, ['review', f.file], [{ envelope: envelope(verdict({ criteria: [
+      { id: 'done-when-1', state: 'met', evidence: 'read output' },
+    ] })) }])
+    if (scenario.startsWith('same-author')) {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is anthropic\/sonnet/)
+      assert.equal(calls(f).filter((call) => call.role === 'reviewer').length, 0)
+      assert.equal(existsSync(f.statePath), true)
+      assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'result\n')
+    } else {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.independence.satisfied, true)
+      assert.equal(certification.independence.author.model, 'sonnet')
+      assert.equal(certification.independence.reviewer.model, 'opus')
+    }
+  })
+}
+
+for (const mode of ['same-provider', 'different-model', 'cross-vendor']) {
+  test(`review with an unknown author obeys ${mode} independence`, () => {
+    const f = fixture({ git: true, taskIndependence: mode })
+    mkdirSync(join(f.root, '.caw-tasks'))
+    writeFileSync(join(f.root, '.caw-tasks', '001_hand.md'), '---\ntitle: Hand delivery\n---\n')
+    writeFileSync(join(f.root, 'output.txt'), 'hand delivery\n')
+    const result = run(f, ['review', '001_hand.md'], [{ envelope: envelope(verdict()) }])
+    if (mode === 'same-provider') {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.state, 'limited')
+      assert.equal(certification.independence.author.model, null)
+      assert.ok(certification.limitations.includes('author-runtime-unobserved'))
+    } else {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is unknown\/unknown/)
+      assert.equal(calls(f).length, 0)
+    }
+  })
+}
+
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [
     ['unknown document field', (v) => { v.fallback = 'claude' }, /unknown field.*fallback/],
