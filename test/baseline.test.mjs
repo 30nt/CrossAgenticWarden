@@ -108,7 +108,7 @@ const envelope = (value, overrides = {}) => ({
   },
 })
 
-const population = (cases = []) => ({ cases })
+const population = (cases = [], requestIssues = []) => ({ cases, request_issues: requestIssues })
 const requestSource = (excerpt, occurrence = 1) => ({ kind: 'request', excerpt, occurrence })
 const plan = () => ({
   tasks: [{
@@ -126,8 +126,8 @@ const planReview = () => ({
   uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [],
 })
 const delivery = (summary) => ({ summary, notes: [], blocked: '' })
-const verdict = ({ carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) =>
-  ({ carried, broken, uncovered, weak, noted })
+const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) =>
+  ({ criteria, carried, broken, uncovered, weak, noted })
 
 test('JavaScript provider paths use the current Node executable on every platform', () => {
   for (const platformName of ['darwin', 'linux', 'win32']) {
@@ -1079,6 +1079,29 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.equal(existsSync(runPath), false)
 })
 
+test('request preflight stops after enumerator and before architect', () => {
+  const f = fixture({ git: true })
+  const issue = {
+    issue: 'The request conflicts with project authority.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: '.caw/CAW.md', occurrence: 1, excerpt: '# CAW profile',
+    }],
+  }
+
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.deepEqual(calls(f).map((call) => call.role), ['enumerator'])
+  assert.match(result.stdout, /request preflight stopped before architect; 1 issue/)
+  assert.match(result.stdout, /request#1/)
+  assert.match(result.stdout, /\.caw\/CAW\.md:/)
+  assert.match(result.stderr, /No architect or plan-reviewer call ran/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
+})
+
 test('non-executable JavaScript provider fixture runs through Node for version and roles', () => {
   const f = fixture({ git: true })
   const providerScript = join(f.parent, 'provider-without-exec-bit.mjs')
@@ -1157,7 +1180,10 @@ test('Codex executor uses file transport and returns the canonical result throug
 
   result = run(f, ['build', '--no-full'], [
     { role: 'executor', value: delivery('written by Codex'), writeFiles: { 'output.txt': 'done\n' } },
-    { role: 'reviewer', envelope: envelope(verdict()) },
+    { role: 'reviewer', envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced the fixture output case' },
+      { id: 'done-when-1', state: 'met', evidence: 'traced the output and its gate' },
+    ] })) },
   ])
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'done\n')
@@ -2196,14 +2222,17 @@ title: Baseline task
 
 - The fixture output exists.
 `)
+  const criteria = [{
+    id: 'done-when-1', state: 'met', evidence: 'traced the fixture output and its gate',
+  }]
 
   const first = run(f, ['build', '--no-full'], [
     { writeFiles: { 'src/output.txt': 'round one\n' }, envelope: envelope(delivery('first pass')) },
-    { recordReviewProbe: true, envelope: envelope(verdict({ broken: [{
+    { recordReviewProbe: true, envelope: envelope(verdict({ criteria, broken: [{
       where: 'src/output.txt:1', fix: 'write the final value', evidence: 'read round one',
     }] })) },
     { writeFiles: { 'src/output.txt': 'round two\n' }, envelope: envelope(delivery('second pass')) },
-    { recordReviewProbe: true, envelope: envelope(verdict({ carried: [{
+    { recordReviewProbe: true, envelope: envelope(verdict({ criteria, carried: [{
       id: 'r1.1', state: 'open', evidence: 'the final value is still absent',
     }] })) },
   ])
@@ -2244,7 +2273,7 @@ title: Baseline task
   changedRuntime.roles.reviewer.reasoning = 'medium'
   writeFileSync(runtimePath, `${JSON.stringify(changedRuntime, null, 2)}\n`)
 
-  const unpricedReview = envelope(verdict({ carried: [{
+  const unpricedReview = envelope(verdict({ criteria, carried: [{
     id: 'r1.1', state: 'closed', evidence: 'read final',
   }] }))
   delete unpricedReview.total_cost_usd
@@ -2346,21 +2375,21 @@ test('fake provider can expose malformed output and structured failures without 
 test('engine structural validation rejects missing, mistyped, and unknown canonical fields', () => {
   const mistyped = fixture()
   const wrongArray = run(mistyped, ['plan', 'x'], [
-    { envelope: envelope({ cases: 'not-an-array' }) },
+    { envelope: envelope({ cases: 'not-an-array', request_issues: [] }) },
   ])
   assert.equal(wrongArray.status, 1)
   assert.match(wrongArray.stderr, /invalid canonical output at \$\.cases: expected array/)
 
   const missing = fixture()
   const missingSource = run(missing, ['plan', 'x'], [
-    { envelope: envelope({ cases: [{ case: 'one' }] }) },
+    { envelope: envelope({ cases: [{ case: 'one' }], request_issues: [] }) },
   ])
   assert.equal(missingSource.status, 1)
   assert.match(missingSource.stderr, /\$\.cases\[0\]\.source: required field is missing/)
 
   const unknown = fixture()
   const extra = run(unknown, ['plan', 'x'], [
-    { envelope: envelope({ cases: [], provider_only: true }) },
+    { envelope: envelope({ cases: [], request_issues: [], provider_only: true }) },
   ])
   assert.equal(extra.status, 1)
   assert.match(extra.stderr, /\$\.provider_only: unknown field/)
@@ -2494,7 +2523,10 @@ test('weak canonical values without a mutation object fail before history ingest
 test('oversized successful final values are rejected instead of truncated and consumed', () => {
   const f = fixture()
   const result = run(f, ['plan', 'x'], [{
-    envelope: envelope({ cases: [{ case: 'x'.repeat(4 * 1024 * 1024), source: 'request' }] }),
+    envelope: envelope({
+      cases: [{ case: 'x'.repeat(4 * 1024 * 1024), source: 'request' }],
+      request_issues: [],
+    }),
   }])
   assert.equal(result.status, 1)
   assert.match(result.stderr, /final canonical value is .* limit is 4194304/)
@@ -2571,7 +2603,9 @@ title: Baseline task
     },
     ignoreWriteErrors: true,
     recordReviewProbe: true,
-    envelope: envelope(verdict()),
+    envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'traced the intended output and its gate',
+    }] })),
   }])
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
@@ -2629,7 +2663,9 @@ title: Baseline task
   writeFileSync(join(f.root, '.env'), 'SECRET=delivery-only\n')
 
   const result = run(f, ['review', '001_baseline-task.md'], [{
-    envelope: envelope(verdict({ weak: [
+    envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'traced the delivery review path',
+    }], weak: [
       {
         where: 'README.md:1',
         fix: 'make the gate observe the fixture heading',

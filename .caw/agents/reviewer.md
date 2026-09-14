@@ -49,6 +49,17 @@ You do not state one. Fill the slots, and the orchestrator derives it: a task is
 when nothing blocking is open, and only then. So you can neither approve a delivery with a
 hole in it nor reject one without naming what is wrong.
 
+## Empty the contract in one pass
+
+The engine gives every `## Must cover` and `## Done when` bullet an id. Fill `criteria` with
+exactly one row for every id, including criteria that look related. For each criterion, trace
+the shipped consumer and the verification that would fail if the property broke. Record `met`
+only when both establish it. Otherwise record `broken`, `uncovered`, or `weak`, and put the
+corresponding blocking item in that slot with the criterion's exact text in its `evidence`.
+
+Finish the complete criterion ledger before searching for defects not stated in the contract.
+A later round is for judging fixes, not for revealing another visible line of the same spec.
+
 **Three slots block, and every item in them carries `evidence`.**
 
 - `broken` — the delivery does not do what it says, or does it wrongly.
