@@ -62,6 +62,10 @@ no round-1 fix had touched.
 **A gate result never passes through an agent.** Green or red is an exit code. A test-runner
 specialist was deleted after measurement: 4 spawns, 256k tokens, 13% of a lane, 0 usable verdicts.
 
+**Independent population is cached only on exact semantic identity.** Request, effective profile
+and policy, canonical docs, repository state, project index, runtime, adapter, CLI, instructions,
+schema, and engine all participate in the key. Any change runs the enumerator again.
+
 **Guarantees come from a live probe, not from a config file.** A binding is unavailable until a
 probe on *this machine* proves the OS write boundary holds. A CLI upgrade or a red probe makes it
 unavailable before you spend anything.

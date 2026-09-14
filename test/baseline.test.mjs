@@ -1144,6 +1144,64 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.equal(existsSync(runPath), false)
 })
 
+test('population cache reuses exact inputs and misses after canonical authority changes', () => {
+  const f = fixture({ git: true })
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, `${readFileSync(profilePath, 'utf8')}\n## Canonical docs\n\n- CANONICAL.md\n`)
+  writeFileSync(join(f.root, 'CANONICAL.md'), 'The fixture output is required.\n')
+  execFileSync('git', ['add', '.caw/CAW.md', 'CANONICAL.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add canonical authority'], { cwd: f.root })
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['plan-reviewer'])
+  let manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  const hit = manifests.find((manifest) => manifest.population_cache?.state === 'hit')
+  assert.ok(hit)
+  assert.match(hit.population_cache.inputs.repository.head, /^[0-9a-f]{40}$/)
+  assert.match(hit.population_cache.inputs.repository.delivery_digest, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.canonical_authority
+    .find(({ path }) => path === 'CANONICAL.md').sha256, /^[0-9a-f]{64}$/)
+  assert.equal(hit.population_cache.inputs.runtime.provider, 'test-claude')
+  assert.match(hit.population_cache.inputs.runtime.adapter_digest, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.instructions_sha256, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.schema_sha256, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.engine_sha256, /^[0-9a-f]{64}$/)
+
+  writeFileSync(join(f.root, 'CANONICAL.md'), 'The fixture output and audit marker are required.\n')
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.doesNotMatch(result.stdout, /population cache hit/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator', 'plan-reviewer'])
+  manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  assert.equal(manifests.some((manifest) =>
+    manifest.population_cache?.state === 'miss' && manifest.population_cache?.stored === true), true)
+})
+
 test('request preflight stops after enumerator and before architect', () => {
   const f = fixture({ git: true })
   const issue = {
@@ -3353,7 +3411,21 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
     await new Promise((done) => setTimeout(done, 20))
   }
   assert.equal(appeared, true)
-  await new Promise((done) => setTimeout(done, 150))
+  let runName = null
+  for (let attempt = 0; attempt < 150; attempt++) {
+    if (existsSync(join(f.root, '.caw-logs'))) {
+      runName = readdirSync(join(f.root, '.caw-logs')).find((name) => {
+        if (!name.startsWith('run-')) return false
+        try {
+          return JSON.parse(readFileSync(
+            join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')).calls.length === 1
+        } catch { return false }
+      }) || null
+    }
+    if (runName) break
+    await new Promise((done) => setTimeout(done, 20))
+  }
+  assert.ok(runName, 'reviewer provider attempt did not start before SIGINT')
   process.kill(-child.pid, 'SIGINT')
   const exit = await new Promise((done) => child.once('exit', (code, signal) => done({ code, signal })))
   assert.equal([1, 130].includes(exit.code), true)
@@ -3361,7 +3433,6 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
   assert.equal(retained.length, 1)
   assert.equal(JSON.parse(readFileSync(
     join(REVIEW_SURFACE_PARENT, retained[0], 'manifest.json'), 'utf8')).state, 'interrupted')
-  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const runManifest = JSON.parse(readFileSync(
     join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.equal(runManifest.calls.length, 1)

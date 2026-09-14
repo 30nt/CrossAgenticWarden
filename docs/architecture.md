@@ -51,6 +51,10 @@ the entire surface.
 
 The enumerator is deliberately blind: it is asked what the request implies *before* it can be
 shaped by the plan, so its list is a check on the architect rather than an echo of it.
+Its canonical response is cached in Git-private state. Reuse requires one exact digest over the
+request, effective profile and policy, canonical authorities, repository state, project index,
+runtime, adapter, CLI, role instructions, schema, and engine. A mismatch causes a normal cache
+miss; every hit or miss is written to the run manifest.
 
 The reviewer states no verdict. Before the call, the engine gives every `Must cover`, `Change`,
 and `Done when` bullet a stable id. The reviewer must return exactly one evidenced disposition
