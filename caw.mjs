@@ -1943,6 +1943,10 @@ function profile(preflight = true) {
     }
     f[key] = ms
   }
+  f.index_format = f.index_format || 'text-v0'
+  if (!['text-v0', 'json-v1'].includes(f.index_format)) {
+    die(`.caw/CAW.md index_format must be text-v0 or json-v1 — got "${f.index_format}"`)
+  }
   legacyQueueRefusal()
   if (preflight) preflightRuntime(f)
   return { f, text }
@@ -3048,33 +3052,120 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null) {
 //     set in front of a role that is about to be told the set is closed, which is worse than
 //     no index at all — the one failure this whole mechanism exists to prevent.
 const INDEX_MAX = 60_000 // ~15k tokens, against profiles that run 12-17 KB. Cached, so paid once.
+const INDEX_JSON_MAX = 1024 * 1024
+const INDEX_SET_MAX = 128
+const INDEX_MEMBER_MAX = 20_000
 
-function index(cmd) {
-  if (!cmd) return { text: '', truncated: 0, sha256: null }
+function structuredIndex(raw) {
+  if (Buffer.byteLength(raw) > INDEX_JSON_MAX) {
+    die(`project index json-v1 exceeds ${INDEX_JSON_MAX} bytes. No provider call ran.`)
+  }
+  let value
+  try { value = JSON.parse(raw) }
+  catch (error) { die(`project index json-v1 is invalid JSON: ${error.message}. No provider call ran.`) }
+  try {
+    exactObjectKeys(value, ['api_version', 'sets'], 'project index')
+    if (value.api_version !== 1) throw new Error('project index api_version must be 1')
+    if (!Array.isArray(value.sets) || value.sets.length > INDEX_SET_MAX) {
+      throw new Error(`project index sets must be an array with at most ${INDEX_SET_MAX} entries`)
+    }
+    const ids = new Set()
+    let memberCount = 0
+    for (const [index, set] of value.sets.entries()) {
+      const label = `project index sets[${index}]`
+      exactObjectKeys(set, ['id', 'label', 'source', 'members'], label)
+      if (typeof set.id !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(set.id)) {
+        throw new Error(`${label}.id is invalid`)
+      }
+      if (ids.has(set.id)) throw new Error(`${label}.id duplicates ${JSON.stringify(set.id)}`)
+      ids.add(set.id)
+      for (const key of ['label', 'source']) {
+        if (typeof set[key] !== 'string' || !set[key].trim() || Buffer.byteLength(set[key]) > 2000) {
+          throw new Error(`${label}.${key} must be a non-empty string of at most 2000 bytes`)
+        }
+      }
+      if (!Array.isArray(set.members)) throw new Error(`${label}.members must be an array`)
+      const members = new Set()
+      for (const [memberIndex, member] of set.members.entries()) {
+        if (typeof member !== 'string' || !member.trim() || Buffer.byteLength(member) > 8000) {
+          throw new Error(`${label}.members[${memberIndex}] must be a non-empty string of at most 8000 bytes`)
+        }
+        if (members.has(member)) {
+          throw new Error(`${label}.members[${memberIndex}] duplicates an earlier member`)
+        }
+        members.add(member)
+      }
+      memberCount += set.members.length
+      if (memberCount > INDEX_MEMBER_MAX) {
+        throw new Error(`project index has more than ${INDEX_MEMBER_MAX} members`)
+      }
+    }
+  } catch (error) {
+    die(`${error.message}. No provider call ran.`)
+  }
+  const text = value.sets.map((set) => [
+    `## [${set.id}] ${set.label.trim()}`,
+    `Source: ${set.source.trim()}`,
+    ...set.members.map((member) => `- ${member.trim()}`),
+  ].join('\n')).join('\n\n')
+  if (text.length > INDEX_MAX) {
+    die(`project index json-v1 renders to ${text.length} chars; limit is ${INDEX_MAX}. ` +
+      'A structured closed set cannot be truncated. No provider call ran.')
+  }
+  if (!text) {
+    say('  project index json-v1 contains no sets')
+    return { text: '', truncated: 0, sha256: null, format: 'json-v1', apiVersion: 1 }
+  }
+  say(`  project index json-v1: ${value.sets.length} set(s), ${text.length} chars`)
+  return {
+    text, truncated: 0, sha256: createHash('sha256').update(text).digest('hex'),
+    format: 'json-v1', apiVersion: 1,
+  }
+}
+
+function index(cmd, format = 'text-v0') {
+  if (!cmd) return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   const r = spawnSync('bash', ['-lc', cmd], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (r.error) {
+    if (format === 'json-v1') {
+      die(`project index json-v1 could not run: ${r.error.message}. No provider call ran.`)
+    }
     say(`  index_cmd could not run (${r.error.message}) — enumerating without it`)
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
   if (r.status !== 0) {
+    if (format === 'json-v1') {
+      die(`project index json-v1 exited ${r.status}. No provider call ran. Its last words:\n` +
+        `  ${(`${r.stderr || ''}${r.stdout || ''}`).trim().split('\n').slice(-3).join('\n  ')}`)
+    }
     say(`  index_cmd exited ${r.status} — enumerating without it. Its last words:\n` +
         `    ${(`${r.stderr || ''}${r.stdout || ''}`).trim().split('\n').slice(-3).join('\n    ')}`)
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
   const out = (r.stdout || '').trim()
   if (!out) {
+    if (format === 'json-v1') {
+      die('project index json-v1 printed nothing. No provider call ran.')
+    }
     say('  index_cmd printed nothing — enumerating without it')
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
+  if (format === 'json-v1') return structuredIndex(out)
   if (out.length > INDEX_MAX) {
     const dropped = out.length - INDEX_MAX
     say(`  index_cmd printed ${out.length} chars, ${dropped} of them DROPPED (cap ${INDEX_MAX}). ` +
         `The sets are cut and the enumerator is told so.`)
     const text = out.slice(0, INDEX_MAX)
-    return { text, truncated: dropped, sha256: createHash('sha256').update(text).digest('hex') }
+    return {
+      text, truncated: dropped, sha256: createHash('sha256').update(text).digest('hex'),
+      format, apiVersion: null,
+    }
   }
   say(`  index_cmd: ${out.length} chars`)
-  return { text: out, truncated: 0, sha256: createHash('sha256').update(out).digest('hex') }
+  return {
+    text: out, truncated: 0, sha256: createHash('sha256').update(out).digest('hex'),
+    format, apiVersion: null,
+  }
 }
 
 // The wording that goes with it, kept next to the reader for the same reason populationBlock()
@@ -3721,7 +3812,7 @@ function planIncomplete(description, out, history, problems, reason, population,
 // rate on every call for nothing. The order is load-bearing for the mechanism, not for the
 // price. The unmeasured residual above still applies, to this role alone.
 function enumerate(description, text, f) {
-  const indexResult = index(f.index_cmd)
+  const indexResult = index(f.index_cmd, f.index_format)
   const p = agent('enumerator', [
     'Profile:\n\n' + text,
     indexBlock(indexResult),

@@ -72,6 +72,30 @@ list **in full**: every member of an enum, every caller of a function, every mig
 route, every numbered section of a specification against the files that cite it. What does not
 belong is anything you cannot close — a summary, an architectural overview, advice.
 
+New profiles set `index_format: json-v1`. The command must print one strict object:
+
+```json
+{
+  "api_version": 1,
+  "sets": [
+    {
+      "id": "public-routes",
+      "label": "Public HTTP routes",
+      "source": "scripts/project-index.mjs",
+      "members": ["GET /health", "POST /orders"]
+    }
+  ]
+}
+```
+
+Set ids and members must be unique inside their scope. Unknown fields, malformed output,
+duplicate ids or members, non-zero exit, oversized output, and a rendered index above the prompt
+cap stop planning before a provider call. CAW never truncates a structured closed set.
+
+Profiles installed before this contract and lacking `index_format` keep `text-v0`: their stdout
+is passed as before, and command failure stays non-fatal. Set `index_format: json-v1` only after
+the command emits the object above.
+
 **A set may only be drawn from what the project says it MUST do, never from what it records
 having done.** An archive of finished tasks carries section numbers exactly like a
 specification does, and no pattern tells them apart — one clone read 252 numbered references
@@ -100,8 +124,8 @@ on one project returned 22 where the real number was 90, and its own commit mess
 A script that quietly under-reports is worse than no script, because the enumerator is about to
 be told the set is closed.
 
-Failure is never fatal. No command, an empty print, a non-zero exit — the run says so and
-enumerates as it always has. Output above the cap is truncated, the run says how much was
-dropped, and the enumerator is told it may not treat any set in there as closed. A visible index
-member can still be cited with the exact digest, line range and excerpt; the model never turns that
-address into a global completeness claim.
+In legacy `text-v0`, failure remains non-fatal. No command, an empty print, or a non-zero exit
+makes the run enumerate as it always has. Output above the cap is truncated, the run says how much
+was dropped, and the enumerator is told it may not treat any set in there as closed. In both
+formats a visible index member can still be cited with the exact digest, line range and excerpt;
+the model never turns that address into a global completeness claim.
