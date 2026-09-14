@@ -70,6 +70,19 @@ no round-1 fix had touched.
 **A gate result never passes through an agent.** Green or red is an exit code. A test-runner
 specialist was deleted after measurement: 4 spawns, 256k tokens, 13% of a lane, 0 usable verdicts.
 
+The gate result now has an engine-owned receipt. It binds the command, status, duration, bounded
+output and validated artifact digests to the exact delivery digest. Executor checks are separate
+structured claims and remain untrusted. A reviewer sees both in a bounded task dossier instead of
+receiving the whole accumulated conversation by default; it can still read the repository.
+
+Findings carry stable criterion, surface, transition and property links. Exact root-cause keys are
+presented to the executor as one work package while every original pass observation and its
+provenance remains in history. Similar wording alone never merges findings.
+
+Projects can opt into an API-v3 [acceptance matrix](docs/project-policies.md) without editing CAW
+core. The project owns its consumers, scenarios, observables, mutations, evidence kinds and
+selectors; CAW validates completeness and the gate evidence transport.
+
 **Independent population is cached only on exact semantic identity.** Request, effective profile
 and policy, canonical docs, repository state, project index, runtime, adapter, CLI, instructions,
 schema, and engine all participate in the key. Any change runs the enumerator again.

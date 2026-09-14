@@ -48,6 +48,10 @@ the build range. API v2 gate policies may classify a project-allowlisted flaky f
 engine retains the confirmation and retry cap.
 Required baseline caching is also project-aware: the engine hashes every input it owns and reuses
 a result only when a v2 gate policy supplies the matching digest for external inputs.
+API v3 adds an optional acceptance stage. The project maps each task's engine criteria, surfaces
+and transitions to its own production consumers, scenarios, observables, mutations, evidence
+kinds and selectors. The engine validates completeness and requires matching gate evidence, while
+the domain-specific matrix remains outside core.
 
 ## The five roles
 
@@ -84,6 +88,16 @@ the script derives approval from whether anything blocking is open. From round 2
 own open items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An
 id it omits stays open.
 
+Executor and reviewer prompts start from a bounded task dossier. Each section has its own byte cap,
+digest and truncation marker; the total is capped too. It contains the contract, changed files,
+bounded diff, grouped open findings, executor claims, acceptance cases and gate receipt. This
+limits repeated context without removing repository read access.
+
+Executor checks are structured but untrusted claims. The gate runs with engine-provided private
+manifest and artifact paths. CAW validates links, paths, kinds and bounds, hashes accepted files,
+and creates a receipt bound to the delivery digest. Reviewer evidence references distinguish that
+receipt from claims and from direct repository or isolated-surface experiments.
+
 An open carried item whose saved evidence quotes a criterion supports that criterion's non-met
 state without becoming a duplicate new finding. If a schema-valid reviewer response is
 semantically inconsistent with either ledger, the engine restores the same review baseline and
@@ -94,6 +108,11 @@ A review round contains one primary pass plus `review_challenger_passes` blind c
 surface. The engine merges their census rows and findings before another executor can run.
 Disagreement keeps a carried item open; challenger-only findings are labelled
 `late-same-baseline` with that digest.
+
+Each finding names criterion, surface and transition ids plus a stable property key. CAW retains
+every pass observation and groups only an exact match of those fields into one executor work
+package. This preserves provenance and prevents text similarity or a shared file from collapsing
+different defects.
 
 The derived result is retained as a [certification record](certification.md). Acceptance and full
 certification are separate states: missing independent population or unavailable verification is

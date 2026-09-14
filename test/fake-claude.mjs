@@ -52,7 +52,8 @@ const semanticRepairMatch = role === 'reviewer'
   ? input.match(/^Semantic repair (\d+) for review pass (\d+) of \d+\./)
   : null
 const reviewPass = role === 'reviewer'
-  ? Number(semanticRepairMatch?.[2] || input.match(/^Review pass (\d+) of \d+\./)?.[1] || 1)
+  ? Number(semanticRepairMatch?.[2] ||
+      input.match(/(?:^|\n\n)Review pass (\d+) of \d+\./)?.[1] || 1)
   : 1
 const semanticRepair = Number(semanticRepairMatch?.[1] || 0)
 const matching = queue.map((entry, index) => belongsTo(entry) ? index : -1).filter((index) => index >= 0)

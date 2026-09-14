@@ -22,9 +22,11 @@ Create `.caw/project/manifest.json`:
 }
 ```
 
-The admitted stages are `planning`, `review`, `gate`, and `commit`. API version 1 remains the
+The admitted stages are `planning`, `review`, `gate`, `commit`, and, in API v3,
+`acceptance`. API version 1 remains the
 single-pass contract below. API version 2 adds risk-aware two-phase planning and a bounded flaky
-retry decision to the gate contract; review and commit keep their version-1 output shapes. Unknown
+retry decision to the gate contract. API version 3 keeps those contracts and adds the project
+acceptance matrix; review and commit keep their version-1 output shapes. Unknown
 fields, unknown stages, symlinks, oversized policy trees, invalid commands, and timeouts are refused.
 
 ## Protocol
@@ -126,6 +128,48 @@ retry, and the engine allows at most two policy retries for one delivery. No exe
 them. If the gate stays red, the normal bounded executor/review flow resumes. The allowlist and
 classification rules live in project policy code; the run record stores every decision.
 
+## Acceptance matrix (API v3)
+
+Set `api_version` to `3` and optionally configure an `acceptance` stage. CAW calls it once per
+task before the executor. Its context contains the task id and engine-parsed `criteria`,
+`surfaces`, and `transitions`.
+
+Return `{"cases":[]}`. Each case has:
+
+- a stable lowercase `id` and one or more `criterion_ids`;
+- a known `surface_id` and an optional known `transition_id`;
+- `production_consumer`, `scenario`, `observable`, and `mutation`;
+- a lowercase `evidence_kind` and a stable `selector`.
+
+When this stage is configured, every criterion and every declared transition must be covered.
+Unknown ids, duplicate ids, cross-surface transitions, empty dimensions, and incomplete matrices
+are refused before the executor.
+
+The fast gate receives `CAW_GATE_EVIDENCE_OUT` and `CAW_GATE_ARTIFACTS_DIR`. It may write a
+version-1 JSON manifest to the first path:
+
+```json
+{
+  "version": 1,
+  "checks": [{
+    "id": "language-switch",
+    "criterion_ids": ["done-when-1"],
+    "acceptance_case_ids": ["ui-language-switch"],
+    "selector": "settings.language",
+    "evidence_kind": "xcui-result",
+    "state": "passed",
+    "summary": "mounted consumer changed language",
+    "artifacts": [{"id": "result-bundle", "path": "result.xcresult.zip"}]
+  }]
+}
+```
+
+Artifact paths are relative to `CAW_GATE_ARTIFACTS_DIR`. CAW rejects traversal, symlinks,
+non-regular files, unknown links, wrong evidence kinds or selectors, duplicate ids, and bounded-size
+violations. It hashes and privately retains accepted artifacts. A green gate with an acceptance
+matrix must contain a passed check for every case; otherwise CAW refuses the evidence before the
+reviewer.
+
 Policy commands run in a private temporary working directory with a reduced environment. CAW
 checks that the delivery, HEAD, CAW files, policy files, and task queue did not change. This is a
 side-effect check, not an OS security boundary: policies are trusted project code, like the
@@ -139,6 +183,7 @@ node caw.mjs verify-project
 
 This executes every configured stage with a verification input and validates its output. API v2
 planning is checked in both phases; its gate policy is also checked for ordinary gate and baseline
-input phases. Normal run records contain the manifest digest, every policy digest, duration,
+input phases. API v3 also checks matrix completeness and references. Normal run records contain
+the manifest digest, every policy digest, duration,
 stage, and result. Saved task state records the policy set and reports divergence after a policy
 change.

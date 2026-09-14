@@ -169,6 +169,75 @@ process.stdout.write(JSON.stringify({
   assert.match(wrongPhaseResult.stderr, /baseline inputs outside the cache-input phase/)
 })
 
+test('v3 acceptance policy returns a complete project matrix', (t) => {
+  const policy = `
+let text = ''
+for await (const chunk of process.stdin) text += chunk
+const { context } = JSON.parse(text)
+process.stdout.write(JSON.stringify({ cases: [{
+  id: 'language-switch',
+  criterion_ids: context.criteria.map((row) => row.id),
+  surface_id: context.surfaces[0].id,
+  transition_id: context.transitions[0].id,
+  production_consumer: 'SettingsView',
+  scenario: 'select another language',
+  observable: 'mounted labels change',
+  mutation: 'disable the locale update',
+  evidence_kind: 'xcui-result',
+  selector: 'settings.language',
+}] }))
+`
+  const root = fixture(policy, ['acceptance'], 3)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+
+  const result = run(root)
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /acceptance: acceptance-policy [0-9a-f]{12} — valid/)
+})
+
+test('v3 acceptance policy rejects incomplete and cross-surface matrices', (t) => {
+  const empty = fixture(`process.stdout.write(JSON.stringify({ cases: [] }))`,
+    ['acceptance'], 3)
+  t.after(() => rmSync(empty, { recursive: true, force: true }))
+  const emptyResult = run(empty)
+  assert.equal(emptyResult.status, 1)
+  assert.match(emptyResult.stderr, /does not cover criterion ids/)
+
+  const wrongSurface = fixture(`
+let text = ''
+for await (const chunk of process.stdin) text += chunk
+const { context } = JSON.parse(text)
+process.stdout.write(JSON.stringify({ cases: [{
+  id: 'wrong-surface',
+  criterion_ids: [context.criteria[0].id],
+  surface_id: 'other-surface',
+  transition_id: context.transitions[0].id,
+  production_consumer: 'consumer',
+  scenario: 'scenario',
+  observable: 'observable',
+  mutation: 'mutation',
+  evidence_kind: 'test-result',
+  selector: 'selector',
+}] }))
+`, ['acceptance'], 3)
+  t.after(() => rmSync(wrongSurface, { recursive: true, force: true }))
+  const wrongResult = run(wrongSurface)
+  assert.equal(wrongResult.status, 1)
+  assert.match(wrongResult.stderr, /unknown surface/)
+})
+
+test('acceptance stage is unavailable before project policy api v3', (t) => {
+  const root = fixture(`process.stdout.write(JSON.stringify({ cases: [] }))`,
+    ['acceptance'], 2)
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+
+  const result = run(root)
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /acceptance policy requires api_version 3/)
+})
+
 test('policy digests change when any file in the project policy tree changes', (t) => {
   const root = fixture(validPolicy, ['planning'])
   t.after(() => rmSync(root, { recursive: true, force: true }))

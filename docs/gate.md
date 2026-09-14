@@ -66,6 +66,19 @@ digest for external inputs. Without the project digest, or on any mismatch, the 
    Unset — a hand run, or the full gate — means the whole directory is the right subject.
    (Without it a gate reds a plan's early tasks over a debt only its last task settles.)
 
+## Structured evidence
+
+Every gate receives `CAW_GATE_EVIDENCE_OUT` and `CAW_GATE_ARTIFACTS_DIR`. A project with an
+API-v3 acceptance policy writes the version-1 manifest documented in
+[project policies](project-policies.md). A green fast gate must report a passed check for every
+acceptance case with the required evidence kind.
+
+CAW owns the resulting receipt. It records the command result, bounded output and artifact
+digests against the exact delivery digest. Manifest files are limited to 1 MiB, 128 checks and 32
+artifacts. Each artifact is at most 16 MiB and all artifacts together at most 64 MiB. Paths must
+be relative regular files without symlink components. Archive directory-style result bundles
+before listing them, for example as `.xcresult.zip`.
+
 The reviewer and every `weak` replay run this gate again inside an isolated write boundary. A green
 delivery gate does not prove that the same command is runnable there. The live acceptance repository
 used a Node gate successfully, but a direct macOS experiment against one iOS/Swift install's Xcode/Swift gate had

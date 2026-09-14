@@ -73,6 +73,20 @@ baseline ревью; повторное противоречие останав�
 Специалиста по запуску тестов удалили после измерения: 4 запуска, 256k токенов, 13% дорожки,
 0 пригодных вердиктов.
 
+Теперь результат gate имеет engine-owned receipt. Он связывает команду, status, длительность,
+ограниченный output и digest проверенных артефактов с точным digest доставки. Проверки executor
+хранятся отдельно как структурированные недоверенные claims. Reviewer видит оба набора в
+ограниченном task dossier, а не получает по умолчанию всю накопленную историю; репозиторий
+по-прежнему доступен для чтения.
+
+Findings связаны со стабильными criterion, surface, transition и property. Точные root-cause keys
+передаются executor как один work package, но исходное наблюдение каждого прохода и его provenance
+остаются в истории. Сходство текста само по себе findings не объединяет.
+
+Проект может включить [acceptance matrix API v3](project-policies.ru.md), не меняя ядро CAW.
+Consumers, scenarios, observables, mutations, evidence kinds и selectors принадлежат проекту;
+CAW проверяет полноту и транспорт gate evidence.
+
 **Независимая population кэшируется только при полном смысловом совпадении.** В ключ входят
 запрос, эффективный профиль и policy, canonical docs, состояние репозитория, project index,
 runtime, адаптер, CLI, instructions, schema и движок. Любое изменение снова запускает enumerator.

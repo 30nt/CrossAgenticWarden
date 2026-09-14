@@ -7,11 +7,22 @@
 
 Запись содержит фактические runtime автора и reviewer (или подписанную identity человека), проверенный режим независимости, полный
 criterion ledger, состояние population, baseline review-поверхности, digest дерева, состояние
-weak verification, ID открытых findings и digest project policies.
+weak verification, ID открытых findings, digest project policies, executor claims, acceptance
+cases и engine-owned receipt fast gate.
+
+Executor claims остаются недоверенными навигационными данными. Receipt создаёт сам CAW: он
+связывает состояние команды, status, длительность, ограниченный output и digest проверенных
+артефактов с digest доставки. Reviewer получает и claims, и receipt, но не должен считать claim
+доказательством движка.
 
 Автоматический task-раунд объединяет primary-проход и настроенные слепые challenger-проходы по
 одному digest доставки. Certification сохраняет runtime каждого прохода. Новая находка challenger
 получает `late-same-baseline`; спор по carried-пункту не может его одобрить.
+
+Каждый disposition критерия и finding содержит стабильные evidence references. Finding также
+связан с criterion, surface, transition и property key. CAW сохраняет наблюдение каждого прохода
+и объединяет точные root-cause keys в work packages; сходство текста само по себе никогда не
+является причиной для объединения.
 
 Состояния записи:
 
@@ -50,10 +61,14 @@ certification содержат имя файла, размер и SHA-256, а н
 отправляется на remote автоматически.
 
 Перед автоматическим или явным удалением старого run record CAW дописывает компактные счётчики
-вызовов, usage state, длительности и certification в `caw/metrics/runs.jsonl`. Prompts, ответы
-провайдеров и диагностические payload туда не копируются.
+вызовов, usage state, длительности и certification в `caw/metrics/runs.jsonl`. Там отдельно
+учитываются наблюдаемые input, cached input, вычисленный uncached input, output, reasoning, размер
+исходного prompt и количество/объём provider events, с группировкой по задаче, раунду и роли.
+Отсутствующие provider-поля остаются явно неизвестными. Prompts, ответы провайдеров и
+диагностические payload туда не копируются.
 
 Для `human-review` `.caw/CAW.md` указывает OpenSSH allowed-signers файл. `human-review prepare`
 создаёт точный census плана или задачи, а `human-review accept` проверяет подпись `ssh-keygen -Y`
 в namespace `caw-review`. Подписанные JSON и signature сохраняются в Git-приватном
 `caw/human-reviews/`; любое изменение байтов плана или digest доставки инвалидирует аттестацию.
+Task attestation имеет версию 2 и требует `evidence_refs` у каждого criterion и carried item.
