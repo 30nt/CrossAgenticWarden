@@ -1275,6 +1275,7 @@ test('Codex executor uses file transport and returns the canonical result throug
     { role: 'executor', value: delivery('written by Codex'), writeFiles: { 'output.txt': 'done\n' } },
     { role: 'reviewer', envelope: envelope(verdict({ criteria: [
       { id: 'must-cover-1', state: 'met', evidence: 'traced the fixture output case' },
+      { id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation' },
       { id: 'done-when-1', state: 'met', evidence: 'traced the output and its gate' },
     ] })) },
   ])
@@ -2352,6 +2353,8 @@ title: Baseline task
 - The fixture output exists.
 `)
   const criteria = [{
+    id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation',
+  }, {
     id: 'done-when-1', state: 'met', evidence: 'traced the fixture output and its gate',
   }]
 
@@ -2717,6 +2720,7 @@ test('a planned task retains an approved certification with population and crite
     { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
     { envelope: envelope(verdict({ criteria: [
       { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+      { id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation' },
       { id: 'done-when-1', state: 'met', evidence: 'ran the fixture gate' },
     ] })) },
   ])
@@ -2736,7 +2740,7 @@ test('a planned task retains an approved certification with population and crite
   assert.equal(certification.reviewer.provider, 'test-claude')
   assert.equal(certification.independence.mode, 'different-model')
   assert.deepEqual(certification.criteria.map(({ id }) => id),
-    ['must-cover-1', 'done-when-1'])
+    ['must-cover-1', 'change-1', 'done-when-1'])
   assert.match(certification.review_surface.baseline_commit, /^[0-9a-f]{40}$/)
   assert.match(execFileSync('git', ['log', '-1', '--pretty=%B'], {
     cwd: f.root, encoding: 'utf8',
@@ -2910,6 +2914,8 @@ title: Baseline task
     ignoreWriteErrors: true,
     recordReviewProbe: true,
     envelope: envelope(verdict({ criteria: [{
+      id: 'change-1', state: 'met', evidence: 'traced the intended output implementation',
+    }, {
       id: 'done-when-1', state: 'met', evidence: 'traced the intended output and its gate',
     }] })),
   }])

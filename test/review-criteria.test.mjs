@@ -32,6 +32,7 @@ test('extracts every review criterion with a stable engine id', () => {
       id: 'must-cover-2', section: 'Must cover',
       criterion: "Beta keeps the user's entered text unchanged",
     },
+    { id: 'change-1', section: 'Change', criterion: 'Implement both.' },
     {
       id: 'done-when-1', section: 'Done when',
       criterion: 'The mounted Alpha consumer updates.',
@@ -47,6 +48,8 @@ test('accepts exactly one evidenced row for every criterion', () => {
   assert.equal(reviewCriteriaIssue(spec, rows, emptyVerdict), null)
   assert.match(reviewCriteriaIssue(spec, rows.slice(1), emptyVerdict),
     /missing criterion id.*must-cover-1/)
+  assert.match(reviewCriteriaIssue(spec, rows.filter(({ id }) => id !== 'change-1'), emptyVerdict),
+    /missing criterion id.*change-1/)
   assert.match(reviewCriteriaIssue(spec, [...rows, rows[0]], emptyVerdict),
     /duplicate criterion id/)
   assert.match(reviewCriteriaIssue(spec, [{ ...rows[0], id: 'done-when-99' }, ...rows.slice(1)],

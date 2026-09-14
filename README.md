@@ -36,8 +36,12 @@ when nothing blocking is open, and only then. Three slots block, and every item 
 | slot | means | evidence must be |
 |---|---|---|
 | `broken` | the delivery does not do what it says | what was run |
-| `uncovered` | a `## Done when` line the tree does not meet | what was checked |
+| `uncovered` | a `Must cover`, `Change`, or `Done when` line the tree does not meet | what was checked |
 | `weak` | a test green for the wrong reason | **the mutation that proves it** |
+
+Before those slots, the engine creates an atomic census from every `## Must cover`, `## Change`,
+and `## Done when` bullet. The reviewer must give every stable id one disposition and evidence;
+missing, duplicate, and unknown ids invalidate the response.
 
 A weakness nobody demonstrated is not a `weak`. A fourth slot, `noted`, never blocks and nothing
 ever acts on it — it exists so the other three can stay strict.
