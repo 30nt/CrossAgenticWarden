@@ -127,15 +127,18 @@ node caw.mjs verify-project          # validate project policy extensions
 node caw.mjs artifacts list          # retained run/recovery/probe/transport artifacts
 ```
 
-`ls .caw-tasks/` is the queue and `git log` is the record: each commit carries its spec's full
-text and deletes the file. Every command prints the resolved matrix and runtime digest before
-mutation or spend.
+`ls .caw-tasks/` is the queue. A task commit stays public and compact; its `CAW-Audit` digest
+points to the complete private record under Git's `caw/audit/` path. That record keeps the spec,
+notes, certification, policy identity, reviewed delivery digest and staged tree after the queue
+file is deleted. Every command prints the resolved matrix and runtime digest before mutation or
+spend.
 
 Each provider call creates an immutable `attempt-*.json` before the child process starts. The run
 manifest links that attempt to its success, failure, timeout, interrupted state, diagnostics, and
 duration through one `attempt_id`. Usage is labelled `reported`, `partial`, or `unknown`; unknown
 is never written as zero. `estimated` is reserved for a future explicitly sourced estimator and
-is not emitted by the current adapters.
+is not emitted by the current adapters. Before old run records are pruned or explicitly purged,
+CAW appends payload-free counters and durations to Git's private `caw/metrics/runs.jsonl`.
 
 ## Before you point this at a real repository
 

@@ -425,6 +425,11 @@ function calls(f) {
   return readFileSync(f.calls, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
 }
 
+function latestTaskAudit(f) {
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim()
+  return JSON.parse(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`), 'utf8'))
+}
+
 function codexCalls(f) {
   const path = join(f.root, '.fake-codex-calls.jsonl')
   if (!existsSync(path)) return []
@@ -3011,8 +3016,9 @@ test('one resumed carried set preserves and renders several runtime origins',
   }])
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /RUNTIME DIVERGENCE/)
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
-  const observation = JSON.parse(message.match(/fake-review-probe:(\{.*\})/)[1])
+  const observationText = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-review-probe:'))
+  const observation = JSON.parse(observationText.slice('fake-review-probe:'.length))
   assert.deepEqual(observation.inputMatches,
     Object.fromEntries(expectedOrigins.map((origin) => [origin, true])))
 })
@@ -3263,13 +3269,21 @@ title: Core title
   })
   assert.match(message, /^project: delivered safely\n/)
   assert.match(message, /Review: accepted with LIMITED certification, round 1/)
-  assert.match(message, /--- spec \(001_policy-review\.md\), verbatim/)
-  assert.match(message, /"project:review-policy:privacy":true/)
-  assert.match(message, /"trace the project privacy boundary":true/)
+  assert.doesNotMatch(message, /--- spec/)
+  assert.doesNotMatch(message, /fake-review-probe/)
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim()
+  const audit = JSON.parse(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`), 'utf8'))
+  assert.match(audit.spec, /title: Core title/)
+  assert.match(audit.delivery.reviewer_notes.join('\n'), /"project:review-policy:privacy":true/)
+  assert.match(audit.delivery.reviewer_notes.join('\n'), /"trace the project privacy boundary":true/)
+  const auditDigest = createHash('sha256')
+    .update(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`))).digest('hex')
+  assert.match(message, new RegExp(`CAW-Audit: sha256:${auditDigest}`))
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.deepEqual(manifest.policy_calls.map(({ stage }) => stage), ['gate', 'review', 'commit'])
   assert.equal(manifest.certifications[0].state, 'limited')
+  assert.equal(manifest.audits[0].commit, head)
   assert.deepEqual(manifest.certifications[0].limitations,
     ['population-unknown', 'author-runtime-unobserved'])
 })
@@ -3498,12 +3512,10 @@ title: Baseline task
   assert.equal(existsSync(join(f.root, 'src', 'reviewer-leak.txt')), false)
   assert.equal(existsSync(join(f.root, 'src', 'escaped.txt')), false)
   assert.equal(readFileSync(join(f.root, 'node_modules', 'fixture', 'index.js'), 'utf8'), 'dependency\n')
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
-    cwd: f.root, encoding: 'utf8',
-  })
-  const observation = message.match(/fake-review-probe:(\{.*\})/)
-  assert.ok(observation, message)
-  const probe = JSON.parse(observation[1])
+  const observation = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-review-probe:'))
+  assert.ok(observation)
+  const probe = JSON.parse(observation.slice('fake-review-probe:'.length))
   const canonicalSurfaceParent = join(realpathSync(tmpdir()), 'caw-review-surfaces')
   const fromSurfaceParent = relative(canonicalSurfaceParent, probe.cwd)
   assert.equal(fromSurfaceParent.startsWith('..') || isAbsolute(fromSurfaceParent), false)
@@ -3787,11 +3799,9 @@ test('a nonescaping weak mutation that makes the gate red is refuted and noted',
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /open now 0,  noted 1/)
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
-    cwd: f.root, encoding: 'utf8',
-  })
-  assert.match(message, /weak refuted experiment, noted only/)
-  assert.match(message, /weak mutation made the gate red/)
+  const auditNotes = latestTaskAudit(f).delivery.reviewer_notes.join('\n')
+  assert.match(auditNotes, /weak refuted experiment, noted only/)
+  assert.match(auditNotes, /weak mutation made the gate red/)
   assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json')), false)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
@@ -3889,7 +3899,8 @@ test('a weak mutation against another component is unavailable and never reaches
     cwd: f.root, encoding: 'utf8',
   })
   assert.match(message, /Review: accepted with LIMITED certification/)
-  assert.match(message, /changes README\.md but reviewer location names src\/expected\.js/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /changes README\.md but reviewer location names src\/expected\.js/)
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const manifest = JSON.parse(readFileSync(
     join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
@@ -3938,7 +3949,8 @@ test('red weak baseline records non-blocking unavailable evidence with limited c
     cwd: f.root, encoding: 'utf8',
   })
   assert.match(message, /Review: accepted with LIMITED certification/)
-  assert.match(message, /weak verification unavailable, noted only/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /weak verification unavailable, noted only/)
 
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const runManifest = JSON.parse(readFileSync(
@@ -3986,7 +3998,8 @@ test('mutation gate refusal is non-blocking unavailable evidence',
     cwd: f.root, encoding: 'utf8',
   })
   assert.match(message, /Review: accepted with LIMITED certification/)
-  assert.match(message, /weak verification unavailable, noted only/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /weak verification unavailable, noted only/)
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const runManifest = JSON.parse(readFileSync(
     join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))

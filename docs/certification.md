@@ -36,6 +36,13 @@ the certification `limited`; it does not create work for the executor.
 hand-written task or an old plan has `population: unknown`, so it cannot receive ordinary
 certification. Its commit says `accepted with LIMITED certification`.
 
-Certification files currently share run-record retention: newest 20 and at most 30 days. The
-task contract itself remains durable in the commit message; long-term audit storage is a separate
-contract.
+Certification files currently share run-record retention: newest 20 and at most 30 days. Before
+the task commit, CAW also writes the complete task contract to Git's private `caw/audit/` path.
+The public commit carries only a compact summary and the record's SHA-256. The record is first
+durable as `pending-<digest>.json`, then renamed to `<commit>.json`; interruption cannot erase the
+only copy. It contains the spec, notes, certification, policy snapshot, reviewed delivery digest
+and exact staged tree. This private storage is local Git state and is not pushed automatically.
+
+Before an old run record is pruned or explicitly purged, CAW appends compact call, usage-state,
+duration and certification counters to `caw/metrics/runs.jsonl`. Provider responses, prompts and
+diagnostic payloads are not copied into this metrics stream.

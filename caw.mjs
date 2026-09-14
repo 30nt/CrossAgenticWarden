@@ -1705,9 +1705,62 @@ const POPULATION_CACHE_VERSION = 1
 const POPULATION_CACHE_MAX = 20
 const POPULATION_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 const POPULATION_CACHE_FILE_MAX = 8 * 1024 * 1024
+const TASK_AUDIT_MAX = 16 * 1024 * 1024
 let projectPolicySet = null
 let activePopulationCertification = null
 let runRecord = null
+
+function gitPrivatePath(...parts) {
+  const raw = execFileSync('git', ['rev-parse', '--git-path', parts.join('/')], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim()
+  if (!raw) throw new Error(`Git returned no private path for ${parts.join('/')}`)
+  return resolve(raw)
+}
+
+function compactRunMetrics(manifest) {
+  const calls = Array.isArray(manifest?.calls) ? manifest.calls : []
+  const policyCalls = Array.isArray(manifest?.policy_calls) ? manifest.policy_calls : []
+  const certifications = Array.isArray(manifest?.certifications) ? manifest.certifications : []
+  const countBy = (rows, key) => Object.fromEntries([...rows.reduce((map, row) => {
+    const value = row?.[key] ?? 'unknown'
+    map.set(value, (map.get(value) || 0) + 1)
+    return map
+  }, new Map())].sort(([a], [b]) => String(a).localeCompare(String(b))))
+  const duration = (rows) => rows.reduce((sum, row) =>
+    sum + (Number.isFinite(row?.duration_ms) ? row.duration_ms : 0), 0)
+  return {
+    version: 1,
+    run_id: manifest?.run_id || null,
+    started_at: manifest?.started_at || null,
+    updated_at: manifest?.updated_at || null,
+    status: manifest?.status || 'unknown',
+    provider_calls: calls.length,
+    provider_calls_by_role: countBy(calls, 'role'),
+    provider_calls_by_status: countBy(calls, 'status'),
+    usage_states: countBy(calls, 'usage_state'),
+    provider_duration_ms: duration(calls),
+    policy_calls: policyCalls.length,
+    policy_duration_ms: duration(policyCalls),
+    certifications: countBy(certifications, 'state'),
+  }
+}
+
+function exportRunMetrics(runPath) {
+  const manifestPath = join(runPath, 'manifest.json')
+  if (!existsSync(manifestPath)) return false
+  let manifest
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
+  catch { return false }
+  let root
+  try { root = gitPrivatePath('caw', 'metrics') }
+  catch { root = resolve(LOG_DIR, 'metrics') }
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const target = join(root, 'runs.jsonl')
+  appendFileSync(target, `${JSON.stringify(compactRunMetrics(manifest))}\n`, { mode: 0o600 })
+  try { chmodSync(target, 0o600) } catch { /* platform does not expose POSIX modes */ }
+  return true
+}
 
 function writeRunManifest(status) {
   if (!runRecord) return
@@ -1723,6 +1776,7 @@ function writeRunManifest(status) {
     calls: runRecord.calls,
     diagnostics: runRecord.diagnostics,
     certifications: runRecord.certifications || [],
+    audits: runRecord.audits || [],
     ...(projectPolicySet?.manifestDigest ? {
       project_policies: {
         api_version: projectPolicySet.apiVersion,
@@ -1764,6 +1818,7 @@ function pruneRunRecords(now = Date.now()) {
   const maxAge = 30 * 24 * 60 * 60 * 1000
   records.forEach((entry, index) => {
     if (index >= 20 || now - entry.stat.mtimeMs > maxAge) {
+      try { exportRunMetrics(entry.path) } catch { /* retention cleanup must remain available */ }
       removeTree(entry.path)
     }
   })
@@ -2067,6 +2122,39 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
   })
   writeRunManifest(state === 'rejected' ? 'failed' : 'active')
   return body
+}
+
+function writeTaskAudit(body) {
+  const root = gitPrivatePath('caw', 'audit')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  if (bytes.length > TASK_AUDIT_MAX) {
+    throw new Error(`task audit record is ${bytes.length} bytes; limit is ${TASK_AUDIT_MAX}`)
+  }
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  const name = `pending-${digest}.json`
+  writePrivateFile(join(root, name), bytes, TASK_AUDIT_MAX)
+  const run = beginRunRecord()
+  run.audits ||= []
+  const entry = {
+    task: body.task,
+    state: 'pending-commit',
+    digest,
+    file: name,
+    bytes: bytes.length,
+  }
+  run.audits.push(entry)
+  writeRunManifest('active')
+  return { root, path: join(root, name), digest, entry }
+}
+
+function finalizeTaskAudit(audit, commitHash) {
+  const name = `${commitHash}.json`
+  const target = join(audit.root, name)
+  renameSync(audit.path, target)
+  Object.assign(audit.entry, { state: 'committed', commit: commitHash, file: name })
+  writeRunManifest('active')
+  return target
 }
 
 // `.caw-tasks/` holds three kinds of file and only one of them is work to run. `PLAN.md` is
@@ -2506,6 +2594,36 @@ function deliveryDigest() {
     const st = lstatSync(path)
     hash.update(`\0${path}\0${st.mode}\0`)
     hash.update(st.isSymbolicLink() ? realpathSync(path) : readFileSync(path))
+  }
+  return hash.digest('hex')
+}
+
+function deliverySnapshotDigest() {
+  const hash = createHash('sha256')
+  const listed = new Set()
+  const collect = (args) => {
+    let raw = ''
+    try { raw = execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }) }
+    catch { return }
+    for (const path of raw.split('\0').filter(Boolean)) listed.add(path)
+  }
+  collect(['ls-tree', '-rz', '--name-only', 'HEAD'])
+  collect(['ls-files', '-z', '--cached', '--others', '--exclude-standard'])
+  for (const path of [...listed].sort()) {
+    if (path.startsWith(`${QUEUE_DIR}/`) || path.startsWith(`${LOG_DIR}/`)) continue
+    hash.update(`\0${path}\0`)
+    if (!existsSync(path)) {
+      hash.update('missing\0')
+      continue
+    }
+    const stat = lstatSync(path)
+    hash.update(`${stat.mode & 0o7777}\0`)
+    if (stat.isSymbolicLink()) hash.update(`symlink\0${readlinkSync(path)}`)
+    else if (stat.isFile()) hash.update(readFileSync(path))
+    else if (stat.isDirectory()) {
+      try { hash.update(`gitlink\0${execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()}`) }
+      catch { hash.update('directory\0') }
+    } else hash.update(`other\0${stat.mode}`)
   }
   return hash.digest('hex')
 }
@@ -6935,17 +7053,10 @@ function resumeTask(cmd, arg) {
   say(`\n  spent ${formatAccounting(accounting)}`)
 }
 
-// The spec is deleted once its task is committed, so `ls .caw-tasks/` is the queue — existence
-// is the whole state, and nothing stores progress.
-//
-// The spec file never enters git as a file; its TEXT goes into the commit message, verbatim.
-// This used to end at `Spec: .caw-tasks/001_thing.md` — a pointer to a path that is `.gitignore`d
-// and deleted two lines below, so it resolved to nothing from the moment it was written. What
-// was lost with it is the half of a task that a diff cannot carry: what the spec ruled OUT.
-// `Change` and `Done when` are recoverable by reading the code that landed; "server-side
-// enforcement is deliberately out of scope" and "this migration is applied, fix it with a new
-// one" are not recoverable from anything, and they are what a later reader most needs, because
-// re-litigating a settled exclusion is the expensive mistake.
+// The spec is deleted once its task is committed, so `ls .caw-tasks/` is the queue. Its exact
+// text survives in the Git-private audit record written before the commit. The public commit is
+// deliberately compact and carries the audit SHA-256; project-specific subject policy cannot
+// change staging, evidence or the private record.
 // `how` records the shape of the round that earned the approval, and it exists because the
 // signature line is the thing this loop is for. `null` — the ordinary case, the whole task ran
 // inside one `build`. `'resumed'` — a human authorised further rounds after a stop. `'hand'` —
@@ -6994,9 +7105,41 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
     gate_red_attempts: gateRedAttempts,
   })
   const subject = commitPolicy?.output.subject.trim() || title
+  const files = changedFiles()
+  const precommitSnapshot = deliverySnapshotDigest()
   git('add', '-A')
   try { git('reset', '-q', '--', QUEUE_DIR) } catch { /* nothing of .caw-tasks/ was staged */ }
   try { git('reset', '-q', '--', LOG_DIR) } catch { /* nothing of .caw-logs/ was staged */ }
+  if (deliverySnapshotDigest() !== precommitSnapshot) {
+    die(`${file} — delivery snapshot changed during staging; refusing commit`)
+  }
+  const stagedTree = git('write-tree').trim()
+  const audit = writeTaskAudit({
+    version: 1,
+    task: file,
+    title,
+    public_subject: subject,
+    created_at: new Date().toISOString(),
+    spec,
+    delivery: {
+      summary: ex?.summary || null,
+      executor_notes: ex?.notes || [],
+      reviewer_notes: noted || [],
+      files,
+      delivery_digest: reviewedDigest || deliveryDigest(),
+      precommit_snapshot_digest: precommitSnapshot,
+      staged_tree: stagedTree,
+    },
+    gate: {
+      fast: f.gate_fast,
+      state: 'green',
+      earlier_red_attempts: gateRedAttempts,
+      full: f.gate_full || null,
+      full_state_at_task_commit: 'not-run',
+    },
+    review: { round, mode: how || 'pipeline', certification },
+    project_policies: projectPolicySnapshot(),
+  })
   // `--cleanup=verbatim` is load-bearing, not tidiness. A spec is markdown: `## Read`,
   // `## Done when`. Under git's `strip` mode every one of those lines is a comment and is
   // silently removed, leaving a message whose headings are gone and whose bullets have lost
@@ -7023,28 +7166,18 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
                        + ' pipeline did not get to judge'
       : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
       : ''}.`,
-    // The executor's notes ride along with the commit they were made during. They used to be
-    // printed at the end of the run and nowhere else — the script said so itself: "nothing was
-    // recorded anywhere". On one live run a note was the discovery that the project's Xcode
-    // file registers every source by hand, so an unregistered test does not fail: it ceases to
-    // exist and the suite goes green. It survived because someone read the terminal before
-    // closing it. That is not a mechanism.
-    //
-    // Marked unreviewed because they are. The reviewer judges the code against the spec; a note
-    // is a side observation it never looked at, so this is testimony, not a finding. The
-    // reviewer's own `noted` slot lands in the same place and is prefixed there, so the two
-    // speakers stay told apart — this header used to name only the executor and would have
-    // become false the moment the reviewer gained a channel that does not block.
-    ...(ex?.notes?.length || noted?.length
-      ? ['', '--- notes from this task (unreviewed — nobody judged these, only the code) ---', '',
-         ...(ex?.notes || []).map((n) => `- ${n}`),
-         ...(noted || []).map((n) => `- (reviewer) ${n}`)]
-      : []),
+    // Notes and the exact spec live in the audit record above. Keeping them out of the public
+    // commit is the separation this method enforces: the commit is a useful project history,
+    // while the local private record is the complete operational history.
     '',
-    `--- spec (${file}), verbatim — the text this task was built and judged against ---`,
-    '',
-    spec.trim(),
+    `CAW-Audit: sha256:${audit.digest}`,
   ].join('\n'))
+  const committedHead = git('rev-parse', 'HEAD').trim()
+  let auditPath = audit.path
+  try { auditPath = finalizeTaskAudit(audit, committedHead) }
+  catch (error) {
+    say(`  WARNING: audit record remains pending at ${audit.path}: ${error?.message || error}`)
+  }
   clearRoundState(file)
 
   // That header used to call this the only durable copy, and the unlink below is what would
@@ -7075,7 +7208,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   if (onDisk === null) {
     // The executor holds Write and Edit and could have removed it. Unlinking would throw ENOENT
     // out of a run that has already committed, taking the notes and the spend line with it.
-    say(`  committed  ${head}`)
+    say(`  committed  ${head}  audit ${auditPath}`)
     say(`  note: .caw-tasks/${file} was already gone before this line ran`)
     clearTaskRecoveryArtifacts(file)
     return
@@ -7103,7 +7236,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
     } catch { kept = null }
     rm(specPath)
     clearTaskRecoveryArtifacts(file)
-    say(`  committed  ${head}`)
+    say(`  committed  ${head}  audit ${auditPath}`)
     say(`  .caw-tasks/${file} CHANGED under this run. The commit carries the text the executor and`)
     say(`  reviewer were actually given; the file on disk was something else and no role here`)
     say(kept && retained ? `  read it. It is at ${kept} — diff it against the spec in the commit.`
@@ -7114,7 +7247,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   }
   rm(specPath)
   clearTaskRecoveryArtifacts(file)
-  say(`  committed  ${head}`)
+  say(`  committed  ${head}  audit ${auditPath}`)
 }
 
 // ---------------------------------------------------------------- review-specs
@@ -7621,6 +7754,8 @@ function artifacts(args) {
   }
   const runPath = join(LOG_DIR, target)
   if (target.startsWith('run-') && existsSync(runPath) && inside(resolve(LOG_DIR), resolve(runPath))) {
+    try { exportRunMetrics(runPath) }
+    catch (error) { die(`could not export compact metrics before purging ${target}: ${error?.message || error}`) }
     removeTree(runPath)
     say(`purged ${target}`)
     return
@@ -7774,6 +7909,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 
 export {
   GateFailureAction, PlanningAction, SCHEMA, addAccounting, canonicalAuthorityPaths,
+  compactRunMetrics,
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
   normalizeAccounting, planRelationIssue, planningLedger, reviewCriteriaIssue,
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
