@@ -153,6 +153,7 @@ Run manifest связывает попытку, success, failure, timeout, inter
 | [docs/architecture.md](architecture.ru.md) | как устроены движок, роли, адаптеры и пробы |
 | [docs/adapters.md](adapters.md) | как написать адаптер для другого провайдера (EN) |
 | [docs/project-policies.md](project-policies.ru.md) | как расширять CAW без изменения ядра |
+| [docs/certification.md](certification.ru.md) | состояния сертификации и сохранённые доказательства |
 | [docs/limitations.md](limitations.ru.md) | что известно как сломанное или непроверенное |
 | [SECURITY.md](../SECURITY.md) | что обеспечивается, а что нет (EN) |
 | [CONTRIBUTING.md](contributing.ru.md) | как здесь выглядит полезный вклад |

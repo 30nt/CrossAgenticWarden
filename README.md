@@ -150,6 +150,7 @@ is not emitted by the current adapters.
 | [docs/architecture.md](docs/architecture.md) | how the engine, roles, adapters and probes fit |
 | [docs/adapters.md](docs/adapters.md) | writing an adapter for another provider |
 | [docs/project-policies.md](docs/project-policies.md) | extending CAW without changing its core |
+| [docs/certification.md](docs/certification.md) | task certification states and retained evidence |
 | [docs/limitations.md](docs/limitations.md) | what is known to be broken or unexercised |
 | [SECURITY.md](SECURITY.md) | what is enforced, and what is not |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | what a useful contribution looks like here |

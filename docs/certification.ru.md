@@ -1,0 +1,26 @@
+# Записи сертификации
+
+[English version](certification.md)
+
+Каждый task review записывает `certification-<task>-round-<n>.json` в текущий run record до того,
+как CAW напечатает или применит verdict.
+
+Запись содержит фактические runtime автора и reviewer, проверенный режим независимости, полный
+criterion ledger, состояние population, baseline review-поверхности, digest дерева, состояние
+weak verification, ID открытых findings и digest project policies.
+
+Состояния записи:
+
+- `approved` — открытых пунктов нет, независимо перечисленная population сохранилась, runtime
+  автора известен;
+- `limited` — код принят, но нет population или происхождения автора либо weak verification
+  недоступна;
+- `rejected` — остались блокирующие пункты.
+
+`PLAN.md` переносит состояние, счётчики и digest population из планирования в последующий build.
+Ручная задача и старый план получают `population: unknown`, поэтому обычная сертификация для них
+невозможна. В коммите будет `accepted with LIMITED certification`.
+
+Сейчас файлы сертификации живут столько же, сколько run records: не более 20 новых и 30 дней.
+Task contract остаётся навсегда в сообщении коммита; долговременное audit-хранилище — отдельный
+контракт.
