@@ -64,6 +64,26 @@ If your provider has no OS boundary on this host, say so: `writeScope: 'shell-re
 is the honest value, and the engine will refuse the planning roles with a message naming the
 guarantee rather than the missing helper. That refusal is the adapter working correctly.
 
+The closed `features` object also declares invocation capabilities:
+
+```js
+{
+  schemaTransport: 'inline',
+  resultTransport: 'stdout',
+  reportsCost: true,
+  reportsCacheCounters: true,
+  reportsModels: true,
+  modelSelection: 'explicit-id',
+  reasoningLevels: ['low', 'medium', 'high', 'max'],
+}
+```
+
+`explicit-id` means `runtime.json` model strings are provider-native ids and are passed without an
+engine alias table. `reasoningLevels` lists the CAW levels the adapter maps to native options. A
+binding outside that list refuses before the provider process starts. A successful
+`node caw.mjs smoke <role>` is keyed to the exact model, reasoning, CLI, adapter and engine bytes;
+changing any of them requires that role to be smoked again when the profile enables the check.
+
 ## Cost and tokens: unknown is a value
 
 `decodeSuccess` returns accounting alongside the value. A provider that reports no price must

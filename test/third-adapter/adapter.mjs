@@ -5,6 +5,7 @@ import { delimiter, join } from 'node:path'
 const FEATURES = {
   schemaTransport: 'inline', resultTransport: 'stdout',
   reportsCost: false, reportsCacheCounters: false, reportsModels: false,
+  modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
 }
 
 const scopeFor = (role) => role === 'executor' ? 'delivery-tree'

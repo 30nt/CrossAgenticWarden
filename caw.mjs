@@ -1048,13 +1048,22 @@ function validateDescriptor(role, descriptor) {
   }
   exact(descriptor, ['features', 'guarantees'], `${role} adapter descriptor`)
   exact(descriptor.features,
-    ['schemaTransport', 'resultTransport', 'reportsCost', 'reportsCacheCounters', 'reportsModels'],
+    ['schemaTransport', 'resultTransport', 'reportsCost', 'reportsCacheCounters', 'reportsModels',
+      'modelSelection', 'reasoningLevels'],
     `${role} features`)
   if (!['inline', 'file'].includes(descriptor.features.schemaTransport)) {
     die(`${role} adapter has unsupported schema transport ${descriptor.features.schemaTransport}`)
   }
   if (!['stdout', 'file'].includes(descriptor.features.resultTransport)) {
     die(`${role} adapter has unsupported result transport ${descriptor.features.resultTransport}`)
+  }
+  if (descriptor.features.modelSelection !== 'explicit-id') {
+    die(`${role} adapter must support explicit model ids`)
+  }
+  if (!Array.isArray(descriptor.features.reasoningLevels) ||
+      descriptor.features.reasoningLevels.some((level) => !REASONING.has(level)) ||
+      new Set(descriptor.features.reasoningLevels).size !== descriptor.features.reasoningLevels.length) {
+    die(`${role} adapter has malformed reasoningLevels`)
   }
   exact(descriptor.guarantees,
     ['repositoryRead', 'directEdit', 'shellExecution', 'externalToolAccess', 'writeScope',

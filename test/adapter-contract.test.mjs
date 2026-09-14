@@ -74,6 +74,13 @@ const descriptor = (role) => Object.fromEntries(Object.entries({
   ...expected[role], interaction: 'noninteractive', permissionEscalation: 'forbidden',
 }).map(([key, state]) => [key, { state, by: 'test' }]))
 
+test('every shipped adapter declares explicit model ids and bounded reasoning levels', () => {
+  for (const adapter of [claude, codex, third]) {
+    assert.equal(adapter.features.modelSelection, 'explicit-id')
+    assert.deepEqual(adapter.features.reasoningLevels, ['low', 'medium', 'high', 'max'])
+  }
+})
+
 test('role guarantee matcher accepts every exact cell and rejects every missing or incomparable cell', () => {
   const incompatible = {
     repositoryRead: 'unavailable',
