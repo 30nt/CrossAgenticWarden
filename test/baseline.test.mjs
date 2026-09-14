@@ -2691,9 +2691,13 @@ title: Baseline task
     item.mutation_event.state === 'confirmed-weak'), true)
   assert.equal(state.weak_verification.state, 'baseline-green')
   assert.equal(state.weak_verification.mutations.length, 2)
+  assert.deepEqual(state.weak_verification.replay_surface, {
+    strategy: 'single-reusable-surface', surfaces_created: 1, restores: 3,
+  })
   assert.equal(new Set(state.history.map((item) => item.mutation_event.patch_sha256)).size, 2)
   const gateCalls = readFileSync(gateLog, 'utf8').trim().split('\n')
   assert.equal(gateCalls.length, 4) // delivery, one unmutated baseline, then two mutations
+  assert.equal(new Set(gateCalls).size, 2) // delivery plus one reused replay surface
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
   assert.equal(readFileSync(join(f.root, 'node_modules', 'fixture', 'index.js'), 'utf8'), 'dependency\n')
 })
