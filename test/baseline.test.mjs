@@ -20,8 +20,8 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
-  retainWeakVerificationEvents,
+  planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
+  resolvePopulationSource, retainWeakVerificationEvents,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
 import {
@@ -118,11 +118,17 @@ const plan = () => ({
     change: ['Write the fixture output.'],
     done_when: ['The fixture output exists.'],
   }],
-  coverage: [{ case: 'fixture output', task: 'baseline-task' }],
+  coverage: [{
+    case: 'fixture output', task: 'baseline-task',
+    acceptance_criteria: ['The fixture output exists.'],
+  }],
   blocked: '',
   resplit: [],
 })
-const planReview = () => ({
+const planReview = (subject = plan()) => ({
+  relations: planningLedger(subject).relations.map(({ id }) => ({
+    id, state: 'covered', evidence: 'the linked final-tree criterion establishes the case',
+  })),
   uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [],
 })
 const delivery = (summary) => ({ summary, notes: [], blocked: '' })
@@ -1100,6 +1106,12 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.match(planText, /"role": "enumerator"/)
   assert.match(planText, /"role": "architect"/)
   assert.match(planText, /"role": "plan-reviewer"/)
+  assert.match(planText, /## Planning relation ledger/)
+  assert.match(planText, /plan-relation-[0-9a-f]{12}/)
+  assert.match(planText, /plan-requirement-[0-9a-f]{12}/)
+  const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
+  assert.match(specText, /## Acceptance links/)
+  assert.match(specText, /plan-case-[0-9a-f]{12}/)
 
   const runNames = readdirSync(join(f.root, '.caw-logs')).filter((name) => name.startsWith('run-'))
   assert.equal(runNames.length, 1)
@@ -2634,11 +2646,50 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const relation = fixture()
   const unknownTask = run(relation, ['plan', 'x'], [
     { envelope: envelope(population()) },
-    { envelope: envelope({ ...plan(), coverage: [{ case: 'fixture output', task: 'missing' }] }) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'missing',
+      acceptance_criteria: ['The fixture output exists.'],
+    }] }) },
   ])
   assert.equal(unknownTask.status, 1)
   assert.match(unknownTask.stderr, /names unknown task/)
   assert.equal(existsSync(join(relation.root, '.caw-tasks')), false)
+
+  const acceptance = fixture()
+  const unknownCriterion = run(acceptance, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'baseline-task',
+      acceptance_criteria: ['A criterion the task does not contain.'],
+    }] }) },
+  ])
+  assert.equal(unknownCriterion.status, 1)
+  assert.match(unknownCriterion.stderr, /unknown done_when criterion/)
+  assert.equal(existsSync(join(acceptance.root, '.caw-tasks')), false)
+})
+
+test('plan reviewer must adjudicate every engine relation id exactly once', () => {
+  const valid = planReview()
+  const variants = [
+    ['missing', { ...valid, relations: [] }, /missing relation id/],
+    ['duplicate', { ...valid, relations: [valid.relations[0], valid.relations[0]] },
+      /duplicate relation id/],
+    ['unknown', { ...valid, relations: [{
+      ...valid.relations[0], id: 'plan-relation-000000000000',
+    }] }, /unknown relation id/],
+  ]
+
+  for (const [name, review, expected] of variants) {
+    const f = fixture()
+    const result = run(f, ['plan', `relation ${name}`], [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(review) },
+    ])
+    assert.equal(result.status, 1, name)
+    assert.match(result.stderr, expected)
+    assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
+  }
 })
 
 function reviewedOnceWithOpenItem() {

@@ -1307,8 +1307,14 @@ const SCHEMA = closeSchema({
           properties: {
             case: { type: 'string', description: 'a case, state, input or surface the request implies' },
             task: { type: 'string', description: 'slug of the task that handles it' },
+            acceptance_criteria: {
+              type: 'array', minItems: 1,
+              items: { type: 'string' },
+              description: 'one or more exact done_when strings from that task which make this ' +
+                'case checkable on the final tree',
+            },
           },
-          required: ['case', 'task'],
+          required: ['case', 'task', 'acceptance_criteria'],
         },
       },
       blocked: {
@@ -1337,6 +1343,22 @@ const SCHEMA = closeSchema({
   planReview: {
     type: 'object',
     properties: {
+      relations: {
+        type: 'array',
+        description: 'exactly one disposition for every engine-assigned relation id',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned relation id' },
+            state: { type: 'string', enum: ['covered', 'uncovered'] },
+            evidence: {
+              type: 'string',
+              description: 'why the linked acceptance criteria do or do not establish this case',
+            },
+          },
+          required: ['id', 'state', 'evidence'],
+        },
+      },
       uncovered: {
         type: 'array', items: { type: 'string' },
         description: 'a case the request implies that no task handles',
@@ -1360,7 +1382,7 @@ const SCHEMA = closeSchema({
           'ends on the first anyway, so a question left out costs the human a whole run to find.',
       },
     },
-    required: ['uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable'],
+    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable'],
   },
 
   // A source is an address the engine can resolve, not a model's assertion that it looked
@@ -2967,11 +2989,69 @@ function validateBlockedValue(role, value) {
     `${role} returned invalid canonical output at $.blocked: use the empty string, not a placeholder`)
 }
 
+function planningId(kind, ...parts) {
+  return `${kind}-${createHash('sha256').update(stableJson(parts)).digest('hex').slice(0, 12)}`
+}
+
+function planningLedger(out) {
+  const tasks = (out.tasks || []).map((task) => ({
+    id: planningId('plan-task', task.slug),
+    slug: task.slug,
+    title: task.title || '',
+  }))
+  const taskBySlug = new Map(tasks.map((task) => [task.slug, task]))
+  const requirements = (out.tasks || []).flatMap((task) => {
+    const taskId = taskBySlug.get(task.slug)?.id || planningId('plan-task', task.slug)
+    return ['read', 'change', 'done_when'].flatMap((section) =>
+      (task[section] || []).map((text) => ({
+        id: planningId('plan-requirement', task.slug, section, text),
+        task_id: taskId,
+        section,
+        text,
+      })))
+  })
+  const requirementByKey = new Map(requirements.map((row) =>
+    [`${row.task_id}\0${row.section}\0${row.text}`, row]))
+  const cases = (out.coverage || []).map((row) => ({
+    id: planningId('plan-case', row.case),
+    case: row.case,
+  }))
+  const relations = (out.coverage || []).map((row, index) => {
+    const task = taskBySlug.get(row.task)
+    const caseRow = cases[index]
+    const criterionIds = (row.acceptance_criteria || []).map((criterion) =>
+      requirementByKey.get(`${task?.id}\0done_when\0${criterion}`)?.id).filter(Boolean)
+    return {
+      id: planningId('plan-relation', caseRow.id, task?.id || row.task, [...criterionIds].sort()),
+      case_id: caseRow.id,
+      case: row.case,
+      task_id: task?.id || null,
+      task: row.task,
+      criterion_ids: criterionIds,
+    }
+  })
+  return { version: 1, tasks, requirements, cases, relations }
+}
+
 function validatePlanRelations(out) {
   const slugs = out.tasks.map((task) => task.slug.trim())
   const unique = new Set(slugs)
   if (slugs.some((slug) => !slug)) schemaFailure('architect', '$.tasks', 'task slug must not be empty')
+  if (out.tasks.some((task) => task.slug !== task.slug.trim())) {
+    schemaFailure('architect', '$.tasks', 'task slugs must not contain surrounding whitespace')
+  }
   if (unique.size !== slugs.length) schemaFailure('architect', '$.tasks', 'task slugs must be unique')
+  for (const [taskIndex, task] of out.tasks.entries()) {
+    for (const section of ['read', 'change', 'done_when']) {
+      if (task[section].some((text) => !text.trim())) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].${section}`, 'requirements must not be empty')
+      }
+      if (new Set(task[section]).size !== task[section].length) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].${section}`,
+          'requirements must not be repeated')
+      }
+    }
+  }
   const unknown = out.coverage.find((row) => !unique.has(row.task))
   if (unknown) {
     schemaFailure('architect', '$.coverage', `case ${JSON.stringify(unknown.case)} names unknown task ${JSON.stringify(unknown.task)}`)
@@ -2980,6 +3060,52 @@ function validatePlanRelations(out) {
   if (new Set(cases).size !== cases.length) {
     schemaFailure('architect', '$.coverage', 'each case must appear exactly once')
   }
+  const uncoveredTasks = slugs.filter((slug) => !out.coverage.some((row) => row.task === slug))
+  if (uncoveredTasks.length) {
+    schemaFailure('architect', '$.coverage',
+      `every task must handle at least one case; missing ${uncoveredTasks.join(', ')}`)
+  }
+  for (const [index, row] of out.coverage.entries()) {
+    if (!row.case.trim()) schemaFailure('architect', `$.coverage[${index}].case`, 'must not be empty')
+    if (!Array.isArray(row.acceptance_criteria) || !row.acceptance_criteria.length) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        'must name at least one done_when criterion')
+    }
+    if (new Set(row.acceptance_criteria).size !== row.acceptance_criteria.length) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        'must not repeat a criterion')
+    }
+    const task = out.tasks.find((candidate) => candidate.slug.trim() === row.task)
+    const unknownCriterion = row.acceptance_criteria.find((criterion) =>
+      !task.done_when.includes(criterion))
+    if (unknownCriterion !== undefined) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        `unknown done_when criterion ${JSON.stringify(unknownCriterion)} for task ${JSON.stringify(row.task)}`)
+    }
+  }
+  return planningLedger(out)
+}
+
+function planRelationIssue(ledger, rows) {
+  if (!Array.isArray(rows)) return 'relations must be an array'
+  const expected = new Map((ledger?.relations || []).map((relation) => [relation.id, relation]))
+  const seen = new Set()
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return 'every relation row must be an object'
+    }
+    if (seen.has(row.id)) return `duplicate relation id ${JSON.stringify(row.id)}`
+    if (!expected.has(row.id)) return `unknown relation id ${JSON.stringify(row.id)}`
+    if (!['covered', 'uncovered'].includes(row.state)) {
+      return `${row.id} has unknown state ${JSON.stringify(row.state)}`
+    }
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) {
+      return `${row.id} has empty evidence`
+    }
+    seen.add(row.id)
+  }
+  const missing = [...expected.keys()].filter((id) => !seen.has(id))
+  return missing.length ? `missing relation id(s): ${missing.join(', ')}` : null
 }
 
 function validateCarriedSet(carried, open) {
@@ -3958,9 +4084,9 @@ const changedFiles = () =>
 // derives, the no-progress guard that counts holes, and the ability to say "47 of 65 findings
 // were uncovered", which is the measurement that settled the cap question.
 //
-// The coverage mapping survives here and nowhere else. `writeSpecs` scatters it into per-spec
-// `## Must cover` blocks, so each task knows its own cases and the claim about the population
-// as a whole is lost the moment planning ends.
+// The complete coverage mapping survives here. `writeSpecs` scatters its cases and stable
+// acceptance links into per-spec blocks, so each task carries its own part while the population
+// claim as a whole remains readable in this artifact.
 function populationPlanRecord(population) {
   const summary = populationResolution.get(population) || {
     state: 'unknown', returned: 0, repaired: 0, dropped: 0, retained: 0,
@@ -4006,6 +4132,7 @@ function readPlanPopulationRecord(text) {
 
 function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = []) {
   const populationRecord = populationPlanRecord(population)
+  const ledger = planningLedger(out)
   writeFileSync(PLAN, [
     '---',
     `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`,
@@ -4024,8 +4151,14 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     '## Coverage — the population this request implies', '',
     "The architect's own mapping: what it says this request implies, and which task it gave",
     'each case to.', '',
-    '| Case | Task |', '|---|---|',
-    ...(out.coverage || []).map((c) => `| ${c.case} | \`${c.task}\` |`), '',
+    '| Case | Task | Acceptance criteria |', '|---|---|---|',
+    ...(out.coverage || []).map((c) => `| ${c.case.replace(/\|/g, '\\|')} | ` +
+      `\`${c.task}\` | ${c.acceptance_criteria.map((item) =>
+        item.replace(/\|/g, '\\|')).join('<br>')} |`), '',
+    '## Planning relation ledger', '',
+    'Engine-assigned stable IDs for every task requirement and every declared',
+    '`case → task → acceptance criterion` relation.', '',
+    '```json', JSON.stringify(ledger, null, 2), '```', '',
     // Both lists, side by side, and no attempt to reconcile them here. A script cannot match
     // two prose phrasings of the same case, and a human reading the two tables against each
     // other is the only reader who can. This is also the only artifact the blind list survives
@@ -4524,7 +4657,7 @@ function plan(description) {
     // say in `resplit` what moved and why.
     const revision = problems
       ? '\n\nYour previous plan, in the order it would run:\n\n' +
-        JSON.stringify(last.tasks, null, 2) +
+        JSON.stringify({ tasks: last.tasks, coverage: last.coverage }, null, 2) +
         '\n\nThe reviewer found these holes in it. Close every one:\n- ' + problems.join('\n- ') +
         '\n\nReturn the whole plan again with the holes closed, and change only what closing them' +
         ' requires: a task nobody raised a hole about comes back as it was. Where a hole is about' +
@@ -4542,7 +4675,7 @@ function plan(description) {
     ].join(''), SCHEMA.plan, f)
     planProvenance.push({ round, role: 'architect', ...runtimeIdentity(out) })
 
-    validatePlanRelations(out)
+    const ledger = validatePlanRelations(out)
 
     if (blocked(out.blocked)) {
       die(`architect stopped:\n\n${out.blocked}\n\n` +
@@ -4568,12 +4701,17 @@ function plan(description) {
       '\n\nProfile:\n\n' + text,
       '\n\nProposed tasks:\n\n' + JSON.stringify(out.tasks, null, 2),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
+      '\n\nEngine-owned relation ledger. Return exactly one `relations` row for every id:',
+      '\n\n' + JSON.stringify(ledger.relations, null, 2),
       populationBlock(population),
       collisionBlock(collided),
       '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
       ' dimension.',
     ].join(''), SCHEMA.planReview, f)
     planProvenance.push({ round, role: 'plan-reviewer', ...runtimeIdentity(r) })
+
+    const relationProblem = planRelationIssue(ledger, r.relations)
+    if (relationProblem) schemaFailure('plan-reviewer', '$.relations', relationProblem)
 
     // The script derives the verdict from the slots. The reviewer does not get to state one.
     //
@@ -4602,6 +4740,8 @@ function plan(description) {
     // section under the `## Undecidable` one. The artifact existed; it was handed an empty array.
     // Measured on the install that found it: a $1.57 verdict of which one slot in five was read.
     problems = [
+      ...r.relations.filter((row) => row.state === 'uncovered')
+        .map((row) => `uncovered relation [${row.id}] — ${row.evidence}`),
       ...(r.uncovered || []).map((x) => `uncovered — ${x}`),
       ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
       ...(r.misordered || []).map((x) => `misordered — ${x}`),
@@ -4657,14 +4797,23 @@ function plan(description) {
 // the human to build a plan nobody approved — and printed it BEFORE the holes.
 function writeSpecs(tasks, coverage) {
   mkdirSync(QUEUE_DIR, { recursive: true })
+  const ledger = planningLedger({ tasks, coverage })
   tasks.forEach((t, i) => {
     const id = String(i + 1).padStart(3, '0')
     const path = join(QUEUE_DIR, `${id}_${t.slug}.md`)
     const covers = (coverage || []).filter((c) => c.task === t.slug).map((c) => c.case)
+    const links = ledger.relations.filter((relation) => relation.task === t.slug)
     writeFileSync(path, [
       '---', `id: ${id}`, `title: ${t.title}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
       ...(covers.length ? ['## Must cover', ...covers.map((x) => `- ${x}`), ''] : []),
+      ...(links.length ? ['## Acceptance links', ...links.map((relation) => {
+        const criteria = relation.criterion_ids.map((criterionId) => {
+          const criterion = ledger.requirements.find((item) => item.id === criterionId)
+          return `\`${criterionId}\` ${criterion?.text || ''}`
+        }).join('; ')
+        return `- \`${relation.id}\` / \`${relation.case_id}\` ${relation.case} → ${criteria}`
+      }), ''] : []),
       '## Change', ...t.change.map((x) => `- ${x}`), '',
       '## Done when', ...t.done_when.map((x) => `- ${x}`), '',
     ].join('\n'))
@@ -6449,7 +6598,24 @@ function specTask(name, body) {
     const sec = body.split(/^## /m).find((x) => x.toLowerCase().startsWith(heading))
     return sec ? sec.split('\n').slice(1).filter((l) => l.startsWith('- ')).map((l) => l.slice(2)) : []
   }
-  return { slug: name, change: bullets('change'), done_when: bullets('done when') }
+  return {
+    slug: name.replace(/^\d+_/, '').replace(/\.md$/, ''),
+    title: body.match(/^title:\s*(.+)$/m)?.[1]?.trim() || name,
+    read: bullets('read'),
+    must_cover: bullets('must cover'),
+    change: bullets('change'),
+    done_when: bullets('done when'),
+  }
+}
+
+function specsPlanningLedger(specs) {
+  const tasks = specs.map((name) => specTask(name, readFileSync(join(QUEUE_DIR, name), 'utf8')))
+  const coverage = tasks.flatMap((task) => task.must_cover.map((caseText) => ({
+    case: caseText,
+    task: task.slug,
+    acceptance_criteria: [...task.done_when],
+  })))
+  return planningLedger({ tasks, coverage })
 }
 
 // `population` is enumerated once by the caller and handed down, never re-derived here — see
@@ -6469,6 +6635,7 @@ function judgeSpecs(description, f, text, population) {
   const collided = collisions(
     specs.map((x) => specTask(x, readFileSync(join(QUEUE_DIR, x), 'utf8'))))
   sayCollisions(collided)
+  const ledger = specsPlanningLedger(specs)
 
   const r = agent('plan-reviewer', [
     'Judge these task specs. There is no code for them yet: you are judging the split and its',
@@ -6479,11 +6646,17 @@ function judgeSpecs(description, f, text, population) {
     '\n\nThese were written by hand, so there is no separate coverage mapping: each spec\'s',
     ' "## Must cover" block is its coverage claim, and a spec with no such block is claiming',
     ' nothing.',
+    '\n\nEngine-owned relation ledger. For hand-edited specs each case is conservatively linked',
+    ' to every Done when item in its task. Return exactly one `relations` row for every id:',
+    '\n\n' + JSON.stringify(ledger.relations, null, 2),
     populationBlock(population),
     collisionBlock(collided),
     '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
     ' dimension.',
   ].join(''), SCHEMA.planReview, f)
+
+  const relationProblem = planRelationIssue(ledger, r.relations)
+  if (relationProblem) schemaFailure('plan-reviewer', '$.relations', relationProblem)
 
   // The four other slots are built BEFORE the question is raised, so a verdict that stopped
   // the run still shows what else it found. It was paid for either way: the same call fills
@@ -6491,6 +6664,8 @@ function judgeSpecs(description, f, text, population) {
   // reordering and nothing else — the run still stops, because a fix written under an
   // unsettled question is a guess.
   const problems = [
+    ...r.relations.filter((row) => row.state === 'uncovered')
+      .map((row) => `uncovered relation [${row.id}] — ${row.evidence}`),
     ...(r.uncovered || []).map((x) => `uncovered — ${x}`),
     ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
     ...(r.misordered || []).map((x) => `misordered — ${x}`),
@@ -6945,7 +7120,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 export {
   GateFailureAction, PlanningAction, SCHEMA, addAccounting, canonicalAuthorityPaths,
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
-  normalizeAccounting, reviewCriteriaIssue,
+  normalizeAccounting, planRelationIssue, planningLedger, reviewCriteriaIssue,
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface, retainWeakVerificationEvents,
   runProjectPolicy, runWeakReplaySession, verifyProjectPolicies, zeroAccounting,

@@ -35,6 +35,13 @@ the code, before you read the plan closely.
 - A task needing something a later task produces is `misordered`.
 - A task doing work the request did not ask for is `out_of_scope`.
 
+The engine also gives every declared `case → task → acceptance criterion` relation a stable id.
+Return exactly one `relations` row for every id. Mark it `covered` only when the named final-tree
+criteria actually establish the case; otherwise mark it `uncovered` and state the missing proof.
+Missing, repeated, or invented relation ids invalidate your whole response. The `uncovered` slot
+still carries cases absent from the architect's mapping, because no relation id exists for a row
+the architect never declared.
+
 Enumerating beats reading, and that holds for what you add as much as for what you were
 given. "Every case of this enum", "both overloads of this method", "each caller of this
 function", "the empty and the non-empty state" — a population you can list is a population
@@ -96,6 +103,7 @@ something. Name that something.
 
 ## Silence is approval
 
-Every slot you leave empty is you approving that dimension. Leaving all five empty approves
-the plan, and the orchestrator commits it to disk. There is no field for a remark, a
-preference, or an improvement — deliberately. If it is not a hole, it does not go anywhere.
+Every hole slot you leave empty is you approving that dimension. Marking every relation
+`covered` and leaving all five hole slots empty approves the plan, and the orchestrator commits
+it to disk. There is no field for a remark, a preference, or an improvement — deliberately. If
+it is not a hole, it does not go anywhere.
