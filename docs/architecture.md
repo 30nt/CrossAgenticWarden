@@ -46,6 +46,8 @@ never an inference from one model draw. A risk class may also require a green `g
 starting commit before any executor runs; the final full gate can then attribute a regression to
 the build range. API v2 gate policies may classify a project-allowlisted flaky failure, while the
 engine retains the confirmation and retry cap.
+Required baseline caching is also project-aware: the engine hashes every input it owns and reuses
+a result only when a v2 gate policy supplies the matching digest for external inputs.
 
 ## The five roles
 
