@@ -122,6 +122,12 @@ node caw.mjs artifacts list          # retained run/recovery/probe/transport art
 text and deletes the file. Every command prints the resolved matrix and runtime digest before
 mutation or spend.
 
+Each provider call creates an immutable `attempt-*.json` before the child process starts. The run
+manifest links that attempt to its success, failure, timeout, interrupted state, diagnostics, and
+duration through one `attempt_id`. Usage is labelled `reported`, `partial`, or `unknown`; unknown
+is never written as zero. `estimated` is reserved for a future explicitly sourced estimator and
+is not emitted by the current adapters.
+
 ## Before you point this at a real repository
 
 - It runs model-authored code and **commits it**. Use a scratch branch on a repository you can
