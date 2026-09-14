@@ -7,7 +7,14 @@
         "title": "Store token",
         "read": ["src/token.js"],
         "change": ["Store a token without logging it."],
-        "done_when": ["A test proves the token is stored.", "A test proves logs contain no token."]
+        "done_when": ["A test proves the token is stored.", "A test proves logs contain no token."],
+        "surfaces": [{"id":"token-storage","responsibility":"Store one token without exposing it."}],
+        "state_machines": [{
+          "surface":"token-storage",
+          "states":["empty","stored"],
+          "transitions":[{"from":"empty","event":"store token","to":"stored"}]
+        }],
+        "indivisible_reason":""
       }
     ],
     "coverage": [
@@ -25,7 +32,7 @@
   },
   "expect": {
     "tasks": 1,
-    "requirements": 4,
+    "requirements": 6,
     "cases": 2,
     "relations": 2,
     "incomplete_review_is_rejected": true

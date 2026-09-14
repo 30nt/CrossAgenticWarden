@@ -1376,8 +1376,45 @@ const TASK = {
     read: { type: 'array', items: { type: 'string' } },
     change: { type: 'array', items: { type: 'string' } },
     done_when: { type: 'array', items: { type: 'string' } },
+    surfaces: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'stable kebab-case surface id' },
+          responsibility: { type: 'string', description: 'one independently changeable responsibility' },
+        },
+        required: ['id', 'responsibility'],
+      },
+    },
+    state_machines: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          surface: { type: 'string', description: 'id of exactly one surface in this task' },
+          states: { type: 'array', minItems: 2, items: { type: 'string' } },
+          transitions: {
+            type: 'array', minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string' }, event: { type: 'string' }, to: { type: 'string' },
+              },
+              required: ['from', 'event', 'to'],
+            },
+          },
+        },
+        required: ['surface', 'states', 'transitions'],
+      },
+    },
+    indivisible_reason: {
+      type: 'string',
+      description: 'empty for one surface; for several surfaces, why they cannot be separate tasks',
+    },
   },
-  required: ['slug', 'title', 'read', 'change', 'done_when'],
+  required: ['slug', 'title', 'read', 'change', 'done_when', 'surfaces', 'state_machines',
+    'indivisible_reason'],
 }
 
 // One shape for every blocking slot of a task verdict. `where` and `fix` are what the executor
@@ -3741,13 +3778,25 @@ function planningLedger(out) {
   const taskBySlug = new Map(tasks.map((task) => [task.slug, task]))
   const requirements = (out.tasks || []).flatMap((task) => {
     const taskId = taskBySlug.get(task.slug)?.id || planningId('plan-task', task.slug)
-    return ['read', 'change', 'done_when'].flatMap((section) =>
+    const ordinary = ['read', 'change', 'done_when'].flatMap((section) =>
       (task[section] || []).map((text) => ({
         id: planningId('plan-requirement', task.slug, section, text),
         task_id: taskId,
         section,
         text,
       })))
+    const surfaces = (task.surfaces || []).map((surface) => ({
+      id: planningId('plan-requirement', task.slug, 'surface', surface.id, surface.responsibility),
+      task_id: taskId, section: 'surface', text: `${surface.id}: ${surface.responsibility}`,
+    }))
+    const transitions = (task.state_machines || []).flatMap((machine) =>
+      (machine.transitions || []).map((transition) => ({
+        id: planningId('plan-requirement', task.slug, 'state-transition', machine.surface,
+          transition.from, transition.event, transition.to),
+        task_id: taskId, section: 'state-transition',
+        text: `${machine.surface}: ${transition.from} --${transition.event}--> ${transition.to}`,
+      })))
+    return [...ordinary, ...surfaces, ...transitions]
   })
   const requirementByKey = new Map(requirements.map((row) =>
     [`${row.task_id}\0${row.section}\0${row.text}`, row]))
@@ -3790,6 +3839,50 @@ function validatePlanRelations(out) {
           'requirements must not be repeated')
       }
     }
+    const surfaceIds = task.surfaces.map((surface) => surface.id.trim())
+    if (surfaceIds.some((id) => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) ||
+        task.surfaces.some((surface) => !surface.responsibility.trim())) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].surfaces`,
+        'each surface needs a kebab-case id and a non-empty responsibility')
+    }
+    if (new Set(surfaceIds).size !== surfaceIds.length) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].surfaces`, 'surface ids must be unique')
+    }
+    if (surfaceIds.length > 1 && !task.indivisible_reason.trim()) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].indivisible_reason`,
+        'a task with unrelated surfaces must explain why they are indivisible')
+    }
+    if (surfaceIds.length === 1 && task.indivisible_reason.trim()) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].indivisible_reason`,
+        'must be empty when the task has one surface')
+    }
+    const machineSurfaces = task.state_machines.map((machine) => machine.surface.trim())
+    if (new Set(machineSurfaces).size !== machineSurfaces.length ||
+        machineSurfaces.some((surface) => !surfaceIds.includes(surface)) ||
+        surfaceIds.some((surface) => !machineSurfaces.includes(surface))) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].state_machines`,
+        'every surface must have exactly one state machine and no unknown surface may appear')
+    }
+    for (const [machineIndex, machine] of task.state_machines.entries()) {
+      const states = machine.states.map((state) => state.trim())
+      if (states.some((state) => !state) || new Set(states).size !== states.length) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].state_machines[${machineIndex}].states`,
+          'states must be non-empty and unique')
+      }
+      for (const [transitionIndex, transition] of machine.transitions.entries()) {
+        if (!states.includes(transition.from) || !states.includes(transition.to) ||
+            !transition.event.trim()) {
+          schemaFailure('architect',
+            `$.tasks[${taskIndex}].state_machines[${machineIndex}].transitions[${transitionIndex}]`,
+            'from and to must name declared states and event must be non-empty')
+        }
+      }
+    }
+  }
+  const globalSurfaces = out.tasks.flatMap((task) => task.surfaces.map((surface) => surface.id))
+  if (new Set(globalSurfaces).size !== globalSurfaces.length) {
+    schemaFailure('architect', '$.tasks',
+      'surface ids must be globally unique; shared surfaces belong in one explicitly indivisible task')
   }
   const unknown = out.coverage.find((row) => !unique.has(row.task))
   if (unknown) {
@@ -5456,6 +5549,9 @@ function plan(description) {
       '\n\nProfile:\n\n' + text,
       revision,
       '\n\nSplit this into an ordered list of atomic tasks, and return the coverage mapping.',
+      ' Give every independently changeable surface a globally unique id and one explicit state',
+      ' machine. Put unrelated surfaces in separate tasks. If several surfaces truly cannot be',
+      ' delivered independently, keep them together only with a concrete indivisible_reason.',
     ].join(''), SCHEMA.plan, f)
     planProvenance.push({ round, role: 'architect', ...runtimeIdentity(out) })
 
@@ -5605,6 +5701,15 @@ function writeSpecs(tasks, coverage) {
     writeFileSync(path, [
       '---', `id: ${id}`, `title: ${t.title}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
+      '## Surfaces', ...t.surfaces.map((surface) =>
+        `- \`${surface.id}\` — ${surface.responsibility}`), '',
+      '## State machines', ...t.state_machines.flatMap((machine) => [
+        `- \`${machine.surface}\`: states ${machine.states.map((state) => `\`${state}\``).join(', ')}`,
+        ...machine.transitions.map((transition) =>
+          `  - \`${transition.from}\` -- ${transition.event} --> \`${transition.to}\``),
+      ]), '',
+      ...(t.indivisible_reason
+        ? ['## Indivisible', `- ${t.indivisible_reason}`, ''] : []),
       ...(covers.length ? ['## Must cover', ...covers.map((x) => `- ${x}`), ''] : []),
       ...(links.length ? ['## Acceptance links', ...links.map((relation) => {
         const criteria = relation.criterion_ids.map((criterionId) => {
@@ -7770,6 +7875,8 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' before what it needs — move it, and record every such move in `resplit` with the hole that',
     ' forced it. A hole is closed when `done_when` checks it on the tree the task leaves behind,',
     ' not when `change` mentions it.',
+    ' Preserve the explicit surfaces and state machines. Split unrelated surfaces into separate',
+    ' tasks unless the task carries a concrete indivisible_reason.',
   ].join(''), SCHEMA.plan, f)
 
   validatePlanRelations(out)
