@@ -345,6 +345,7 @@ export default {
   },
   decodeSuccess(stdout, { binding, requestedNative }) {
     let env
+    let eventTelemetry = null
     if (requestedNative?.probeKind === 'tool-contract') {
       let events
       try {
@@ -362,6 +363,11 @@ export default {
         for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child)
       }
       events.forEach(visit)
+      eventTelemetry = {
+        eventCount: events.length,
+        toolEventCount: toolUseNames.length,
+        eventBytes: Buffer.byteLength(stdout || ''),
+      }
       env = {
         ...env,
         structured_output: {
@@ -385,6 +391,7 @@ export default {
         provider: 'claude',
         requested: { model: binding.model, reasoning: binding.reasoning, native: requestedNative },
         ...seen,
+        telemetry: eventTelemetry || { eventCount: null, toolEventCount: null, eventBytes: null },
         cost: typeof env.total_cost_usd === 'number'
           ? { amount: env.total_cost_usd, currency: 'USD' }
           : null,

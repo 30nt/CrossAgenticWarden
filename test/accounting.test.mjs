@@ -53,15 +53,36 @@ test('run metrics retain bounded decisions without provider payloads', () => {
   const metrics = compactRunMetrics({
     run_id: 'run-1', started_at: 'start', updated_at: 'end', status: 'failed',
     calls: [
-      { role: 'executor', status: 'success', usage_state: 'reported', duration_ms: 120 },
-      { role: 'reviewer', status: 'failure', usage_state: 'estimated', duration_ms: 80 },
+      {
+        role: 'executor', task: '001.md', round: 2, status: 'success',
+        usage_state: 'reported', duration_ms: 120,
+        tokens: { input: 100, cachedRead: 70, output: 8, reasoning: 3 },
+        prompt: { bytes: 40 }, telemetry: { eventCount: 5, toolEventCount: 2, eventBytes: 90 },
+      },
+      {
+        role: 'reviewer', task: '001.md', round: 2, status: 'failure',
+        usage_state: 'estimated', duration_ms: 80,
+      },
     ],
     policy_calls: [{ stage: 'gate', duration_ms: 5, output: 'must not survive' }],
     certifications: [{ state: 'limited' }],
     final_response: 'must not survive',
   })
+  assert.deepEqual(metrics.provider_usage.input_tokens, { observed: 100, unknown_calls: 1 })
+  assert.deepEqual(metrics.provider_usage.cached_read_tokens, { observed: 70, unknown_calls: 1 })
+  assert.deepEqual(metrics.provider_usage.uncached_input_tokens, { observed: 30, unknown_calls: 1 })
+  assert.deepEqual(metrics.provider_usage.prompt_bytes, { observed: 40, unknown_calls: 1 })
+  assert.deepEqual(metrics.provider_usage.provider_tool_event_count,
+    { observed: 2, unknown_calls: 1 })
+  assert.deepEqual(metrics.provider_usage_by_scope.map((row) =>
+    [row.task, row.round, row.role, row.calls]), [
+    ['001.md', 2, 'executor', 1],
+    ['001.md', 2, 'reviewer', 1],
+  ])
+  delete metrics.provider_usage
+  delete metrics.provider_usage_by_scope
   assert.deepEqual(metrics, {
-    version: 1,
+    version: 2,
     run_id: 'run-1', started_at: 'start', updated_at: 'end', status: 'failed',
     provider_calls: 2,
     provider_calls_by_role: { executor: 1, reviewer: 1 },

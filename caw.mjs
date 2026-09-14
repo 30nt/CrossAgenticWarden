@@ -2310,8 +2310,44 @@ function compactRunMetrics(manifest) {
   }, new Map())].sort(([a], [b]) => String(a).localeCompare(String(b))))
   const duration = (rows) => rows.reduce((sum, row) =>
     sum + (Number.isFinite(row?.duration_ms) ? row.duration_ms : 0), 0)
+  const usage = (rows) => {
+    const fields = {
+      input_tokens: (row) => row?.tokens?.input,
+      cached_read_tokens: (row) => row?.tokens?.cachedRead,
+      uncached_input_tokens: (row) => Number.isFinite(row?.tokens?.input) &&
+        Number.isFinite(row?.tokens?.cachedRead)
+        ? Math.max(0, row.tokens.input - row.tokens.cachedRead) : null,
+      output_tokens: (row) => row?.tokens?.output,
+      reasoning_tokens: (row) => row?.tokens?.reasoning,
+      prompt_bytes: (row) => row?.prompt?.bytes,
+      provider_event_count: (row) => row?.telemetry?.eventCount,
+      provider_tool_event_count: (row) => row?.telemetry?.toolEventCount,
+      provider_event_bytes: (row) => row?.telemetry?.eventBytes,
+    }
+    return Object.fromEntries(Object.entries(fields).map(([name, read]) => {
+      const values = rows.map(read)
+      return [name, {
+        observed: values.reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0),
+        unknown_calls: values.filter((value) => !Number.isFinite(value)).length,
+      }]
+    }))
+  }
+  const scopes = [...calls.reduce((map, call) => {
+    const scope = {
+      task: call?.task || null,
+      round: Number.isSafeInteger(call?.round) ? call.round : null,
+      role: call?.role || 'unknown',
+    }
+    const key = stableJson(scope)
+    if (!map.has(key)) map.set(key, { ...scope, calls: [] })
+    map.get(key).calls.push(call)
+    return map
+  }, new Map()).values()].map((scope) => ({
+    task: scope.task, round: scope.round, role: scope.role,
+    calls: scope.calls.length, usage: usage(scope.calls),
+  })).sort((a, b) => stableJson(a).localeCompare(stableJson(b)))
   return {
-    version: 1,
+    version: 2,
     run_id: manifest?.run_id || null,
     started_at: manifest?.started_at || null,
     updated_at: manifest?.updated_at || null,
@@ -2320,6 +2356,8 @@ function compactRunMetrics(manifest) {
     provider_calls_by_role: countBy(calls, 'role'),
     provider_calls_by_status: countBy(calls, 'status'),
     usage_states: countBy(calls, 'usage_state'),
+    provider_usage: usage(calls),
+    provider_usage_by_scope: scopes,
     provider_duration_ms: duration(calls),
     policy_calls: policyCalls.length,
     policy_duration_ms: duration(policyCalls),
@@ -2358,6 +2396,7 @@ function writeRunManifest(status) {
     calls: runRecord.calls,
     stages: runRecord.stages || [],
     diagnostics: runRecord.diagnostics,
+    gate_evidence: runRecord.gateEvidence || [],
     certifications: runRecord.certifications || [],
     audits: runRecord.audits || [],
     ...(projectPolicySet?.manifestDigest ? {
@@ -2434,7 +2473,7 @@ function recordStage(kind, name, startedMs, state, detail = {}) {
   writeRunManifest(state === 'success' || state === 'green' ? 'active' : 'failed')
 }
 
-function beginProviderAttempt(role, provider, binding, invocation, budgetLimits) {
+function beginProviderAttempt(role, provider, binding, invocation, budgetLimits, promptMetrics = {}) {
   reserveProviderBudget(role, budgetLimits)
   const run = beginRunRecord()
   const index = String(run.calls.length + 1).padStart(3, '0')
@@ -2463,6 +2502,14 @@ function beginProviderAttempt(role, provider, binding, invocation, budgetLimits)
       native: invocation.requestedNative || null,
     },
     usage_estimate: usageEstimate,
+    prompt: {
+      bytes: promptMetrics.promptBytes ?? null,
+      instructions_bytes: promptMetrics.instructionsBytes ?? null,
+      dossier: promptMetrics.dossier ?? null,
+    },
+    task: promptMetrics.task ?? null,
+    round: promptMetrics.round ?? null,
+    pass: promptMetrics.pass ?? null,
   }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
@@ -2474,11 +2521,14 @@ function beginProviderAttempt(role, provider, binding, invocation, budgetLimits)
     status: 'started',
     usage_state: 'unknown',
     started_at: startedAt,
+    task: body.task,
+    round: body.round,
+    pass: body.pass,
   }
   run.calls.push(entry)
   writeRunManifest('active')
   return { id: attemptId, index, startedAt, startedMs: Date.now(), entry,
-    usageEstimate, budgetSettled: false }
+    usageEstimate, prompt: body.prompt, budgetSettled: false }
 }
 
 function providerUsageState(result) {
@@ -2502,12 +2552,17 @@ function recordProviderCall(role, provider, result, attempt) {
     completed_at: new Date().toISOString(),
     role,
     provider: result.provider,
+    task: attempt.entry.task,
+    round: attempt.entry.round,
+    pass: attempt.entry.pass,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
     runtime_digest: resolvedRuntime.digest,
     requested: result.requested,
     models: result.models,
     tokens: result.tokens,
+    telemetry: result.telemetry,
+    prompt: attempt.prompt,
     cost: result.cost,
     duration_ms: result.durationMs,
     usage_state: usageState,
@@ -2525,6 +2580,9 @@ function recordProviderCall(role, provider, result, attempt) {
     bytes: bytes.length,
     status: 'success',
     usage_state: usageState,
+    tokens: result.tokens,
+    telemetry: result.telemetry,
+    prompt: attempt.prompt,
     duration_ms: result.durationMs ?? (Date.now() - attempt.startedMs),
     completed_at: new Date().toISOString(),
   })
@@ -2549,6 +2607,9 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
     completed_at: new Date().toISOString(),
     role,
     provider: provider.adapter.id,
+    task: attempt.entry.task,
+    round: attempt.entry.round,
+    pass: attempt.entry.pass,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
     exit_status: result.status,
@@ -2560,6 +2621,8 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
       requested: observed.requested,
       models: observed.models,
       tokens: observed.tokens,
+      telemetry: observed.telemetry,
+      prompt: attempt.prompt,
       cost: observed.cost,
       duration_ms: observed.durationMs,
     } : {}),
@@ -2577,6 +2640,11 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
     status: terminalStatus,
     failure_kind: failureKind,
     usage_state: usageState,
+    ...(observed ? {
+      tokens: observed.tokens,
+      telemetry: observed.telemetry,
+      prompt: attempt.prompt,
+    } : {}),
     duration_ms: Date.now() - attempt.startedMs,
     completed_at: new Date().toISOString(),
   })
@@ -4456,7 +4524,7 @@ function validateCallResult(decoded, role, binding) {
   }
   exact(decoded, ['canonical', 'finalResponse'], `${role} decoded result`)
   const result = decoded.canonical
-  exact(result, ['value', 'provider', 'requested', 'models', 'tokens', 'cost', 'durationMs'],
+  exact(result, ['value', 'provider', 'requested', 'models', 'tokens', 'telemetry', 'cost', 'durationMs'],
     `${role} canonical call result`)
   if (result.provider !== binding.provider) throw new Error(`${role} result provider does not match binding`)
   exact(result.requested, ['model', 'reasoning', 'native'], `${role}.requested`)
@@ -4475,6 +4543,12 @@ function validateCallResult(decoded, role, binding) {
   exact(result.tokens, ['input', 'output', 'cachedRead', 'cachedWritten', 'reasoning'], `${role}.tokens`)
   for (const value of Object.values(result.tokens)) {
     if (!(value === null || typeof value === 'number')) throw new Error(`${role}.tokens has invalid observation`)
+  }
+  exact(result.telemetry, ['eventCount', 'toolEventCount', 'eventBytes'], `${role}.telemetry`)
+  for (const [key, value] of Object.entries(result.telemetry)) {
+    if (!(value === null || (Number.isSafeInteger(value) && value >= 0))) {
+      throw new Error(`${role}.telemetry.${key} is invalid`)
+    }
   }
   if (result.cost !== null) {
     exact(result.cost, ['amount', 'currency'], `${role}.cost`)
@@ -4591,7 +4665,14 @@ function agent(role, prompt, schema, f, spec, context = null) {
     die(`${role} adapter could not construct invocation: ${error?.message || error}`)
   }
 
-  const attempt = beginProviderAttempt(role, provider, binding, invocation, f.provider_budgets)
+  const attempt = beginProviderAttempt(role, provider, binding, invocation, f.provider_budgets, {
+    promptBytes: Buffer.byteLength(prompt || ''),
+    instructionsBytes: Buffer.byteLength(instructions),
+    dossier: context?.dossier || null,
+    task: spec || null,
+    round: context?.round ?? null,
+    pass: context?.pass ?? null,
+  })
   process.stderr.write(`  · ${role} `)
   // The agent is the only long call in this script — the gates are seconds — so it is the
   // only one worth holding the machine awake for.

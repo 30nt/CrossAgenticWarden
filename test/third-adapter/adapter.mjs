@@ -170,6 +170,9 @@ export default {
         requested: { model: binding.model, reasoning: binding.reasoning, native },
         models: [],
         tokens: { input: null, output: null, cachedRead: null, cachedWritten: null, reasoning: null },
+        telemetry: {
+          eventCount: null, toolEventCount: null, eventBytes: Buffer.byteLength(stdout || ''),
+        },
         cost: null,
         durationMs: null,
       },
