@@ -94,8 +94,9 @@ const requestedNative = (binding) => ({
 })
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'test-third',
+  vendor: 'independent-fixture',
   features: FEATURES,
   resolveExecutable(env) { return env.CAW_THIRD || 'test-third' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },

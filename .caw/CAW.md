@@ -32,6 +32,10 @@ review_dependency_roots:
 # Task specs, commit messages, notes. Stated explicitly because an agent otherwise
 # inherits whatever language preference the machine it runs on happens to carry.
 docs_language: English
+
+# Required separation between the author and reviewer bindings.
+planning_independence: same-provider
+task_independence: different-model
 ---
 
 # CAW profile

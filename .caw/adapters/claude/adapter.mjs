@@ -209,8 +209,9 @@ function guarantees(role, cliVersion) {
 }
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'claude',
+  vendor: 'anthropic',
   features: {
     schemaTransport: 'inline', resultTransport: 'stdout',
     reportsCost: true, reportsCacheCounters: true, reportsModels: true,

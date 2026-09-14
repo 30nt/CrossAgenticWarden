@@ -492,7 +492,7 @@ function providerLaunch(executable, platformName = process.platform, providerId 
 }
 
 const ADAPTER_KEYS = [
-  'apiVersion', 'id', 'features', 'resolveExecutable', 'versionInvocation',
+  'apiVersion', 'id', 'vendor', 'features', 'resolveExecutable', 'versionInvocation',
   'mechanismAvailable', 'verifyGuaranteeProbe', 'describe', 'buildInvocation', 'buildProbeInvocation',
   'decodeSuccess', 'decodeFailure',
 ]
@@ -522,14 +522,18 @@ async function discoverAdapters() {
     if (!adapter || typeof adapter !== 'object') die(`adapter ${name} has no default contract object`)
     const extra = Object.keys(adapter).filter((key) => !ADAPTER_KEYS.includes(key))
     const missing = ADAPTER_KEYS.filter((key) => !Object.prototype.hasOwnProperty.call(adapter, key))
-    const versionMismatch = adapter.apiVersion !== 2
+    const versionMismatch = adapter.apiVersion !== 3
     if (extra.length || missing.length || versionMismatch || adapter.id !== name) {
       die(`adapter ${name} has malformed contract` +
-        `${versionMismatch ? `; API version is ${JSON.stringify(adapter.apiVersion)}, expected 2` : ''}` +
+        `${versionMismatch ? `; API version is ${JSON.stringify(adapter.apiVersion)}, expected 3` : ''}` +
         `${missing.length ? `; missing ${missing.join(', ')}` : ''}` +
         `${extra.length ? `; unknown ${extra.join(', ')}` : ''}`)
     }
-    for (const fn of ADAPTER_KEYS.filter((key) => !['apiVersion', 'id', 'features'].includes(key))) {
+    if (typeof adapter.vendor !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(adapter.vendor)) {
+      die(`adapter ${name}.vendor must be a stable lowercase vendor id`)
+    }
+    for (const fn of ADAPTER_KEYS.filter((key) =>
+      !['apiVersion', 'id', 'vendor', 'features'].includes(key))) {
       if (typeof adapter[fn] !== 'function') die(`adapter ${name}.${fn} must be a function`)
     }
     if (adapters.has(name)) die(`duplicate adapter id ${name}`)
@@ -1064,6 +1068,38 @@ function compareGuarantees(role, descriptor, provider, missingEvidence = null) {
   }
 }
 
+function reviewIndependence(mode, authorRole, reviewerRole) {
+  const participant = (role) => {
+    const binding = resolvedRuntime.value.roles[role]
+    const adapter = adapters.get(binding.provider)
+    return {
+      role,
+      provider: binding.provider,
+      vendor: adapter?.vendor || binding.provider,
+      model: binding.model,
+    }
+  }
+  const author = participant(authorRole)
+  const reviewer = participant(reviewerRole)
+  const scope = authorRole === 'architect' ? 'planning' : 'task'
+  if (mode === 'human-review') {
+    return {
+      scope, mode, author, reviewer, satisfied: false,
+      reason: 'Automated approval is disabled; CAW has no signed human-attestation command yet.',
+    }
+  }
+  const satisfied = mode === 'same-provider'
+    || (mode === 'different-model' &&
+      (author.vendor !== reviewer.vendor || author.model !== reviewer.model))
+    || (mode === 'cross-vendor' && author.vendor !== reviewer.vendor)
+  return {
+    scope, mode, author, reviewer, satisfied,
+    reason: satisfied ? '' : mode === 'cross-vendor'
+      ? 'Select adapters owned by different vendors.'
+      : 'Select a different model or a different vendor for the reviewer.',
+  }
+}
+
 function preflightRuntime(f) {
   if (!resolvedRuntime) resolvedRuntime = loadRuntime(f)
   if (!resolvedRuntime.providers) {
@@ -1101,6 +1137,18 @@ function preflightRuntime(f) {
           `  Run: node caw.mjs probe ${provider}`).join('\n'))
     }
   }
+  const independence = [
+    reviewIndependence(f.planning_independence, 'architect', 'plan-reviewer'),
+    reviewIndependence(f.task_independence, 'executor', 'reviewer'),
+  ]
+  const independenceFailure = independence.find((entry) => !entry.satisfied)
+  if (independenceFailure) {
+    die(`${independenceFailure.scope} independence requires ${independenceFailure.mode}; actual pair is ` +
+      `${independenceFailure.author.vendor}/${independenceFailure.author.model} -> ` +
+      `${independenceFailure.reviewer.vendor}/${independenceFailure.reviewer.model}. ` +
+      independenceFailure.reason)
+  }
+  resolvedRuntime.independence = independence
   if (!resolvedRuntime.printed) {
     say(`runtime ${resolvedRuntime.digest}`)
     for (const role of ROLES) {
@@ -1110,6 +1158,10 @@ function preflightRuntime(f) {
         ` adapter=${provider.adapter.digest.slice(0, 12)} CLI=${provider.cliVersion}`)
     }
     for (const line of observedProbeDrift) say(line)
+    for (const entry of independence) {
+      say(`  ${entry.scope} independence: ${entry.mode} — ${entry.author.vendor}/${entry.author.model}` +
+        ` -> ${entry.reviewer.vendor}/${entry.reviewer.model}`)
+    }
     resolvedRuntime.printed = true
   }
   printRuntimeResiduals({ runtime: resolvedRuntime.value })
@@ -1583,6 +1635,7 @@ function writeRunManifest(status) {
     run_id: runRecord.id,
     engine_digest: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
     runtime_digest: resolvedRuntime.digest,
+    review_independence: resolvedRuntime.independence || [],
     started_at: runRecord.startedAt,
     updated_at: new Date().toISOString(),
     status,
@@ -2057,6 +2110,13 @@ function profile(preflight = true) {
   f.index_format = f.index_format || 'text-v0'
   if (!['text-v0', 'json-v1'].includes(f.index_format)) {
     die(`.caw/CAW.md index_format must be text-v0 or json-v1 — got "${f.index_format}"`)
+  }
+  for (const key of ['planning_independence', 'task_independence']) {
+    f[key] = f[key] || 'same-provider'
+    if (!['same-provider', 'different-model', 'cross-vendor', 'human-review'].includes(f[key])) {
+      die(`.caw/CAW.md ${key} must be same-provider, different-model, cross-vendor, or ` +
+        `human-review — got "${f[key]}"`)
+    }
   }
   legacyQueueRefusal()
   if (preflight) preflightRuntime(f)

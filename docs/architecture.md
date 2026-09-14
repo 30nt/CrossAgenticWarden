@@ -62,6 +62,12 @@ omits stays open.
 `.caw/runtime.json` binds each role to a provider, model and reasoning level. That declaration is
 not trusted on its own. Each role has a set of requirements:
 
+`.caw/CAW.md` separately sets `planning_independence` and `task_independence`. `same-provider`
+permits any pair, `different-model` requires a different vendor or model, and `cross-vendor`
+compares the stable `vendor` owner reported by each adapter. `human-review` disables automated
+approval and currently refuses because CAW has no signed human-attestation command. The resolved
+pairs and whether they satisfy policy are retained in every run manifest.
+
 ```js
 executor: {
   repositoryRead: 'available', directEdit: 'available', shellExecution: 'available',

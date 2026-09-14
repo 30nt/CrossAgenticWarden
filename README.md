@@ -3,8 +3,9 @@
 *[Русская версия](docs/readme.ru.md)*
 
 A small agentic pipeline that splits one request into tasks, implements them one at a time,
-and has a **different model, from a different vendor, judge each one against evidence it had
-to produce**.
+and has a separately configured reviewer judge each one against evidence it had to produce.
+The project can enforce same-provider, different-model, or cross-vendor review; CAW checks the
+actual adapter vendor and model pair before any provider call.
 
 Roles bind explicitly to trusted provider adapters. The engine owns the protocol, schemas,
 gates, state and commits — the models own none of those. One file, 5.2k lines, no dependencies.

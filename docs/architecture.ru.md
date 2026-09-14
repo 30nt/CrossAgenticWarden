@@ -62,6 +62,13 @@
 `.caw/runtime.json` привязывает каждую роль к провайдеру, модели и уровню reasoning. Само по себе
 это объявление доверия не имеет. У каждой роли есть набор требований:
 
+`.caw/CAW.md` отдельно задаёт `planning_independence` и `task_independence`. Режим
+`same-provider` допускает любую пару, `different-model` требует другого вендора или модели, а
+`cross-vendor` сравнивает стабильного владельца `vendor`, которого сообщает адаптер.
+`human-review` отключает автоматическое одобрение и пока отказывает, потому что в CAW нет команды
+подписанной аттестации человека. Фактические пары и результат проверки сохраняются в каждом run
+manifest.
+
 ```js
 executor: {
   repositoryRead: 'available', directEdit: 'available', shellExecution: 'available',
