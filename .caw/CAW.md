@@ -8,9 +8,12 @@ main_branch: main
 # Two conventions, both explained in docs/gate.md: exit 75 when the gate REFUSES to start
 # rather than fails, and read CAW_SPEC when the gate looks at .caw-tasks/ at all.
 gate_fast: npm test
+# Optional positive milliseconds. Empty means no engine timeout.
+gate_fast_timeout_ms:
 
 # Run once, at the end of a build. Leave empty when it is the same as gate_fast.
 gate_full:
+gate_full_timeout_ms:
 
 # Optional. Prints this project's CLOSED sets — the ones a script can list in full and a
 # model can only sample: every member of an enum, every caller, every migration, every

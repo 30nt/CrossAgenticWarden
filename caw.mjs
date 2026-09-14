@@ -307,11 +307,10 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
 // call across a run, which nothing records today; until something does, this number is a
 // guess with a stated basis rather than a measurement.
 //
-// The gate is deliberately left without one. How long a suite runs is a property of the
-// project — one install measures 3:20, another's is seconds — so the tool has no basis to pick
-// that bound, and a wrong guess turns a passing suite into a failed run. When it is needed the
-// shape is known: a profile field, and a gate that runs out of time is `did not run` (exit 75),
-// not red.
+// Gate timeouts live in the project profile. How long a suite runs is a property of the project
+// — one install measures 3:20, another's is seconds — so the engine does not invent a default.
+// When configured, a timeout is its own state: the gate was killed before it produced a verdict,
+// which is neither red nor the gate's explicit exit-75 refusal.
 //
 // The override is an environment variable and NOT a profile field, and the distinction is the
 // one drawn just above. A suite's duration is a property of the project, so it would belong in
@@ -326,6 +325,7 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
 // — which breaks the byte-identity every install checks its version by. The measurement was
 // blocked by the thing that makes installs verifiable.
 const AGENT_TIMEOUT_DEFAULT_MS = 30 * 60 * 1000
+const GATE_TIMEOUT_MAX_MS = 2_147_483_647
 const AGENT_TIMEOUT_MS = (() => {
   const raw = process.env.CAW_AGENT_TIMEOUT_MS
   if (raw === undefined || raw.trim() === '') return AGENT_TIMEOUT_DEFAULT_MS
@@ -1931,6 +1931,18 @@ function profile(preflight = true) {
   // direction: gate() treats an empty command as green, so every task would pass a gate
   // that never ran and be committed on it.
   if (!f.gate_fast) die('.caw/CAW.md sets no gate_fast — refusing to run a pipeline with no gate')
+  for (const key of ['gate_fast_timeout_ms', 'gate_full_timeout_ms']) {
+    if (f[key] === undefined || f[key] === '') {
+      f[key] = null
+      continue
+    }
+    const ms = Number(f[key])
+    if (!Number.isSafeInteger(ms) || ms <= 0 || ms > GATE_TIMEOUT_MAX_MS) {
+      die(`.caw/CAW.md ${key} must be a positive whole number of milliseconds no greater than ` +
+        `${GATE_TIMEOUT_MAX_MS} — got "${f[key]}"`)
+    }
+    f[key] = ms
+  }
   legacyQueueRefusal()
   if (preflight) preflightRuntime(f)
   return { f, text }
@@ -2983,14 +2995,32 @@ function agent(role, prompt, schema, f, spec, context = null) {
 //
 // `status` is not redundant next to `ok`, and deleting it as such has already broken one
 // install for six days: 75 is the gate saying it did not run, and build() reads it.
-function gate(cmd, spec, cwd = undefined) {
-  if (!cmd) return { ok: true, out: '(none configured)' }
+function gate(cmd, spec, cwd = undefined, timeoutMs = null) {
+  if (!cmd) {
+    return {
+      ok: true, state: 'green', status: 0, out: '(none configured)',
+      durationMs: 0, timeoutMs,
+    }
+  }
   const env = { ...process.env, PWD: cwd || process.cwd() }
   if (spec) env.CAW_SPEC = spec
+  const startedAt = Date.now()
   const r = spawnSync('bash', ['-lc', cmd], {
     cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env,
+    ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   })
-  return { ok: r.status === 0, status: r.status, out: `${r.stdout || ''}${r.stderr || ''}`.slice(-8000) }
+  const state = r.error?.code === 'ETIMEDOUT' ? 'timeout'
+    : r.status === 0 ? 'green'
+    : r.status === 75 ? 'refused'
+    : 'red'
+  const diagnostic = state === 'timeout'
+    ? `\ngate exceeded ${formatTimeout(timeoutMs)} and was killed\n`
+    : ''
+  return {
+    ok: state === 'green', state, status: r.status,
+    out: `${r.stdout || ''}${r.stderr || ''}${diagnostic}`.slice(-8000),
+    durationMs: Date.now() - startedAt, timeoutMs,
+  }
 }
 
 // The closed sets of a project, computed instead of searched for. One opaque command, like a
@@ -4167,15 +4197,16 @@ function build(noFull) {
 
   if (!noFull && f.gate_full) {
     say(`\n· full gate: ${f.gate_full}`)
-    const g = gate(f.gate_full)
-    const gateState = g.status === 75 ? 'refused' : g.ok ? 'green' : 'red'
+    const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms)
     const gatePolicy = runProjectPolicy('gate', {
       task: null,
       kind: 'full',
       command: f.gate_full,
-      state: gateState,
+      state: g.state,
       status: g.status ?? (g.ok ? 0 : null),
       output: g.out.slice(-8000),
+      duration_ms: g.durationMs,
+      timeout_ms: g.timeoutMs,
     })
     if (gatePolicy?.output.action === 'stop') {
       if (g.out) say(g.out)
@@ -4184,6 +4215,10 @@ function build(noFull) {
     }
     if (!g.ok) {
       say(g.out)
+      if (g.state === 'timeout') {
+        die(`full gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed. No full-gate` +
+            ` verdict exists; re-run it or adjust gate_full_timeout_ms in .caw/CAW.md.`)
+      }
       // 75 (EX_TEMPFAIL) is the gate saying it DID NOT RUN — the convention the README asks
       // a gate to follow when it refuses to start rather than fails: a machine too busy for
       // the suite it shards, a simulator that is not there, a service it depends on that is
@@ -4191,7 +4226,7 @@ function build(noFull) {
       // Calling a refusal RED sends the reader hunting a defect through a range where no test
       // executed, each bisect step a full suite run. Measured on one install, where the gate
       // used exit 1 for both and the bisect advice was followed.
-      if (g.status === 75) {
+      if (g.state === 'refused') {
         die(`full gate DID NOT RUN — it refused to start, and nothing was tested.\n` +
             `  Every task is committed on its own green fast gate; none of that is in doubt.\n` +
             `  Re-run once the refusal is over:  ${f.gate_full}`)
@@ -4577,16 +4612,18 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
   })
   const startedAt = Date.now()
-  const result = gate(f.gate_fast, spec, surface.workingRoot)
+  const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms)
   const event = {
-    state: result.status === 75 ? 'unverified-refused'
+    state: result.state === 'timeout' ? 'unverified-timeout'
+      : result.state === 'refused' ? 'unverified-refused'
       : result.ok ? 'confirmed-weak' : 'mutation-caught',
     patch_sha256: createHash('sha256').update(patch).digest('hex'),
     patch_bytes: bytes,
     paths,
     gate: f.gate_fast,
     gate_status: result.status ?? (result.ok ? 0 : null),
-    gate_duration_ms: Date.now() - startedAt,
+    gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
+    gate_timeout_ms: result.timeoutMs,
     gate_output: result.out.slice(-8000),
   }
   surface.weakGate = {
@@ -4602,16 +4639,17 @@ function weakBaselineGate(f, spec, expectedDigest, surface) {
       'delivery tree changed after its green gate; refusing weak baseline')
   }
   const startedAt = Date.now()
-  const result = gate(f.gate_fast, spec, surface.workingRoot)
+  const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms)
   const observation = {
     gate: f.gate_fast,
     gate_status: result.status ?? (result.ok ? 0 : null),
-    gate_duration_ms: Date.now() - startedAt,
+    gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
+    gate_timeout_ms: result.timeoutMs,
     gate_output: result.out.slice(-8000),
   }
   surface.weakGate = {
     phase: 'baseline',
-    state: result.status === 75 ? 'refused' : result.ok ? 'green' : 'red',
+    state: result.state,
     gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
   }
   return { ...observation, state: surface.weakGate.state }
@@ -4648,22 +4686,30 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     finishSurface: (surface, outcome) => {
       if (outcome.state === 'baseline-unavailable') {
         const baseline = outcome.baseline || {}
+        const baselineReason = baseline.state === 'refused'
+          ? ['weak-baseline-refused', 'unmutated weak-verification gate refused to run (status 75)']
+          : baseline.state === 'timeout'
+            ? ['weak-baseline-timeout', 'unmutated weak-verification gate timed out']
+            : ['weak-baseline-red',
+                `unmutated weak-verification gate was red (status ${baseline.gate_status})`]
         retainReviewSurface(surface,
-          baseline.state === 'refused' ? 'weak-baseline-refused' : 'weak-baseline-red',
-          baseline.state === 'refused'
-            ? 'unmutated weak-verification gate refused to run (status 75)'
-            : `unmutated weak-verification gate was red (status ${baseline.gate_status})`)
+          baselineReason[0], baselineReason[1])
       } else if (outcome.state === 'error') {
         retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
       } else {
         const refused = outcome.mutations.find((result) =>
           result?.event?.state === 'unverified-refused')
+        const timedOut = outcome.mutations.find((result) =>
+          result?.event?.state === 'unverified-timeout')
         const caught = outcome.mutations.find((result) =>
           result?.event?.state === 'mutation-caught')
         const failed = outcome.mutations.find((result) => result?.error)
         if (refused) {
           retainReviewSurface(surface, 'weak-gate-refused',
             'weak mutation gate refused to run (status 75)')
+        } else if (timedOut) {
+          retainReviewSurface(surface, 'weak-gate-timeout',
+            'weak mutation gate timed out')
         } else if (caught) {
           retainReviewSurface(surface, 'weak-gate-red',
             `weak mutation made the gate red (status ${caught.event.gate_status})`)
@@ -4678,7 +4724,9 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
   const baseline = session.baseline
   const verification = {
     state: baseline.state === 'green' ? 'baseline-green'
-      : baseline.state === 'refused' ? 'unverified-baseline-refused' : 'unverified-baseline-red',
+      : baseline.state === 'refused' ? 'unverified-baseline-refused'
+      : baseline.state === 'timeout' ? 'unverified-baseline-timeout'
+      : 'unverified-baseline-red',
     baseline,
     mutations: [],
     replay_surface: {
@@ -4688,14 +4736,16 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
     },
   }
   if (baseline.state !== 'green') {
-    say(`  weak verification ${baseline.state === 'refused' ? 'DID NOT RUN' : 'unavailable'}:` +
+    say(`  weak verification ${['refused', 'timeout'].includes(baseline.state)
+      ? 'DID NOT COMPLETE' : 'unavailable'}:` +
       ` unmutated surface gate status ${baseline.gate_status};` +
       ` carrying ${(items || []).length} finding(s) unverified`)
     for (const item of items || []) {
       accepted.push(item)
       events.push({
         state: 'unverified',
-        reason: baseline.state === 'refused' ? 'baseline-refused' : 'baseline-red',
+        reason: baseline.state === 'refused' ? 'baseline-refused'
+          : baseline.state === 'timeout' ? 'baseline-timeout' : 'baseline-red',
         gate: baseline.gate,
         gate_status: baseline.gate_status,
         gate_output: baseline.gate_output,
@@ -4714,6 +4764,10 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
       } else if (event.state === 'unverified-refused') {
         verification.state = 'unverified-mutation-refused'
         events.push({ ...event, state: 'unverified', reason: 'mutation-gate-refused' })
+        accepted.push(item)
+      } else if (event.state === 'unverified-timeout') {
+        verification.state = 'unverified-mutation-timeout'
+        events.push({ ...event, state: 'unverified', reason: 'mutation-gate-timeout' })
         accepted.push(item)
       } else {
         noted.push(weakDowngrade(item,
@@ -4966,14 +5020,15 @@ function runTask(file, f, profileText, opts = {}) {
       confirmationRuns = 0
     }
 
-    const g = gate(f.gate_fast, file)
-    const gateState = g.status === 75 ? 'refused' : g.ok ? 'green' : 'red'
+    const g = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms)
     const gatePolicy = runProjectPolicy('gate', {
       task: file,
       command: f.gate_fast,
-      state: gateState,
+      state: g.state,
       status: g.status ?? (g.ok ? 0 : null),
       output: g.out.slice(-8000),
+      duration_ms: g.durationMs,
+      timeout_ms: g.timeoutMs,
       executor_retries: retry,
       confirmation_runs: confirmationRuns,
     })
@@ -4985,18 +5040,25 @@ function runTask(file, f, profileText, opts = {}) {
         taskAccounting(), runtimeHistory, weakVerification)
     }
     if (!g.ok) {
-      gateRedAttempts += 1
+      if (g.state === 'timeout') {
+        say(g.out)
+        stop(file, spec, ex, history, round, how, noted,
+             `${file} — the fast gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed.` +
+             ` No gate verdict exists; re-run it or adjust gate_fast_timeout_ms in .caw/CAW.md.`,
+             taskAccounting(), runtimeHistory, weakVerification)
+      }
       // A refusal spends no retry, because no executor round changes why a gate refuses to
       // start. Retrying it would burn the purse and then report "still red after N retries"
       // about a gate that never ran once. Same convention as the full gate above; unlike it,
       // this branch has never fired — the one gate known to exit 75 is a full one.
-      if (g.status === 75) {
+      if (g.state === 'refused') {
         say(g.out)
         stop(file, spec, ex, history, round, how, noted,
              `${file} — the fast gate DID NOT RUN: it refused to start, so nothing was tested.` +
              `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}`,
              taskAccounting(), runtimeHistory, weakVerification)
       }
+      gateRedAttempts += 1
       const action = decideGateFailure({
         reviewOnly: startAt === 'gate',
         confirmationRuns,
