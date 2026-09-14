@@ -3107,6 +3107,11 @@ test('a committed task retains its confirmed weak verification in the run record
   assert.equal(manifest.weak_verification.events[0].state, 'baseline-green')
   assert.equal(manifest.weak_verification.events[1].task, '001_baseline-task.md')
   assert.equal(manifest.weak_verification.events[1].state, 'confirmed-weak')
+  assert.match(manifest.weak_verification.events[1].patch_file, /^weak-.*\.patch$/)
+  const retainedPatch = readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.weak_verification.events[1].patch_file))
+  assert.equal(createHash('sha256').update(retainedPatch).digest('hex'),
+    manifest.weak_verification.events[1].patch_sha256)
 })
 
 test('weak verification retention reports every event lost beyond its ceiling', () => {
@@ -3211,6 +3216,50 @@ test('a malformed captured weak is noted without discarding an independent valid
   assert.match(state.noted[0], /retain why this mutation was not reproducible/)
   assert.match(state.noted[0], /the second mutation has a malformed hunk/)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
+})
+
+test('a weak mutation against another component is unavailable and never reaches an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, 'src'))
+  writeFileSync(join(f.root, 'src', 'expected.js'), 'export const expected = true\n')
+  execFileSync('git', ['add', 'src/expected.js'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add expected component'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'src/expected.js:1',
+      fix: 'make the expected component observable',
+      evidence: 'changed a different component in the isolated review surface',
+      mutation: { patch: readmeMutation('wrong-component'), breaks: 'the expected component' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(message, /changes README\.md but reviewer location names src\/expected\.js/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls.map(({ role }) => role), ['reviewer'])
+  assert.equal(manifest.weak_verification.events.at(-1).kind, 'mutation-unavailable')
+  assert.equal(manifest.weak_verification.events.at(-1).state, 'unavailable')
+  assert.match(manifest.weak_verification.events.at(-1).patch_file, /^weak-.*\.patch$/)
+  assert.equal(existsSync(join(f.root, '.caw-logs', runName,
+    manifest.weak_verification.events.at(-1).patch_file)), true)
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-replay')
+  assert.equal(certification.limitations.includes('unverified-mutation-replay'), true)
+  assert.equal(certification.weak_verification.failures[0].patch_file,
+    manifest.weak_verification.events.at(-1).patch_file)
 })
 
 const activeSurfaceNames = () => existsSync(REVIEW_SURFACE_PARENT)

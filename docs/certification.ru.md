@@ -20,6 +20,10 @@ weak verification, ID открытых findings и digest project policies.
 Weak-эксперимент, который поймал gate, записывается как `refuted`. Если baseline, mutation gate
 или replay не удалось завершить, результат считается `unavailable`: CAW сохраняет evidence и
 ограничивает сертификацию, но не превращает такой результат в требование к коду для executor.
+Если `where` указывает существующий файл репозитория, captured mutation должна менять именно этот
+файл. Изменение другого компонента считается unavailable evidence, а не подтверждённым weak test.
+Captured mutation patches сохраняются как приватные артефакты run record. Строки verification и
+certification содержат имя файла, размер и SHA-256, а не встраивают patch в JSON.
 
 `PLAN.md` переносит состояние, счётчики и digest population из планирования в последующий build.
 Ручная задача и старый план получают `population: unknown`, поэтому обычная сертификация для них
