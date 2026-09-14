@@ -114,6 +114,7 @@ node caw.mjs round <spec>            # one more review round on a task that stop
 node caw.mjs review <spec>           # review a task you finished by hand, and commit it
 node caw.mjs done <spec>             # remove a spec with no review at all
 node caw.mjs probe <provider>        # write current machine-local guarantee evidence
+node caw.mjs verify-project          # validate project policy extensions
 node caw.mjs artifacts list          # retained run/recovery/probe/transport artifacts
 ```
 
@@ -141,6 +142,7 @@ mutation or spend.
 | [docs/install.md](docs/install.md) | the full installation manual |
 | [docs/architecture.md](docs/architecture.md) | how the engine, roles, adapters and probes fit |
 | [docs/adapters.md](docs/adapters.md) | writing an adapter for another provider |
+| [docs/project-policies.md](docs/project-policies.md) | extending CAW without changing its core |
 | [docs/limitations.md](docs/limitations.md) | what is known to be broken or unexercised |
 | [SECURITY.md](SECURITY.md) | what is enforced, and what is not |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | what a useful contribution looks like here |

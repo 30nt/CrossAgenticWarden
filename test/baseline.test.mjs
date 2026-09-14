@@ -20,7 +20,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource,
+  populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   retainWeakVerificationEvents,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -279,6 +279,41 @@ Deterministic baseline fixture.
   writeFileSync(calls, '')
   return { parent, root, queue, calls }
 }
+
+function configureProjectPolicies(f, source, stages = ['planning', 'review', 'gate', 'commit']) {
+  const root = join(f.root, '.caw', 'project')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(join(root, 'policy.mjs'), source)
+  writeFileSync(join(root, 'manifest.json'), `${JSON.stringify({
+    api_version: 1,
+    policies: Object.fromEntries(stages.map((stage) => [stage, {
+      id: `${stage}-policy`, command: ['node', '.caw/project/policy.mjs'], timeout_ms: 2000,
+    }])),
+  }, null, 2)}\n`)
+  execFileSync('git', ['add', '.caw/project'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure project policies'], { cwd: f.root })
+}
+
+const projectPolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+const outputs = {
+  planning: request.context.request?.includes('blocked')
+    ? { issues: ['project planning is blocked'], instructions: [] }
+    : { issues: [], instructions: ['apply the project planning constraint'] },
+  review: {
+    criteria: [{ id: 'privacy', section: 'Privacy', criterion: 'No private value is logged.' }],
+    instructions: ['trace the project privacy boundary'],
+  },
+  gate: request.context.task?.includes('policy-stop')
+    ? { action: 'stop', reason: 'project gate policy rejected this task' }
+    : { action: 'continue', reason: '' },
+  commit: { subject: 'project: delivered safely' },
+}
+process.stdout.write(JSON.stringify(outputs[request.stage]))
+`
 
 function run(f, args, responses, extraEnv = {}) {
   writeFileSync(f.queue, `${JSON.stringify(responses, null, 2)}\n`)
@@ -1100,6 +1135,34 @@ test('request preflight stops after enumerator and before architect', () => {
   assert.match(result.stdout, /\.caw\/CAW\.md:/)
   assert.match(result.stderr, /No architect or plan-reviewer call ran/)
   assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
+})
+
+test('project planning policy can stop or add instructions before provider calls', () => {
+  const stopped = fixture({ git: true })
+  configureProjectPolicies(stopped, projectPolicySource)
+  const refused = run(stopped, ['plan', 'blocked request'], [])
+  assert.equal(refused.status, 1)
+  assert.equal(calls(stopped).length, 0)
+  assert.match(refused.stdout, /project planning policy planning-policy stopped before enumerator/)
+
+  const allowed = fixture({ git: true })
+  configureProjectPolicies(allowed, projectPolicySource)
+  const result = run(allowed, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  for (const call of calls(allowed)) {
+    assert.match(call.input, /apply the project planning constraint/)
+  }
+  const runName = readdirSync(join(allowed.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(allowed.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.match(manifest.project_policies.manifest_digest, /^[0-9a-f]{64}$/)
+  assert.deepEqual(manifest.policy_calls.map(({ stage, status }) => [stage, status]),
+    [['planning', 'success']])
 })
 
 test('non-executable JavaScript provider fixture runs through Node for version and roles', () => {
@@ -2243,7 +2306,7 @@ title: Baseline task
   assert.equal(existsSync(state), true)
   const saved = JSON.parse(readFileSync(state, 'utf8'))
   assert.equal(saved.history[0].id, 'r1.1')
-  assert.equal(saved.state_version, 3)
+  assert.equal(saved.state_version, 4)
   assert.match(saved.runtime_digest, /^[0-9a-f]{64}$/)
   assert.equal(saved.runtime_history.some((entry) => entry.role === 'reviewer'), true)
   assert.equal(saved.history[0].origin_runtime.provider, 'test-claude')
@@ -2502,6 +2565,115 @@ test('review confirms a red gate once without waking an executor', () => {
   assert.equal(calls(f).length, 0)
   assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
   assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
+})
+
+test('project review criteria are additive and commit policy only changes the subject',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-review.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), `---
+title: Core title
+---
+
+## Done when
+- Delivery exists.
+`)
+  writeFileSync(join(f.root, 'delivery.txt'), 'safe delivery\n')
+
+  const result = run(f, ['review', spec], [{
+    recordReviewProbe: true,
+    observeInputStrings: [
+      'project:review-policy:privacy', 'trace the project privacy boundary',
+    ],
+    envelope: envelope(verdict({ criteria: [
+      { id: 'done-when-1', state: 'met', evidence: 'traced Delivery exists.' },
+      {
+        id: 'project:review-policy:privacy', state: 'met',
+        evidence: 'traced No private value is logged.',
+      },
+    ] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /^project: delivered safely\n/)
+  assert.match(message, /--- spec \(001_policy-review\.md\), verbatim/)
+  assert.match(message, /"project:review-policy:privacy":true/)
+  assert.match(message, /"trace the project privacy boundary":true/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.policy_calls.map(({ stage }) => stage), ['gate', 'review', 'commit'])
+})
+
+test('project gate policy can stop a green core gate before reviewer', () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-stop.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Policy stop\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [])
+
+  assert.equal(result.status, 1)
+  assert.equal(calls(f).length, 0)
+  assert.match(result.stdout,
+    /project gate policy gate-policy stopped the run: project gate policy rejected this task/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), true)
+})
+
+test('resume reports a project policy source change even when the manifest is unchanged',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-divergence.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Policy divergence\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'safe delivery\n')
+
+  const set = readProjectPolicies(f.root)
+  const snapshot = {
+    api_version: set.apiVersion,
+    manifest_digest: set.manifestDigest,
+    policies: Object.fromEntries(Object.entries(set.policies)
+      .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+  }
+  snapshot.set_digest = createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 4,
+    round: 1,
+    history: [{
+      id: 'r1.1', slot: 'broken', round: 1, where: 'delivery.txt:1',
+      fix: 'keep the safe delivery', evidence: 'read the delivery', state: 'open',
+    }],
+    noted: [],
+    accounting: { priced: {}, unpriced: {} },
+    runtime_history: [],
+    project_policies: snapshot,
+    ex: { summary: 'safe delivery', notes: [] },
+  }, null, 2)}\n`)
+
+  const policyPath = join(f.root, '.caw', 'project', 'policy.mjs')
+  writeFileSync(policyPath, `${readFileSync(policyPath, 'utf8')}\n// policy revision\n`)
+  execFileSync('git', ['add', '.caw/project/policy.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'revise project policy'], { cwd: f.root })
+
+  const result = run(f, ['review', spec], [{
+    envelope: envelope(verdict({
+      criteria: [{
+        id: 'project:review-policy:privacy', state: 'met',
+        evidence: 'traced No private value is logged.',
+      }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'safe delivery remains' }],
+    })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /PROJECT POLICY DIVERGENCE: saved [0-9a-f]{12}/)
 })
 
 test('weak canonical values without a mutation object fail before history ingestion',
