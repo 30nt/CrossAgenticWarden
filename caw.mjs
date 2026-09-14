@@ -148,6 +148,7 @@ const MAX_PLAN_ROUNDS = 3
 const MAX_TASK_ROUNDS = 4 // rounds a task runs before the run stops and asks the human
 const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
 const MAX_REVIEW_CHALLENGER_PASSES = 2
+const MAX_REVIEW_SEMANTIC_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
 
 const GateFailureAction = Object.freeze({
@@ -258,7 +259,7 @@ function renderReviewCriteria(spec, additional = []) {
     : '(none — this spec has no Must cover, Change, or Done when bullets)'
 }
 
-function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
+function reviewCriteriaIssue(spec, rows, verdict, additional = [], priorOpen = []) {
   if (!Array.isArray(rows)) return 'criteria must be an array'
   const expected = [...extractReviewCriteria(spec), ...additional]
   const byId = new Map(expected.map((item) => [item.id, item]))
@@ -280,12 +281,20 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = []) {
   if (missing.length) return `missing criterion id(s): ${missing.join(', ')}`
 
   const slotForState = { broken: 'broken', uncovered: 'uncovered', weak: 'weak' }
+  const carriedById = new Map((verdict?.carried || []).map((item) => [item?.id, item]))
   for (const row of rows) {
     if (row.state === 'met') continue
     const criterion = byId.get(row.id).criterion
     const slot = slotForState[row.state]
     const items = verdict?.[slot]
-    if (!Array.isArray(items) || !items.some((item) => item?.evidence?.includes(criterion))) {
+    const newItemQuotes = Array.isArray(items) &&
+      items.some((item) => item?.evidence?.includes(criterion))
+    const openCarriedQuotes = priorOpen.some((item) => {
+      const disposition = carriedById.get(item?.id)
+      return disposition?.state === 'open' &&
+        [item?.evidence, disposition?.evidence].some((evidence) => evidence?.includes(criterion))
+    })
+    if (!newItemQuotes && !openCarriedQuotes) {
       return `${row.id} is ${row.state} but no ${slot} item quotes its exact criterion`
     }
   }
@@ -463,7 +472,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.1.0'
+const VERSION = '0.2.0-dev'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -3940,16 +3949,22 @@ function planRelationIssue(ledger, rows) {
   return missing.length ? `missing relation id(s): ${missing.join(', ')}` : null
 }
 
-function validateCarriedSet(carried, open) {
+function carriedSetIssue(carried, open) {
+  if (!Array.isArray(carried)) return 'must be an array'
   const expected = new Set(open.map((item) => item.id))
   const seen = new Set()
   for (const item of carried) {
-    if (seen.has(item.id)) schemaFailure('reviewer', '$.carried', `duplicate id ${JSON.stringify(item.id)}`)
-    if (!expected.has(item.id)) schemaFailure('reviewer', '$.carried', `unknown or settled id ${JSON.stringify(item.id)}`)
+    if (seen.has(item.id)) return `duplicate id ${JSON.stringify(item.id)}`
+    if (!expected.has(item.id)) return `unknown or settled id ${JSON.stringify(item.id)}`
     seen.add(item.id)
   }
   const missing = [...expected].filter((id) => !seen.has(id))
-  if (missing.length) schemaFailure('reviewer', '$.carried', `missing open id(s): ${missing.join(', ')}`)
+  return missing.length ? `missing open id(s): ${missing.join(', ')}` : null
+}
+
+function validateCarriedSet(carried, open) {
+  const issue = carriedSetIssue(carried, open)
+  if (issue) schemaFailure('reviewer', '$.carried', issue)
 }
 
 function validateCallResult(decoded, role, binding) {
@@ -6320,6 +6335,14 @@ function prepareWeakCapture(surface) {
   return baseline
 }
 
+function resetReviewPassForSemanticRepair(surface, baseline) {
+  restoreWeakReplaySurface(surface, baseline)
+  const branches = surfaceGit(surface.workingRoot, 'for-each-ref',
+    '--format=%(refname:short)', 'refs/heads/caw-weak-*').split('\n').filter(Boolean)
+  for (const branch of branches) surfaceGit(surface.workingRoot, 'branch', '-D', branch)
+  restoreWeakReplaySurface(surface, baseline)
+}
+
 const weakRefuted = (item, reason) =>
   `weak refuted experiment, noted only — ${item.where}: ${item.fix}; ` +
   `the experiment contradicted the finding (${reason}). Evidence: ${item.evidence}`
@@ -6947,15 +6970,22 @@ function adjudicate(history, carried) {
 
 const openItems = (history) => history.filter((i) => i.state === 'open')
 
+function renderOriginRuntime(originRuntime) {
+  if (!originRuntime) return '\n      origin: legacy/unknown'
+  const origins = Array.isArray(originRuntime) ? originRuntime : [originRuntime]
+  return origins.map((origin, index) => {
+    const pass = origins.length > 1 ? `pass ${origin?.pass || index + 1} ` : ''
+    return `\n      origin: ${pass}${origin?.provider || 'unknown'}/${
+      origin?.requested?.model || '?'} runtime=${origin?.runtime_digest?.slice(0, 12) || '?'}`
+  }).join('')
+}
+
 // What the executor is handed. The evidence travels with the item, and it is not padding: "this
 // assertion can be mutated green" and the mutation that proves it are different instructions,
 // and the executor has no other way to see the tree the way the reviewer saw it.
 const renderItems = (items) => items
   .map((i) => `[${i.id}] ${i.slot} — ${i.where}\n      ${i.fix}\n      evidence: ${i.evidence}` +
-    (i.origin_runtime
-      ? `\n      origin: ${i.origin_runtime.provider}/${i.origin_runtime.requested?.model || '?'} ` +
-        `runtime=${i.origin_runtime.runtime_digest?.slice(0, 12) || '?'}`
-      : '\n      origin: legacy/unknown') +
+    renderOriginRuntime(i.origin_runtime) +
     (i.discovery === 'late-same-baseline'
       ? `\n      discovery: challenger pass ${i.review_pass}, late on baseline ${
           i.baseline_digest?.slice(0, 12) || '?'}`
@@ -7274,76 +7304,111 @@ function runTask(file, f, profileText, opts = {}) {
       const passBaseline = prepareWeakCapture(reviewSurface)
       weakBaseline ||= passBaseline
       let passVerdict
-      try {
-        passVerdict = agent('reviewer', [
-          `Review pass ${passIndex + 1} of ${passCount}. ` +
-            (passIndex === 0
-              ? 'This is the primary pass.'
-              : 'This is a blind challenger pass. Do not assume the primary pass found everything.'),
-          `\n\nAll passes judge the exact delivery digest ${deliveryBaseline}.`,
-          '\n\nTask spec:\n\n' + spec,
-          '\n\nProfile:\n\n' + profileText,
-          '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
-          `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
-          ' Whether it passes is settled. Judge whether it passes for the right reason.',
-          '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
-          ' and finish every row before returning. For a non-met row, the corresponding blocking',
-          ' item must quote the criterion text exactly in its evidence:\n\n' +
-            renderReviewCriteria(spec, projectCriteria),
-          projectReviewInstructions,
-          '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
-            ` baseline is commit ${passBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
-            ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
-            ` it, force branch caw-weak-N to that commit, then reset to the baseline before the next` +
-            ` item and before returning. Do not type or return a diff: the engine derives each` +
-            ` \`git diff --binary\` from those branches, replays it from the unchanged delivery` +
-            ` baseline and runs the gate itself.`,
-          open.length
-            ? `\n\nThis is round ${round + 1} of this task. The items below are open against it:` +
-              ' an earlier verdict raised each one, and the executor has since been told to close' +
-              ' it.' +
-              (open.some((i) => i.round < round)
-                ? ' Some have been carried through more than one round.'
-                : '') +
-              '\n\n  - ' + renderItems(open) +
-              '\n\nFill `carried` with one entry per id above, and do that BEFORE looking for' +
-              ' anything new — whether the tree now satisfies what was already raised is the' +
-              ' question this round exists to answer, and an id you leave out stays open.' +
-              ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
-              ' was raised should be retracted rather than carried, and retracting your own costs' +
-              ' this task less than the executor bending the code to satisfy it.'
-            : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
-        ].join(''), SCHEMA.verdict, f, file, {
-          workingRoot: reviewSurface.workingRoot,
-          scratchRoot: reviewSurface.scratchRoot,
-          surfaceId: reviewSurfaceIds.at(-1),
+      let semanticProblem = null
+      const reviewPrompt = [
+        `Review pass ${passIndex + 1} of ${passCount}. ` +
+          (passIndex === 0
+            ? 'This is the primary pass.'
+            : 'This is a blind challenger pass. Do not assume the primary pass found everything.'),
+        `\n\nAll passes judge the exact delivery digest ${deliveryBaseline}.`,
+        '\n\nTask spec:\n\n' + spec,
+        '\n\nProfile:\n\n' + profileText,
+        '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
+        `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
+        ' Whether it passes is settled. Judge whether it passes for the right reason.',
+        '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
+        ' and finish every row before returning. For a non-met row, the corresponding blocking',
+        ' item must quote the criterion text exactly in its evidence. An already-open carried',
+        ' item is that blocking item when its saved evidence quotes the criterion; keep it in',
+        ' `carried` and do not duplicate it as a new finding:\n\n' +
+          renderReviewCriteria(spec, projectCriteria),
+        projectReviewInstructions,
+        '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
+          ` baseline is commit ${passBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
+          ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
+          ` it, force branch caw-weak-N to that commit, then reset to the baseline before the next` +
+          ` item and before returning. Do not type or return a diff: the engine derives each` +
+          ` \`git diff --binary\` from those branches, replays it from the unchanged delivery` +
+          ` baseline and runs the gate itself.`,
+        open.length
+          ? `\n\nThis is round ${round + 1} of this task. The items below are open against it:` +
+            ' an earlier verdict raised each one, and the executor has since been told to close' +
+            ' it.' +
+            (open.some((i) => i.round < round)
+              ? ' Some have been carried through more than one round.'
+              : '') +
+            '\n\n  - ' + renderItems(open) +
+            '\n\nFill `carried` with one entry per id above, and do that BEFORE looking for' +
+            ' anything new — whether the tree now satisfies what was already raised is the' +
+            ' question this round exists to answer, and an id you leave out stays open.' +
+            ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
+            ' was raised should be retracted rather than carried, and retracting your own costs' +
+            ' this task less than the executor bending the code to satisfy it.'
+          : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
+      ].join('')
+      const reviewContext = {
+        workingRoot: reviewSurface.workingRoot,
+        scratchRoot: reviewSurface.scratchRoot,
+        surfaceId: reviewSurfaceIds.at(-1),
+        deniedReadPaths: reviewSurface.deniedReadPaths,
+        writeBoundary: {
+          kind: REVIEW_WRITE_BOUNDARY,
+          writableRoot: reviewSurface.workingRoot,
           deniedReadPaths: reviewSurface.deniedReadPaths,
-          writeBoundary: {
-            kind: REVIEW_WRITE_BOUNDARY,
-            writableRoot: reviewSurface.workingRoot,
-            deniedReadPaths: reviewSurface.deniedReadPaths,
-            readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
-          },
-        })
-        try {
-          const captured = captureWeakMutations(passVerdict.weak, reviewSurface, passBaseline)
-          passVerdict.weak = captured.accepted
-          passVerdict.noted.push(...captured.noted)
-        } catch (error) {
-          die(`${file} — invalid weak evidence: ${error?.message || error}`)
+          readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
+        },
+      }
+      try {
+        for (let repair = 0; repair <= MAX_REVIEW_SEMANTIC_REPAIRS; repair++) {
+          const prompt = repair === 0 ? reviewPrompt : [
+            `Semantic repair ${repair} for review pass ${passIndex + 1} of ${passCount}.`,
+            '\n\nYour previous response passed the JSON schema but failed the engine semantic',
+            ` consistency check at ${semanticProblem.path}: ${semanticProblem.message}.`,
+            '\nReturn one complete replacement verdict. The review surface has been restored to',
+            ' the same baseline. Preserve valid findings, rerun any weak experiments you still',
+            ' claim, adjudicate every carried id, and do not duplicate an open carried finding',
+            ' into a new blocking slot merely to justify the same non-met criterion.',
+            '\n\nOriginal review request:\n\n', reviewPrompt,
+            '\n\nRejected canonical value:\n\n', JSON.stringify(passVerdict),
+          ].join('')
+          passVerdict = agent('reviewer', prompt, SCHEMA.verdict, f, file, reviewContext)
+          if (deliveryDigest() !== deliveryBaseline) {
+            die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
+          }
+          const carriedProblem = carriedSetIssue(passVerdict.carried, open)
+          const criteriaProblem = carriedProblem ? null : reviewCriteriaIssue(
+            spec, passVerdict.criteria, passVerdict, projectCriteria, open)
+          semanticProblem = carriedProblem
+            ? { path: '$.carried', message: carriedProblem }
+            : criteriaProblem ? { path: '$.criteria', message: criteriaProblem } : null
+          if (!semanticProblem) break
+          recordEngineDiagnostic('reviewer', 'semantic-validation', {
+            pass: passIndex + 1,
+            repair,
+            baseline_digest: deliveryBaseline,
+            path: semanticProblem.path,
+            message: semanticProblem.message,
+          }, runtimeIdentity(passVerdict)?.attempt_id || null)
+          if (repair >= MAX_REVIEW_SEMANTIC_REPAIRS) break
+          say(`  reviewer semantic inconsistency; retrying pass ${passIndex + 1} once: ` +
+            `${semanticProblem.path} ${semanticProblem.message}`)
+          resetReviewPassForSemanticRepair(reviewSurface, passBaseline)
+        }
+        if (!semanticProblem) {
+          try {
+            const captured = captureWeakMutations(passVerdict.weak, reviewSurface, passBaseline)
+            passVerdict.weak = captured.accepted
+            passVerdict.noted.push(...captured.noted)
+          } catch (error) {
+            die(`${file} — invalid weak evidence: ${error?.message || error}`)
+          }
         }
       } catch (error) {
         throw error
       } finally {
         removeReviewSurface(reviewSurface)
       }
-      if (deliveryDigest() !== deliveryBaseline) {
-        die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
-      }
-      const criteriaProblem = reviewCriteriaIssue(spec, passVerdict.criteria, passVerdict,
-        projectCriteria)
-      if (criteriaProblem) schemaFailure('reviewer', '$.criteria', criteriaProblem)
-      validateCarriedSet(passVerdict.carried, open)
+      if (semanticProblem) schemaFailure('reviewer', semanticProblem.path, semanticProblem.message)
       let verified
       try { verified = verifyWeakMutations(passVerdict.weak, f, file, deliveryBaseline) }
       catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }

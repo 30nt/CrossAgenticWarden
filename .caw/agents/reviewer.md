@@ -62,6 +62,8 @@ that look related. For each criterion, trace
 the shipped consumer and the verification that would fail if the property broke. Record `met`
 only when both establish it. Otherwise record `broken`, `uncovered`, or `weak`, and put the
 corresponding blocking item in that slot with the criterion's exact text in its `evidence`.
+In a later round, an already-open item in `carried` is the blocking item when its saved evidence
+quotes that criterion. Keep it open in `carried`; do not duplicate it as a new finding.
 
 Finish the complete criterion ledger before searching for defects not stated in the contract.
 A later round is for judging fixes, not for revealing another visible line of the same spec.

@@ -84,6 +84,11 @@ the script derives approval from whether anything blocking is open. From round 2
 own open items by id and must return `closed`, `open` or `withdrawn` for each, with what it ran. An
 id it omits stays open.
 
+An open carried item whose saved evidence quotes a criterion supports that criterion's non-met
+state without becoming a duplicate new finding. If a schema-valid reviewer response is
+semantically inconsistent with either ledger, the engine restores the same review baseline and
+allows one correction call. A second inconsistency stops the run before later passes are merged.
+
 A review round contains one primary pass plus `review_challenger_passes` blind challenger passes
 (one by default, at most two). Every pass receives the same delivery digest in a fresh isolated
 surface. The engine merges their census rows and findings before another executor can run.

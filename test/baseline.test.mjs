@@ -3083,6 +3083,9 @@ test('challenger review uses the same delivery and retains late findings before 
   ])
   assert.equal(result.status, 1)
   assert.match(`${result.stdout}\n${result.stderr}`, /one round this command runs is done/)
+  assert.match(result.stdout, /origin: pass 1 test-claude\/opus runtime=[0-9a-f]{12}/)
+  assert.match(result.stdout, /origin: pass 2 test-claude\/opus runtime=[0-9a-f]{12}/)
+  assert.doesNotMatch(result.stdout, /origin: undefined\/\? runtime=\?/)
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 2)
@@ -3096,6 +3099,61 @@ test('challenger review uses the same delivery and retains late findings before 
   assert.equal(reviewers.length, 2)
   assert.equal(reviewers[0].baseline_digest, reviewers[1].baseline_digest)
   assert.equal(reviewers[0].baseline_digest, saved.history[0].baseline_digest)
+})
+
+test('reviewer semantic repair preserves the pass and still runs the challenger',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { review_challenger_passes: 1 })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_semantic-repair.md'),
+    'title: Semantic repair\n\n## Done when\n- Delivery is complete.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const met = [{ id: 'done-when-1', state: 'met', evidence: 'delivery inspected' }]
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_semantic-repair.md'], [
+    { reviewPass: 1, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1,
+      envelope: envelope(verdict({ criteria: met })) },
+    { reviewPass: 2, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: met })) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runPath = join(f.root, '.caw-logs', runName)
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 3)
+  assert.equal(manifest.diagnostics.filter((item) =>
+    item.role === 'reviewer' && item.kind === 'semantic-validation').length, 1)
+})
+
+test('reviewer semantic repair budget is bounded',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_semantic-budget.md'),
+    'title: Semantic budget\n\n## Done when\n- Delivery is complete.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_semantic-budget.md'], [
+    { reviewPass: 1, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1,
+      envelope: envelope(verdict({ criteria: invalid })) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /reviewer returned invalid canonical output at \$\.criteria/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 2)
+  assert.equal(manifest.diagnostics.filter((item) =>
+    item.role === 'reviewer' && item.kind === 'semantic-validation').length, 2)
 })
 
 test('role smoke is exact to model and reasoning and model changes fail before a provider call',
@@ -3479,6 +3537,40 @@ test('reviewer must adjudicate every open carried id exactly once',
   ])
   assert.equal(invented.status, 1)
   assert.match(invented.stderr, /unknown or settled id "r9\.9"/)
+})
+
+test('an open carried finding supports the same non-met criterion in the next round',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_carried-criterion.md'
+  const criterion = 'Delivery is complete.'
+  writeFileSync(join(f.root, '.caw-tasks', spec),
+    `title: Carried criterion\n\n## Done when\n- ${criterion}\n`)
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  const brokenCriterion = [{
+    id: 'done-when-1', state: 'broken', evidence: 'the delivery remains incomplete',
+  }]
+  const first = run(f, ['review', spec], [{ envelope: envelope(verdict({
+    criteria: brokenCriterion,
+    broken: [{
+      where: 'delivery.txt:1', fix: 'complete it',
+      evidence: `Observed failure. Criterion: ${criterion}`,
+    }],
+  })) }])
+  assert.equal(first.status, 1)
+
+  const second = run(f, ['review', spec], [{ envelope: envelope(verdict({
+    criteria: brokenCriterion,
+    carried: [{ id: 'r1.1', state: 'open', evidence: 'still incomplete' }],
+  })) }])
+  assert.equal(second.status, 1)
+  assert.doesNotMatch(second.stderr, /invalid canonical output/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(saved.round, 2)
+  assert.equal(saved.history.length, 1)
+  assert.equal(saved.history[0].id, 'r1.1')
+  assert.equal(saved.history[0].state, 'open')
 })
 
 test('legacy numeric round spend migrates to known USD without losing recovery',
