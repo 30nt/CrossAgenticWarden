@@ -67,6 +67,12 @@ The derived result is retained as a [certification record](certification.md). Ac
 certification are separate states: missing independent population or unavailable verification is
 visible as `limited`, never silently called `approved`.
 
+Weak verification can have two project-supplied controls. A source probe proves that the check
+loaded files from the isolated review surface, and a positive control proves that `gate_fast` can
+turn red for a known tracked-file change. They run before reviewer mutations and the surface is
+restored afterwards. The pair is optional but indivisible: partial, invalid, timed-out or
+ineffective controls make weak evidence unavailable rather than blocking delivery.
+
 ## Roles bind to adapters, and bindings are proved
 
 `.caw/runtime.json` binds each role to a provider, model and reasoning level. That declaration is

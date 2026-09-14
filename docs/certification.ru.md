@@ -25,6 +25,14 @@ Weak-эксперимент, который поймал gate, записыва�
 Captured mutation patches сохраняются как приватные артефакты run record. Строки verification и
 certification содержат имя файла, размер и SHA-256, а не встраивают patch в JSON.
 
+Проект может сделать weak verification контролируемой, задав одновременно
+`weak_source_probe_cmd` и `weak_positive_control_cmd`. Source probe сообщает абсолютные пути к
+файлам, которые он действительно загрузил из изолированной review-поверхности. Positive control
+меняет tracked-файл и обязан сделать `gate_fast` красным. Перед replay мутаций reviewer CAW
+восстанавливает поверхность. Ошибка, timeout, неверный формат или изменение файлов source probe,
+как и не пойманный positive control, делают weak evidence недоступной и сертификацию `limited`;
+задача для executor из этого не создаётся.
+
 `PLAN.md` переносит состояние, счётчики и digest population из планирования в последующий build.
 Ручная задача и старый план получают `population: unknown`, поэтому обычная сертификация для них
 невозможна. В коммите будет `accepted with LIMITED certification`.

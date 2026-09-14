@@ -15,6 +15,13 @@ gate_fast_timeout_ms:
 gate_full:
 gate_full_timeout_ms:
 
+# Optional strict weak verification. Configure both fields or leave both empty.
+# The source probe must print only {"loaded_paths":["/absolute/path", ...]} to stdout.
+# The positive control must change a tracked file so gate_fast becomes red.
+# Both commands run only in the isolated review surface.
+weak_source_probe_cmd:
+weak_positive_control_cmd:
+
 # Optional. Returns this project's CLOSED sets — the ones a script can list in full and a
 # model can only sample: every member of an enum, every caller, every migration, every
 # numbered section of a spec against the files citing it. json-v1 is rendered and handed to

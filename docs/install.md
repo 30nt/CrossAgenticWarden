@@ -191,6 +191,13 @@ It is a form and its fields are the whole configuration; the comments in it say 
 field is for. Two things it points at that live here: the gate contract, and `gate_full:`
 may be left empty, meaning the fast gate is the whole gate.
 
+Strict weak verification is optional. To enable it, fill in both `weak_source_probe_cmd` and
+`weak_positive_control_cmd`; leaving only one set is a profile error. The source probe runs in the
+review surface and must print only strict JSON with a non-empty `loaded_paths` array of absolute
+regular-file paths inside that surface. It must not change files. The positive control runs in the
+same surface, must change an existing tracked file, and must make `gate_fast` fail. Keep both
+commands short: their timeout is `gate_fast_timeout_ms`, or five seconds when that field is empty.
+
 ## Bind all five roles in `.caw/runtime.json`
 
 The runtime file is explicit and closed: `architect`, `enumerator`, `plan-reviewer`, `executor`
