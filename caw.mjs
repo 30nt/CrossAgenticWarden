@@ -464,6 +464,103 @@ const notes = []
 const VERSION = '0.1.0'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
+const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
+  request: 256,
+  planning: 16,
+  task: 16,
+  unknownCost: 256,
+  role: 128,
+})
+
+function resolveProviderBudgets(fields = {}) {
+  const read = (key, fallback) => {
+    const raw = fields[key]
+    if (raw === undefined || raw === '') return fallback
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new TypeError(`${key} must be a positive whole number`)
+    }
+    return value
+  }
+  return {
+    request_calls: read('budget_request_calls', PROVIDER_BUDGET_DEFAULTS.request),
+    planning_calls: read('budget_planning_calls', PROVIDER_BUDGET_DEFAULTS.planning),
+    task_calls: read('budget_task_calls', PROVIDER_BUDGET_DEFAULTS.task),
+    unknown_cost_calls: read('budget_unknown_cost_calls', PROVIDER_BUDGET_DEFAULTS.unknownCost),
+    role_calls: Object.fromEntries(ROLES.map((role) => [role,
+      read(`budget_${role.replaceAll('-', '_')}_calls`, PROVIDER_BUDGET_DEFAULTS.role)])),
+  }
+}
+
+let providerBudgetState = {
+  command: null,
+  phase: null,
+  task: null,
+  request_calls: 0,
+  planning_calls: 0,
+  task_calls: 0,
+  unknown_cost_calls: 0,
+  role_calls: Object.fromEntries(ROLES.map((role) => [role, 0])),
+  limits: null,
+}
+
+function providerBudgetSnapshot() {
+  return {
+    command: providerBudgetState.command,
+    phase: providerBudgetState.phase,
+    task: providerBudgetState.task,
+    limits: providerBudgetState.limits,
+    consumed: {
+      request_calls: providerBudgetState.request_calls,
+      planning_calls: providerBudgetState.planning_calls,
+      task_calls: providerBudgetState.task_calls,
+      unknown_cost_calls: providerBudgetState.unknown_cost_calls,
+      role_calls: { ...providerBudgetState.role_calls },
+    },
+  }
+}
+
+function setProviderBudgetPhase(phase, task = null) {
+  providerBudgetState.phase = phase
+  if (task !== providerBudgetState.task) {
+    providerBudgetState.task = task
+    providerBudgetState.task_calls = 0
+  }
+}
+
+function providerBudgetIssue(role, limits) {
+  const checks = [
+    ['budget_request_calls', providerBudgetState.request_calls, limits.request_calls],
+    ...(providerBudgetState.phase === 'planning'
+      ? [['budget_planning_calls', providerBudgetState.planning_calls, limits.planning_calls]] : []),
+    ...(providerBudgetState.task
+      ? [['budget_task_calls', providerBudgetState.task_calls, limits.task_calls]] : []),
+    [`budget_${role.replaceAll('-', '_')}_calls`, providerBudgetState.role_calls[role],
+      limits.role_calls[role]],
+    ['budget_unknown_cost_calls', providerBudgetState.unknown_cost_calls,
+      limits.unknown_cost_calls],
+  ]
+  const reached = checks.find(([, used, limit]) => used >= limit)
+  return reached
+    ? `${reached[0]} reached (${reached[1]}/${reached[2]}); no ${role} provider call was started`
+    : null
+}
+
+function reserveProviderBudget(role, limits) {
+  const issue = providerBudgetIssue(role, limits)
+  if (issue) throw new Error(issue)
+  providerBudgetState.limits = limits
+  providerBudgetState.request_calls += 1
+  if (providerBudgetState.phase === 'planning') providerBudgetState.planning_calls += 1
+  if (providerBudgetState.task) providerBudgetState.task_calls += 1
+  providerBudgetState.role_calls[role] += 1
+}
+
+function settleProviderBudget(attempt, cost) {
+  if (attempt.budgetSettled) return
+  attempt.budgetSettled = true
+  if (cost === null || cost === undefined) providerBudgetState.unknown_cost_calls += 1
+}
 const LEGACY_RUNTIME_FIELDS = [
   'model_architect', 'model_executor', 'model_reviewer', 'effort', 'permission_mode',
 ]
@@ -1773,7 +1870,9 @@ function writeRunManifest(status) {
     updated_at: new Date().toISOString(),
     status,
     timeout_ms: AGENT_TIMEOUT_MS,
+    provider_budgets: providerBudgetSnapshot(),
     calls: runRecord.calls,
+    stages: runRecord.stages || [],
     diagnostics: runRecord.diagnostics,
     certifications: runRecord.certifications || [],
     audits: runRecord.audits || [],
@@ -1833,18 +1932,38 @@ function beginRunRecord() {
   const id = `run-${stamp}-${process.pid}-${nonce}`
   const path = join(LOG_DIR, id)
   mkdirSync(path, { mode: 0o700 })
-  runRecord = { id, path, startedAt: new Date().toISOString(), calls: [], diagnostics: [] }
+  runRecord = { id, path, startedAt: new Date().toISOString(), calls: [], diagnostics: [], stages: [] }
   writeRunManifest('active')
   say(`run record: ${id}`)
   return runRecord
 }
 
-function beginProviderAttempt(role, provider, binding, invocation) {
+function recordStage(kind, name, startedMs, state, detail = {}) {
+  const run = beginRunRecord()
+  run.stages.push({
+    kind,
+    name,
+    state,
+    duration_ms: Math.max(0, Date.now() - startedMs),
+    ...detail,
+  })
+  writeRunManifest(state === 'success' || state === 'green' ? 'active' : 'failed')
+}
+
+function beginProviderAttempt(role, provider, binding, invocation, budgetLimits) {
+  reserveProviderBudget(role, budgetLimits)
   const run = beginRunRecord()
   const index = String(run.calls.length + 1).padStart(3, '0')
   const attemptId = `provider-${index}`
   const startedAt = new Date().toISOString()
   const name = `attempt-${index}-${role}.json`
+  const inputBytes = Buffer.byteLength(invocation.input || '')
+  const usageEstimate = {
+    input_tokens: Math.ceil(inputBytes / 4),
+    output_tokens: null,
+    method: 'utf8-bytes-div-4',
+    input_bytes: inputBytes,
+  }
   const body = {
     attempt_id: attemptId,
     status: 'started',
@@ -1859,6 +1978,7 @@ function beginProviderAttempt(role, provider, binding, invocation) {
       reasoning: binding.reasoning,
       native: invocation.requestedNative || null,
     },
+    usage_estimate: usageEstimate,
   }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
@@ -1873,7 +1993,8 @@ function beginProviderAttempt(role, provider, binding, invocation) {
   }
   run.calls.push(entry)
   writeRunManifest('active')
-  return { id: attemptId, index, startedAt, startedMs: Date.now(), entry }
+  return { id: attemptId, index, startedAt, startedMs: Date.now(), entry,
+    usageEstimate, budgetSettled: false }
 }
 
 function providerUsageState(result) {
@@ -1889,6 +2010,7 @@ function recordProviderCall(role, provider, result, attempt) {
   const run = beginRunRecord()
   const index = attempt.index
   const usageState = providerUsageState(result)
+  settleProviderBudget(attempt, result.cost)
   const body = {
     attempt_id: attempt.id,
     status: 'success',
@@ -1922,6 +2044,7 @@ function recordProviderCall(role, provider, result, attempt) {
     duration_ms: result.durationMs ?? (Date.now() - attempt.startedMs),
     completed_at: new Date().toISOString(),
   })
+  recordStage('provider', role, attempt.startedMs, 'success', { attempt_id: attempt.id })
   writeRunManifest('active')
 }
 
@@ -1930,7 +2053,9 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
   const run = beginRunRecord()
   const index = attempt.index
   const raw = `${result.stdout || ''}\n${result.stderr || ''}`
-  const usageState = observed ? providerUsageState(observed) : 'unknown'
+  const usageState = observed ? providerUsageState(observed)
+    : attempt.usageEstimate ? 'estimated' : 'unknown'
+  settleProviderBudget(attempt, observed?.cost ?? null)
   const terminalStatus = failureKind === 'interrupted' ? 'interrupted' : 'failure'
   const body = {
     attempt_id: attempt.id,
@@ -1946,6 +2071,7 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
     signal: result.signal || null,
     error_code: result.error?.code || null,
     usage_state: usageState,
+    ...(!observed && attempt.usageEstimate ? { usage_estimate: attempt.usageEstimate } : {}),
     ...(observed ? {
       requested: observed.requested,
       models: observed.models,
@@ -1970,6 +2096,7 @@ function recordProviderFailure(role, provider, result, attempt, failureKind = 'p
     duration_ms: Date.now() - attempt.startedMs,
     completed_at: new Date().toISOString(),
   })
+  recordStage('provider', role, attempt.startedMs, terminalStatus, { attempt_id: attempt.id })
   writeRunManifest('failed')
 }
 
@@ -1978,16 +2105,29 @@ function markInterruptedProviderAttempts(reason) {
   const completedAt = new Date().toISOString()
   for (const call of runRecord.calls) {
     if (call.status !== 'started') continue
+    let hasEstimate = false
+    try {
+      const attempt = JSON.parse(readFileSync(join(runRecord.path, call.attempt_file), 'utf8'))
+      hasEstimate = Boolean(attempt.usage_estimate)
+    } catch { /* an interrupted pre-write remains unknown */ }
+    providerBudgetState.unknown_cost_calls += 1
     Object.assign(call, {
       status: 'interrupted',
       failure_kind: reason,
-      usage_state: 'unknown',
+      usage_state: hasEstimate ? 'estimated' : 'unknown',
       completed_at: completedAt,
+    })
+    const startedMs = Date.parse(call.started_at)
+    runRecord.stages.push({
+      kind: 'provider', name: call.role, state: 'interrupted',
+      duration_ms: Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : null,
+      attempt_id: call.attempt_id,
     })
   }
 }
 
-function failProviderAttempt(attempt, failureKind) {
+function failProviderAttempt(attempt, failureKind, cost = null) {
+  settleProviderBudget(attempt, cost)
   Object.assign(attempt.entry, {
     status: 'failure',
     failure_kind: failureKind,
@@ -1995,20 +2135,23 @@ function failProviderAttempt(attempt, failureKind) {
     duration_ms: Date.now() - attempt.startedMs,
     completed_at: new Date().toISOString(),
   })
+  recordStage('provider', attempt.entry.role, attempt.startedMs, 'failure', {
+    attempt_id: attempt.id,
+  })
   writeRunManifest('failed')
 }
 
-function recordEngineDiagnostic(role, kind, diagnostic) {
+function recordEngineDiagnostic(role, kind, diagnostic, attemptId = null) {
   const run = beginRunRecord()
   const index = String(run.diagnostics.length + 1).padStart(3, '0')
-  const body = { role, kind, ...diagnostic }
+  const body = { role, kind, attempt_id: attemptId, ...diagnostic }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   if (bytes.length > ENGINE_DIAGNOSTIC_MAX) {
     throw new Error(`${role} ${kind} diagnostic is ${bytes.length} bytes; limit is ${ENGINE_DIAGNOSTIC_MAX}`)
   }
   const name = `diagnostic-${index}-${role}-${kind}.json`
   writePrivateFile(join(run.path, name), bytes, ENGINE_DIAGNOSTIC_MAX)
-  run.diagnostics.push({ file: name, role, kind, bytes: bytes.length })
+  run.diagnostics.push({ file: name, role, kind, attempt_id: attemptId, bytes: bytes.length })
   writeRunManifest('active')
 }
 
@@ -2523,6 +2666,11 @@ function profile(preflight = true) {
         `human-review — got "${f[key]}"`)
     }
   }
+  try {
+    f.provider_budgets = resolveProviderBudgets(f)
+    providerBudgetState.limits = f.provider_budgets
+  }
+  catch (error) { die(`.caw/CAW.md ${error?.message || error}`) }
   legacyQueueRefusal()
   if (preflight) preflightRuntime(f)
   return { f, text }
@@ -3265,6 +3413,11 @@ function recordProjectPolicyCall(policy, stage, startedAt, status, context = {},
     } : {}),
     duration_ms: Date.now() - startedAt, status,
   })
+  run.stages.push({
+    kind: 'project-policy', name: stage, state: status,
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    policy_id: policy.id,
+  })
   writeRunManifest(status === 'success' ? 'active' : 'failed')
 }
 
@@ -3714,6 +3867,9 @@ function recordMissingEnumeratorPopulation(role, reason, status = 'active') {
 }
 
 function agent(role, prompt, schema, f, spec, context = null) {
+  providerBudgetState.limits = f.provider_budgets
+  const budgetIssue = providerBudgetIssue(role, f.provider_budgets)
+  if (budgetIssue) die(budgetIssue)
   const binding = resolvedRuntime.value.roles[role]
   const provider = resolvedRuntime.providers.get(binding.provider)
   const descriptor = provider.adapter.describe({ role, cliVersion: provider.cliVersion })
@@ -3750,7 +3906,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     die(`${role} adapter could not construct invocation: ${error?.message || error}`)
   }
 
-  const attempt = beginProviderAttempt(role, provider, binding, invocation)
+  const attempt = beginProviderAttempt(role, provider, binding, invocation, f.provider_budgets)
   process.stderr.write(`  · ${role} `)
   // The agent is the only long call in this script — the gates are seconds — so it is the
   // only one worth holding the machine awake for.
@@ -3836,6 +3992,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     die(error.message)
   }
   valueRuntime.set(result.value, {
+    attempt_id: attempt.id,
     runtime_digest: resolvedRuntime.digest,
     provider: result.provider,
     adapter_digest: provider.adapter.digest,
@@ -3846,7 +4003,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
   try { recordProviderCall(role, provider, { ...result, finalResponse: decoded.finalResponse }, attempt) }
   catch (error) {
     recordMissingEnumeratorPopulation(role, 'successful response could not be retained', 'failed')
-    failProviderAttempt(attempt, 'retention-error')
+    failProviderAttempt(attempt, 'retention-error', result.cost)
     die(`${role} ${error?.message || error}`)
   }
   // The price stays first and keeps its shape, because it is what a reader looks for and what
@@ -3879,10 +4036,14 @@ function agent(role, prompt, schema, f, spec, context = null) {
 // install for six days: 75 is the gate saying it did not run, and build() reads it.
 function gate(cmd, spec, cwd = undefined, timeoutMs = null) {
   if (!cmd) {
-    return {
+    const result = {
       ok: true, state: 'green', status: 0, out: '(none configured)',
       durationMs: 0, timeoutMs,
     }
+    if (resolvedRuntime) recordStage('gate', spec ? 'fast' : 'full', Date.now(), 'green', {
+      task: spec || null, status: 0, timeout_ms: timeoutMs,
+    })
+    return result
   }
   const env = { ...process.env, PWD: cwd || process.cwd() }
   if (spec) env.CAW_SPEC = spec
@@ -3898,11 +4059,15 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null) {
   const diagnostic = state === 'timeout'
     ? `\ngate exceeded ${formatTimeout(timeoutMs)} and was killed\n`
     : ''
-  return {
+  const value = {
     ok: state === 'green', state, status: r.status,
     out: `${r.stdout || ''}${r.stderr || ''}${diagnostic}`.slice(-8000),
     durationMs: Date.now() - startedAt, timeoutMs,
   }
+  if (resolvedRuntime) recordStage('gate', spec ? 'fast' : 'full', startedAt, state, {
+    task: spec || null, status: r.status, timeout_ms: timeoutMs,
+  })
+  return value
 }
 
 // The closed sets of a project, computed instead of searched for. One opaque command, like a
@@ -4472,7 +4637,7 @@ function resolvePopulation(cases, context) {
   }
 }
 
-function recordPopulationResolution(resolved) {
+function recordPopulationResolution(resolved, attemptId = null) {
   const events = [
     ...resolved.repairs.map((repair) => ({
       index: repair.index,
@@ -4505,7 +4670,7 @@ function recordPopulationResolution(resolved) {
     retained: resolved.retainedCount,
     witness_withdrawn: resolved.witnessWithdrawn,
   })
-  if (events.length) recordEngineDiagnostic('enumerator', 'provenance', diagnostic)
+  if (events.length) recordEngineDiagnostic('enumerator', 'provenance', diagnostic, attemptId)
   if (resolved.repairs.length) {
     say(`  enumerator repaired ${resolved.repairs.length} anchor(s) by unique exact search`)
   }
@@ -4874,13 +5039,14 @@ function writePopulationCache(identity, value, runtime) {
   if (!root) return null
   mkdirSync(root, { recursive: true, mode: 0o700 })
   try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  const { attempt_id: _attemptId, ...cacheRuntime } = runtime || {}
   const record = {
     version: POPULATION_CACHE_VERSION,
     key: identity.key,
     created_at: new Date().toISOString(),
     inputs: identity.inputs,
     value_digest: createHash('sha256').update(stableJson(value)).digest('hex'),
-    runtime,
+    runtime: cacheRuntime,
     value,
   }
   const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
@@ -4939,7 +5105,7 @@ function enumerate(description, text, f) {
   }
   validateRequestIssues(p.request_issues, context)
   const resolved = resolvePopulation(p.cases, context)
-  recordPopulationResolution(resolved)
+  recordPopulationResolution(resolved, runtimeIdentity(p)?.attempt_id || null)
   const cases = resolved.cases
   valueRuntime.set(cases, runtimeIdentity(p))
   populationResolution.set(cases, {
@@ -5116,6 +5282,7 @@ function sayCollisions({ hits, examined }) {
 }
 
 function plan(description) {
+  setProviderBudgetPhase('planning')
   const { f, text: profileText } = profile()
   noticeNotesLog()
 
@@ -5146,6 +5313,12 @@ function plan(description) {
   const history = []
 
   for (let round = 1; round <= MAX_PLAN_ROUNDS; round++) {
+    const architectBudgetIssue = providerBudgetIssue('architect', f.provider_budgets)
+    if (architectBudgetIssue && last) {
+      planIncomplete(description, last, history, problems || [architectBudgetIssue],
+        `provider budget stopped planning before architect: ${architectBudgetIssue}`,
+        population, planProvenance, risk)
+    }
     // Hand the architect its own plan back.
     //
     // It used to get the holes and nothing else: "Your previous plan has holes" named a plan
@@ -5203,6 +5376,13 @@ function plan(description) {
     const collided = collisions(out.tasks)
     sayCollisions(collided)
 
+    const reviewerBudgetIssue = providerBudgetIssue('plan-reviewer', f.provider_budgets)
+    if (reviewerBudgetIssue) {
+      planIncomplete(description, out, history,
+        [`plan review did not run — ${reviewerBudgetIssue}`],
+        `provider budget stopped planning before plan-reviewer: ${reviewerBudgetIssue}`,
+        population, planProvenance, risk)
+    }
     const r = agent('plan-reviewer', [
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
@@ -5566,6 +5746,7 @@ function requirePersistedFullGateBaseline(f, risk) {
 }
 
 function build(noFull) {
+  setProviderBudgetPhase('delivery')
   const { f, text } = profile()
   noticeNotesLog()
   activePopulationCertification = { state: 'unknown', source: 'no-plan-artifact', digest: null }
@@ -6520,6 +6701,7 @@ function sayWaysOn(file) {
 // inside `build`, and exactly one from `round` and `review`, because a human who authorised one
 // more round authorised one.
 function runTask(file, f, profileText, opts = {}) {
+  setProviderBudgetPhase('delivery', file)
   const { resume = null, startAt = 'executor', rounds = MAX_TASK_ROUNDS, how = null } = opts
 
   // Guarded for the same reason `commit()` now guards its unlink: `.caw-tasks/` is not this
@@ -7288,6 +7470,7 @@ function clearSpecs() {
 }
 
 function reviewSpecs(description, noFix) {
+  setProviderBudgetPhase('planning')
   const { f, text: profileText } = profile()
   const planning = applyPlanningPolicy(description, profileText)
   let text = planning.text
@@ -7786,6 +7969,7 @@ function artifacts(args) {
 
 async function main() {
 const [cmd, ...rest] = process.argv.slice(2)
+providerBudgetState.command = cmd || null
 const noFull = rest.includes('--no-full')
 const arg = rest.filter((x) => !x.startsWith('--')).join(' ')
 // Reading what this tool is cannot depend on the matrix being usable — the same rule that puts
@@ -7913,6 +8097,7 @@ export {
   decideGateFailure, decidePlanningAction, deltaAccounting, extractReviewCriteria, formatAccounting,
   normalizeAccounting, planRelationIssue, planningLedger, reviewCriteriaIssue,
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
-  roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface, retainWeakVerificationEvents,
+  resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
+  retainWeakVerificationEvents,
   runProjectPolicy, runWeakReplaySession, verifyProjectPolicies, zeroAccounting,
 }

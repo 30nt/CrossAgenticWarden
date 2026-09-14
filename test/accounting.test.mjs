@@ -7,6 +7,7 @@ import {
   deltaAccounting,
   formatAccounting,
   normalizeAccounting,
+  resolveProviderBudgets,
   zeroAccounting,
 } from '../caw.mjs'
 
@@ -17,6 +18,35 @@ const counters = (calls, inputTokens, outputTokens) => ({
   cachedReadTokens: 0,
   cachedWrittenTokens: 0,
   reasoningTokens: null,
+})
+
+test('provider call budgets have finite defaults and strict per-scope overrides', () => {
+  const defaults = resolveProviderBudgets({})
+  assert.equal(defaults.request_calls, 256)
+  assert.equal(defaults.planning_calls, 16)
+  assert.equal(defaults.task_calls, 16)
+  assert.equal(defaults.unknown_cost_calls, 256)
+  assert.deepEqual(Object.keys(defaults.role_calls).sort(),
+    ['architect', 'enumerator', 'executor', 'plan-reviewer', 'reviewer'].sort())
+
+  const configured = resolveProviderBudgets({
+    budget_request_calls: '7',
+    budget_planning_calls: '5',
+    budget_task_calls: '3',
+    budget_unknown_cost_calls: '2',
+    budget_plan_reviewer_calls: '1',
+  })
+  assert.deepEqual({
+    request: configured.request_calls,
+    planning: configured.planning_calls,
+    task: configured.task_calls,
+    unknown: configured.unknown_cost_calls,
+    reviewer: configured.role_calls['plan-reviewer'],
+  }, { request: 7, planning: 5, task: 3, unknown: 2, reviewer: 1 })
+  for (const invalid of ['0', '-1', '1.5', 'many']) {
+    assert.throws(() => resolveProviderBudgets({ budget_request_calls: invalid }),
+      /must be a positive whole number/)
+  }
 })
 
 test('run metrics retain bounded decisions without provider payloads', () => {

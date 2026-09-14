@@ -198,6 +198,14 @@ regular-file paths inside that surface. It must not change files. The positive c
 same surface, must change an existing tracked file, and must make `gate_fast` fail. Keep both
 commands short: their timeout is `gate_fast_timeout_ms`, or five seconds when that field is empty.
 
+Provider calls have four independent budgets in the same frontmatter: the whole command
+(`budget_request_calls`), planning only (`budget_planning_calls`), one task
+(`budget_task_calls`), and each role (`budget_<role>_calls`, with hyphens written as underscores).
+`budget_unknown_cost_calls` separately limits completed calls whose monetary cost was not
+reported. Every value is a positive integer and is checked before the next provider process
+starts. Defaults are finite and appear in the distributed profile; lower them per project when
+the project needs a tighter spending boundary.
+
 ## Bind all five roles in `.caw/runtime.json`
 
 The runtime file is explicit and closed: `architect`, `enumerator`, `plan-reviewer`, `executor`

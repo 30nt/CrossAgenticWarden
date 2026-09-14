@@ -43,6 +43,18 @@ docs_language: English
 # Required separation between the author and reviewer bindings.
 planning_independence: same-provider
 task_independence: different-model
+
+# Provider-call budgets. Every limit is checked before a child process starts.
+# Defaults are finite; set smaller project limits here when cost needs a tighter boundary.
+budget_request_calls: 256
+budget_planning_calls: 16
+budget_task_calls: 16
+budget_unknown_cost_calls: 256
+budget_architect_calls: 128
+budget_enumerator_calls: 128
+budget_plan_reviewer_calls: 128
+budget_executor_calls: 128
+budget_reviewer_calls: 128
 ---
 
 # CAW profile
