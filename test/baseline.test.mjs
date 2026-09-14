@@ -3055,7 +3055,7 @@ test('weak verification retention reports every event lost beyond its ceiling', 
   assert.equal(retained.events.length, 32)
 })
 
-test('a nonescaping weak mutation that makes the gate red is downgraded to noted',
+test('a nonescaping weak mutation that makes the gate red is refuted and noted',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.readFileSync('README.md','utf8').includes('# fixture');if(!ok)process.stdout.write('MUTATION CAUGHT\\n');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
@@ -3076,7 +3076,7 @@ test('a nonescaping weak mutation that makes the gate red is downgraded to noted
   const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
     cwd: f.root, encoding: 'utf8',
   })
-  assert.match(message, /weak downgraded to noted/)
+  assert.match(message, /weak refuted experiment, noted only/)
   assert.match(message, /weak mutation made the gate red/)
   assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json')), false)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
@@ -3143,7 +3143,7 @@ test('a malformed captured weak is noted without discarding an independent valid
   assert.equal(state.history[0].fix, 'retain the reproducible weakness')
   assert.equal(state.history[0].mutation_event.gate_status, 0)
   assert.equal(state.noted.length, 1)
-  assert.match(state.noted[0], /weak downgraded to noted/)
+  assert.match(state.noted[0], /weak verification unavailable, noted only/)
   assert.match(state.noted[0], /retain why this mutation was not reproducible/)
   assert.match(state.noted[0], /the second mutation has a malformed hunk/)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
@@ -3153,7 +3153,7 @@ const activeSurfaceNames = () => existsSync(REVIEW_SURFACE_PARENT)
   ? readdirSync(REVIEW_SURFACE_PARENT).filter((name) => name.startsWith('surface-'))
   : []
 
-test('red weak baseline carries findings as unverified with status and output',
+test('red weak baseline records non-blocking unavailable evidence with limited certification',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.existsSync('.env');if(!ok)process.stdout.write('BASELINE MISSING SECRET\\n');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
@@ -3170,21 +3170,17 @@ test('red weak baseline carries findings as unverified with status and output',
     }] })),
   }])
 
-  assert.equal(result.status, 1)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /weak verification unavailable: unmutated surface gate status 1/)
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /downgraded to noted/)
-  const state = JSON.parse(readFileSync(
-    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
-  assert.equal(state.weak_verification.state, 'unverified-baseline-red')
-  assert.equal(state.weak_verification.baseline.gate_status, 1)
-  assert.match(state.weak_verification.baseline.gate_output, /BASELINE MISSING SECRET/)
-  assert.equal(state.weak_verification.mutations.length, 0)
-  assert.equal(state.noted.length, 0)
-  assert.equal(state.history.length, 1)
-  assert.equal(state.history[0].slot, 'weak')
-  assert.equal(state.history[0].state, 'open')
-  assert.equal(state.history[0].mutation_event.state, 'unverified')
-  assert.equal(state.history[0].mutation_event.reason, 'baseline-red')
+  assert.match(result.stdout, /recording 1 finding\(s\) as non-blocking unavailable evidence/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  assert.equal(existsSync(
+    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json')), false)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(message, /weak verification unavailable, noted only/)
 
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const runManifest = JSON.parse(readFileSync(
@@ -3194,6 +3190,11 @@ test('red weak baseline carries findings as unverified with status and output',
   assert.equal(runManifest.weak_verification.events[0].state, 'unverified-baseline-red')
   assert.equal(runManifest.weak_verification.events[0].gate_status, 1)
   assert.match(runManifest.weak_verification.events[0].gate_output, /BASELINE MISSING SECRET/)
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, runManifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-baseline-red')
+  assert.equal(certification.limitations.includes('unverified-baseline-red'), true)
 
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
   assert.equal(retained.length, 1)
@@ -3204,7 +3205,7 @@ test('red weak baseline carries findings as unverified with status and output',
   assert.match(manifest.weak_gate.output, /BASELINE MISSING SECRET/)
 })
 
-test('mutation gate status 75 stays unverified instead of becoming a red downgrade',
+test('mutation gate refusal is non-blocking unavailable evidence',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.readFileSync('README.md','utf8').includes('# fixture');if(!ok)process.stdout.write('MUTATION REFUSED\\n');process.exit(ok?0:75)"`
   const f = fixture({ git: true, gateFast })
@@ -3220,18 +3221,24 @@ test('mutation gate status 75 stays unverified instead of becoming a red downgra
     }] })),
   }])
 
-  assert.equal(result.status, 1)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /weak mutation made the gate red/)
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /downgraded to noted/)
-  const state = JSON.parse(readFileSync(
-    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
-  assert.equal(state.weak_verification.state, 'unverified-mutation-refused')
-  assert.equal(state.weak_verification.mutations[0].state, 'unverified-refused')
-  assert.equal(state.weak_verification.mutations[0].gate_status, 75)
-  assert.match(state.weak_verification.mutations[0].gate_output, /MUTATION REFUSED/)
-  assert.equal(state.noted.length, 0)
-  assert.equal(state.history[0].mutation_event.state, 'unverified')
-  assert.equal(state.history[0].mutation_event.reason, 'mutation-gate-refused')
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(message, /weak verification unavailable, noted only/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runManifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, runManifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-refused')
+  assert.equal(certification.weak_verification.mutations[0].state, 'unverified-refused')
+  assert.equal(certification.weak_verification.mutations[0].gate_status, 75)
+  assert.match(certification.weak_verification.mutations[0].gate_output, /MUTATION REFUSED/)
 
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
   assert.equal(retained.length, 1)
@@ -3240,6 +3247,63 @@ test('mutation gate status 75 stays unverified instead of becoming a red downgra
   assert.equal(manifest.state, 'weak-gate-refused')
   assert.equal(manifest.weak_gate.status, 75)
   assert.match(manifest.weak_gate.output, /MUTATION REFUSED/)
+})
+
+test('weak baseline timeout is non-blocking and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `test -f .env || exec node -e "setTimeout(()=>{},2000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '50' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  writeFileSync(join(f.root, '.env'), 'ignored surface input\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the heading', evidence: 'mutated the heading',
+      mutation: { patch: readmeMutation('timeout'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /weak verification DID NOT COMPLETE/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-baseline-timeout')
+  assert.equal(certification.weak_verification.baseline.gate_timeout_ms, 50)
+})
+
+test('weak mutation timeout is non-blocking and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `grep -q '^# fixture$' README.md || exec node -e "setTimeout(()=>{},2000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '50' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the heading', evidence: 'mutated the heading',
+      mutation: { patch: readmeMutation('timeout'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-timeout')
+  assert.equal(certification.weak_verification.mutations[0].state, 'unverified-timeout')
+  assert.equal(certification.weak_verification.mutations[0].gate_timeout_ms, 50)
 })
 
 test('reviewer timeout retains a bounded interrupted surface',

@@ -17,6 +17,10 @@ Its state is:
   verification is unavailable;
 - `rejected` when blocking items remain.
 
+A weak experiment that is caught by the gate is recorded as `refuted`. A baseline, mutation gate,
+or replay that cannot complete is `unavailable`: CAW retains its evidence and limits the
+certification, but does not turn it into a code requirement for the executor.
+
 `PLAN.md` carries the population state, counts, and digest from planning into a later build. A
 hand-written task or an old plan has `population: unknown`, so it cannot receive ordinary
 certification. Its commit says `accepted with LIMITED certification`.
