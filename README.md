@@ -8,7 +8,8 @@ The project can enforce same-provider, different-model, or cross-vendor review; 
 actual adapter vendor and model pair before any provider call.
 
 Roles bind explicitly to trusted provider adapters. The engine owns the protocol, schemas,
-gates, state and commits — the models own none of those. One file, 5.2k lines, no dependencies.
+gates, state and commits — the models own none of those. The runtime is a dependency-free Node
+engine with small, vendored provider adapters.
 
 ```
 request ──▶ architect ──▶ plan-reviewer ──▶ specs in .caw-tasks/
@@ -94,8 +95,8 @@ and policy, canonical docs, repository state, project index, runtime, adapter, C
 schema, and engine all participate in the key. Any change runs the enumerator again.
 
 **Guarantees come from a live probe, not from a config file.** A binding is unavailable until a
-probe on *this machine* proves the OS write boundary holds. A CLI upgrade or a red probe makes it
-unavailable before you spend anything.
+probe on *this machine* proves the OS write boundary holds. A changed adapter implementation, an
+expired attestation, or a red probe makes it unavailable before a pipeline call.
 
 ## Requirements
 
@@ -181,10 +182,9 @@ CAW appends payload-free counters and durations to Git's private `caw/metrics/ru
 - **A write boundary is not a read boundary.** Any role with a shell can read outside the
   delivery tree and open network connections. [SECURITY.md](SECURITY.md) says exactly how far
   that goes; the engine prints a summary before every paid call.
-- An interrupted reviewer can leave a mutation in your working tree, and the next thing the
-  engine does on the happy path is `git add -A`. This and the rest are in
-  [docs/limitations.md](docs/limitations.md) — a register of what is measured to be broken,
-  kept because shipping known hazards silently is worse than admitting them.
+- Automated review is a bounded sample, and the executor can still commit through provider tools
+  despite the engine contract. These and the remaining hazards are tracked in
+  [docs/limitations.md](docs/limitations.md), including the controls that exist today.
 
 ## Documentation
 
@@ -197,12 +197,14 @@ CAW appends payload-free counters and durations to Git's private `caw/metrics/ru
 | [docs/project-policies.md](docs/project-policies.md) | extending CAW without changing its core |
 | [docs/certification.md](docs/certification.md) | task certification states and retained evidence |
 | [docs/limitations.md](docs/limitations.md) | what is known to be broken or unexercised |
+| [CHANGELOG.md](CHANGELOG.md) | released versions and the current unreleased changes |
 | [SECURITY.md](SECURITY.md) | what is enforced, and what is not |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | what a useful contribution looks like here |
 
 ## Status and licence
 
-**v0.1.0 — first public release.** One maintainer, a research tool, exercised on a handful of
-real projects rather than benchmarked. The adapter contract is not stable until v1.
+**v0.2.0 is in development; v0.1.0 is the latest tagged release.** One maintainer, a research
+tool, exercised on a handful of real projects rather than benchmarked. The adapter contract is
+not stable until v1.
 
 MIT. See [LICENSE](LICENSE).

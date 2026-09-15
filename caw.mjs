@@ -865,6 +865,49 @@ const PROBE_REASON_VALUE_MAX = 3 * 1024
 const PROBE_REASON_SUMMARY_MAX = 320
 const PROBE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 
+function adapterImplementationDigest(directory, adapterName = 'adapter') {
+  const hash = createHash('sha256')
+  const walk = (current, prefix = '') => {
+    for (const name of readdirSync(current).sort()) {
+      // Legacy releases could ship probe evidence beside adapter.mjs. Evidence is an output of
+      // the implementation and contains its digest, so including it would be circular. Current
+      // machine-local evidence lives under Git's private caw/probes path.
+      const path = join(current, name)
+      const item = lstatSync(path)
+      const relativePath = prefix ? `${prefix}/${name}` : name
+      if (item.isSymbolicLink()) {
+        throw new Error(`adapter ${adapterName} contains unsupported symlink ${relativePath}`)
+      }
+      if (!prefix && name === 'probes') {
+        if (!item.isDirectory()) {
+          throw new Error(`adapter ${adapterName} has malformed legacy probes evidence`)
+        }
+        for (const evidenceName of readdirSync(path)) {
+          const evidence = lstatSync(join(path, evidenceName))
+          if (!evidenceName.endsWith('.json') || !evidence.isFile() || evidence.isSymbolicLink()) {
+            throw new Error(`adapter ${adapterName} has unsupported probes entry ${evidenceName}`)
+          }
+        }
+        continue
+      }
+      if (item.isDirectory()) {
+        walk(path, relativePath)
+        continue
+      }
+      if (!item.isFile()) {
+        throw new Error(`adapter ${adapterName} contains unsupported entry ${relativePath}`)
+      }
+      const bytes = readFileSync(path)
+      // Length prefixes make the stream unambiguous without depending on platform path syntax.
+      hash.update(`${Buffer.byteLength(relativePath)}:${relativePath}:`)
+      hash.update(`${item.mode & 0o777}:${bytes.length}:`)
+      hash.update(bytes)
+    }
+  }
+  walk(directory)
+  return hash.digest('hex')
+}
+
 async function discoverAdapters() {
   const root = resolve('.caw/adapters')
   if (!existsSync(root)) die('missing CAW-owned adapter directory .caw/adapters')
@@ -877,8 +920,9 @@ async function discoverAdapters() {
     if (!existsSync(modulePath) || !inside(canonicalRoot, realpathSync(modulePath))) {
       die(`adapter ${name} is missing its trusted adapter.mjs`)
     }
-    const source = readFileSync(modulePath)
-    const digest = createHash('sha256').update(source).digest('hex')
+    let digest
+    try { digest = adapterImplementationDigest(directory, name) }
+    catch (error) { die(error?.message || String(error)) }
     let adapter
     try { adapter = (await import(`${pathToFileURL(modulePath).href}?sha256=${digest}`)).default }
     catch (error) { die(`adapter ${name} failed to load: ${error?.message || error}`) }
@@ -10323,7 +10367,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 export {
-  GateFailureAction, PlanningAction, SCHEMA, addAccounting, buildTaskDossier,
+  GateFailureAction, PlanningAction, SCHEMA, addAccounting, adapterImplementationDigest,
+  buildTaskDossier,
   canonicalAuthorityPaths, compactRunMetrics,
   collectGateEvidence, retainGateEvidence,
   decideGateFailure, decidePlanningAction, deltaAccounting, executorClaimsIssue,
