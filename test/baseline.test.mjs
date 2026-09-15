@@ -255,6 +255,9 @@ function fixture({
   gateBatchTimeout = '',
   gateFull = '',
   gateFullTimeout = '',
+  executorMaxToolEvents = '',
+  executorMaxEventBytes = '',
+  gateUnavailableReview = 'false',
   indexCmd = '',
   indexFormat = '',
   indexAudience = '',
@@ -334,6 +337,9 @@ gate_batch: ${gateBatch}
 gate_batch_timeout_ms: ${gateBatchTimeout}
 gate_full: ${gateFull}
 gate_full_timeout_ms: ${gateFullTimeout}
+executor_max_tool_events: ${executorMaxToolEvents}
+executor_max_event_bytes: ${executorMaxEventBytes}
+gate_unavailable_review: ${gateUnavailableReview}
 index_cmd: ${indexCmd}
 index_format: ${indexFormat}
 index_audience: ${indexAudience}
@@ -3517,7 +3523,7 @@ title: Baseline task
   assert.equal(existsSync(state), true)
   const saved = JSON.parse(readFileSync(state, 'utf8'))
   assert.equal(saved.history[0].id, 'r1.1')
-  assert.equal(saved.state_version, 5)
+  assert.equal(saved.state_version, 6)
   assert.match(saved.runtime_digest, /^[0-9a-f]{64}$/)
   assert.equal(saved.runtime_history.some((entry) => entry.role === 'reviewer'), true)
   assert.equal(saved.history[0].origin_runtime.provider, 'test-claude')
@@ -3660,7 +3666,7 @@ test('version-4 task state migrates finding provenance without dropping legacy f
   assert.equal(result.status, 1)
   const saved = JSON.parse(readFileSync(
     join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
-  assert.equal(saved.state_version, 5)
+  assert.equal(saved.state_version, 6)
   assert.equal(saved.history.length, 1)
   for (const field of ['id', 'slot', 'round', 'where', 'fix', 'evidence', 'state']) {
     assert.equal(saved.history[0][field], legacy[field])
@@ -5314,6 +5320,61 @@ test('build wakes an executor only after the same delivery makes the gate red tw
   assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
 })
 
+test('confirmed red receipt is persisted before an executor retry starts', () => {
+  const f = fixture({
+    git: true,
+    gateFast: `node -e "process.exit(require('fs').readFileSync('src/output.txt','utf8').includes('fixed')?0:1)"`,
+  })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const spec = '001_task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), '---\ntitle: Task\n---\n\nDo it.\n')
+
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'broken\n' }, envelope: envelope(delivery('first try')) },
+    { status: 1, error: 'retry interrupted after editing' },
+  ])
+
+  assert.equal(result.status, 1)
+  const state = JSON.parse(readFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(state.state_version, 6)
+  assert.equal(state.gate_fact.state, 'red')
+  assert.match(state.gate_fact.receipt_id, /^[0-9a-f]{64}$/)
+})
+
+test('unavailable gate may receive one advisory review but cannot commit', () => {
+  const f = fixture({ git: true, gateFast: 'exit 75', gateUnavailableReview: 'true' })
+  const result = buildOneTask(f)
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls.map((call) => call.role), ['executor', 'reviewer'], text)
+  assert.match(text, /running one advisory reviewer pass without certification/)
+  assert.match(text, /delivery is not certified or committed/i)
+  assert.equal(readFileSync(join(f.root, 'src/output.txt'), 'utf8'), 'done\n')
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_task.md')), true)
+})
+
+test('Codex runner enforces its live tool-event budget', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'caw-runner-budget-'))
+  TEMP_ROOTS.add(parent)
+  const fake = join(parent, 'events.mjs')
+  writeFileSync(fake, [
+    "process.on('SIGINT', () => process.exit(130))",
+    "for (let i = 0; i < 20; i++) console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution'}}))",
+    'setTimeout(() => process.exit(0), 5000)',
+  ].join('\n'))
+  const runner = join(ROOT, '.caw', 'adapters', 'codex', 'runner.mjs')
+  const result = spawnSync(process.execPath, [runner, '-', process.execPath, fake], {
+    input: '', encoding: 'utf8', timeout: 3000,
+    env: { ...process.env, CAW_EXECUTOR_MAX_TOOL_EVENTS: '3' },
+  })
+
+  assert.equal(result.status, 86, result.stderr)
+  assert.match(result.stderr, /CAW_EXECUTOR_BUDGET_EXHAUSTED tool-events 3\/3/)
+})
+
 test('task gate receives stable task key and must pass every required check id', () => {
   const f = fixture({ git: true, gateFast: 'node gate.mjs' })
   writeFileSync(join(f.root, 'gate.mjs'), `
@@ -5452,4 +5513,18 @@ test('invalid project gate timeouts fail before provider calls', () => {
   assert.equal(result.status, 1)
   assert.match(result.stderr, /gate_fast_timeout_ms must be a positive whole number/)
   assert.equal(calls(f).length, 0)
+})
+
+test('invalid executor and unavailable-gate budgets fail before provider calls', () => {
+  for (const fields of [
+    { executor_max_tool_events: '0' },
+    { executor_max_event_bytes: '1.5' },
+    { gate_unavailable_review: 'sometimes' },
+  ]) {
+    const f = fixture({ git: true })
+    configureProfileFields(f, fields)
+    const result = run(f, ['plan', 'x'], [])
+    assert.equal(result.status, 1)
+    assert.equal(calls(f).length, 0)
+  }
 })
