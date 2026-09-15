@@ -4542,6 +4542,22 @@ function executorBudgetFloor(taskOrSpec) {
   const body = typeof taskOrSpec === 'string'
     ? taskOrSpec
     : JSON.stringify(taskOrSpec || {})
+  const riskBody = (typeof taskOrSpec === 'string'
+    ? taskOrSpec
+    : [
+        taskOrSpec?.title,
+        ...(taskOrSpec?.read || []), ...(taskOrSpec?.change || []),
+        ...(taskOrSpec?.done_when || []),
+        ...(taskOrSpec?.surfaces || []).flatMap((surface) =>
+          [surface.id, surface.responsibility]),
+        ...(taskOrSpec?.state_machines || []).flatMap((machine) => [
+          machine.surface,
+          ...(machine.transitions || []).map((transition) => transition.event),
+        ]),
+      ].filter(Boolean).join('\n'))
+    .split('\n')
+    .map((line) => line.replace(/\b(?:do not|don't|must not|never|without|no)\b.*$/i, ''))
+    .join('\n')
   const surfaceCount = typeof taskOrSpec === 'string'
     ? (body.split(/^## Surfaces\s*$/m)[1]?.split(/^## /m)[0]
       ?.split('\n').filter((line) => /^-\s+`[^`]+`/.test(line)).length || 0)
@@ -4551,7 +4567,7 @@ function executorBudgetFloor(taskOrSpec) {
     : (taskOrSpec?.state_machines || []).reduce((sum, machine) =>
       sum + (machine.transitions?.length || 0), 0)
   const sensitive = /\b(?:migration|database|schema|postgres|supabase|rls|row[- ]level security|authentication|authorization|credential|secret|security|permission|privilege|grant|access policy|security policy)\b/i
-    .test(body)
+    .test(riskBody)
   if (surfaceCount > 1 || sensitive) {
     return {
       class: 'large',
