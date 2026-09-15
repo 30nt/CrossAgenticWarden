@@ -1365,6 +1365,107 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.equal(existsSync(runPath), false)
 })
 
+test('architect repairs one duplicate coverage row without repeating enumeration', () => {
+  const f = fixture({ git: true })
+  const rejected = plan()
+  rejected.coverage.push({ ...rejected.coverage[0] })
+  const result = run(f, ['plan', 'Repair duplicate coverage'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout,
+    /architect canonical inconsistency; retrying once: \$\.coverage each case must appear exactly once/)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 2)
+  assert.equal(seen.filter((call) => call.role === 'plan-reviewer').length, 1)
+  const repair = seen.find((call) => call.role === 'architect' &&
+    call.input.startsWith('Canonical repair 1 for architect.'))
+  assert.match(repair.input, /failed the engine canonical validation at \$\.coverage/)
+  assert.match(repair.input, /Rejected canonical value:/)
+  assert.equal((repair.input.match(/"case": "fixture output"/g) || []).length, 2)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  const architectCalls = manifest.calls.filter((call) => call.role === 'architect')
+  assert.deepEqual(architectCalls.map((call) => call.status), ['success', 'success'])
+  assert.equal(manifest.calls.length, 4)
+  const diagnostics = manifest.diagnostics.filter((item) =>
+    item.role === 'architect' && item.kind === 'canonical-validation')
+  assert.equal(diagnostics.length, 1)
+  const diagnostic = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    diagnostics[0].file), 'utf8'))
+  assert.equal(diagnostic.path, '$.coverage')
+  assert.equal(diagnostic.message, 'each case must appear exactly once')
+  assert.equal(diagnostic.attempt_id, architectCalls[0].attempt_id)
+})
+
+test('architect canonical repair is bounded to one additional call', () => {
+  const f = fixture()
+  const rejected = plan()
+  rejected.coverage.push({ ...rejected.coverage[0] })
+  const result = run(f, ['plan', 'Bound duplicate coverage repair'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(rejected) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr,
+    /architect returned invalid canonical output at \$\.coverage: each case must appear exactly once/)
+  assert.equal(calls(f).filter((call) => call.role === 'architect').length, 2)
+  assert.equal(calls(f).filter((call) => call.role === 'plan-reviewer').length, 0)
+})
+
+test('architect canonical repair also recovers a structural schema failure', () => {
+  const f = fixture()
+  const result = run(f, ['plan', 'Repair malformed coverage'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), coverage: 'not-an-array' }) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 2)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  const architectCalls = manifest.calls.filter((call) => call.role === 'architect')
+  assert.deepEqual(architectCalls.map((call) => [call.status, call.failure_kind || null]), [
+    ['failure', 'schema-validation'],
+    ['success', null],
+  ])
+})
+
+test('plan reviewer repairs one incomplete relation ledger without repeating the architect', () => {
+  const f = fixture()
+  const rejected = { ...planReview(), relations: [] }
+  const result = run(f, ['plan', 'Repair plan review relations'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'plan-reviewer').length, 2)
+  const repair = seen.find((call) => call.role === 'plan-reviewer' &&
+    call.input.startsWith('Canonical repair 1 for plan-reviewer.'))
+  assert.match(repair.input, /failed the engine canonical validation at \$\.relations/)
+  assert.match(repair.input, /missing relation id/)
+})
+
 test('planning raises an undersized executor budget and preserves the architect proposal', () => {
   const f = fixture()
   const proposed = plan()
@@ -3822,6 +3923,7 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const blockedPlaceholder = run(placeholder, ['plan', 'x'], [
     { envelope: envelope(population()) },
     { envelope: envelope({ ...plan(), blocked: 'none' }) },
+    { envelope: envelope({ ...plan(), blocked: 'none' }) },
   ])
   assert.equal(blockedPlaceholder.status, 1)
   assert.match(blockedPlaceholder.stderr, /\$\.blocked: use the empty string/)
@@ -3834,6 +3936,10 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
       case: 'fixture output', task: 'missing',
       acceptance_criteria: ['The fixture output exists.'],
     }] }) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'missing',
+      acceptance_criteria: ['The fixture output exists.'],
+    }] }) },
   ])
   assert.equal(unknownTask.status, 1)
   assert.match(unknownTask.stderr, /names unknown task/)
@@ -3842,6 +3948,10 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const acceptance = fixture()
   const unknownCriterion = run(acceptance, ['plan', 'x'], [
     { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'baseline-task',
+      acceptance_criteria: ['A criterion the task does not contain.'],
+    }] }) },
     { envelope: envelope({ ...plan(), coverage: [{
       case: 'fixture output', task: 'baseline-task',
       acceptance_criteria: ['A criterion the task does not contain.'],
@@ -3863,6 +3973,7 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const noReason = run(multipleSurfaces, ['plan', 'x'], [
     { envelope: envelope(population()) },
     { envelope: envelope(missingIndivisibility) },
+    { envelope: envelope(missingIndivisibility) },
   ])
   assert.equal(noReason.status, 1)
   assert.match(noReason.stderr, /indivisible_reason/)
@@ -3872,6 +3983,7 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   unknownState.tasks[0].state_machines[0].transitions[0].to = 'deleted'
   const badTransition = run(transition, ['plan', 'x'], [
     { envelope: envelope(population()) },
+    { envelope: envelope(unknownState) },
     { envelope: envelope(unknownState) },
   ])
   assert.equal(badTransition.status, 1)
@@ -3894,6 +4006,7 @@ test('plan reviewer must adjudicate every engine relation id exactly once', () =
     const result = run(f, ['plan', `relation ${name}`], [
       { envelope: envelope(population()) },
       { envelope: envelope(plan()) },
+      { envelope: envelope(review) },
       { envelope: envelope(review) },
     ])
     assert.equal(result.status, 1, name)

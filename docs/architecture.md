@@ -2,7 +2,7 @@
 
 *[Русская версия](architecture.ru.md)*
 
-One file, five roles, two adapters, four guards. This is what each one owns and, more usefully,
+One engine, five roles, two adapters, four guards. This is what each one owns and, more usefully,
 what it is not allowed to own.
 
 ## The shape
@@ -30,8 +30,8 @@ what it is not allowed to own.
 The division is the whole design. `caw.mjs` owns:
 
 - **the protocol** — what is sent, in what order, with which prompt
-- **the schemas** — every role returns JSON validated against a fixed shape; a malformed return
-  is a failure, not an interpretation
+- **the schemas** — every role returns JSON validated against a fixed shape; malformed planning
+  output gets one bounded canonical repair, then remains a failure rather than an interpretation
 - **the gates** — `bash -lc "<your command>"`, and the exit code is the verdict
 - **the state** — the queue is a directory; a task's review history is a file the engine writes
 - **the commits** — `git add -A` and the message, carrying the spec's full text
@@ -75,6 +75,11 @@ from that task. The engine assigns content-stable ids to tasks, requirements, ca
 The plan reviewer must return one evidenced disposition for every relation id; missing, duplicate
 or unknown ids invalidate the response. The complete ledger stays in `PLAN.md`, while each task
 spec carries its own acceptance links.
+
+An invalid architect or plan-reviewer canonical value receives one repair call to the same role.
+The repair contains the exact validation path and message, the original request to that role, and
+the complete rejected value. It neither re-runs the enumerator nor consumes a plan-review round.
+A second invalid value stops with both attempts and diagnostics retained in the private run record.
 
 Every task also declares independently changeable surfaces and one explicit state machine per
 surface. Surface responsibilities and transitions become stable ledger requirements. The engine
