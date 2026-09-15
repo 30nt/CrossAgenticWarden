@@ -5326,6 +5326,7 @@ test('confirmed red receipt is persisted before an executor retry starts', () =>
     gateFast: `node -e "process.exit(require('fs').readFileSync('src/output.txt','utf8').includes('fixed')?0:1)"`,
   })
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
   const spec = '001_task.md'
   writeFileSync(join(f.root, '.caw-tasks', spec), '---\ntitle: Task\n---\n\nDo it.\n')
 
@@ -5430,6 +5431,32 @@ test('a batch gate runs once after task commits and before the full gate', () =>
   const result = buildOneTask(f, [], ['build'], { CAW_BATCH_LOG: log })
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(readFileSync(log, 'utf8'), 'batch\nfull\n')
+})
+
+test('a batch gate runs when round commits the last resumed task', () => {
+  const f = fixture({
+    git: true,
+    gateBatch: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'batch\\n\')"',
+  })
+  const log = join(f.parent, 'resume-batch.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  const spec = '001_task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'src', 'output.txt'), 'done\n')
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 6, spec_digest: 'saved', round: 1, history: [], how: null, noted: [],
+    accounting: { currencies: {}, unknown_cost_calls: 0 }, runtime_history: [],
+    project_policies: null, weak_verification: null, gate_fact: null, ex: null,
+  })}\n`)
+
+  const result = run(f, ['round', spec], [
+    { envelope: envelope(delivery('finished')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_BATCH_LOG: log })
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(readFileSync(log, 'utf8'), 'batch\n')
 })
 
 test('fast mode ends after focused task review and skips queue-level gates', () => {

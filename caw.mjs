@@ -8892,6 +8892,7 @@ function prepareTaskReviewRisk(f) {
 }
 
 function finishReviewedTask(f, risk, fullGateBaseline) {
+  if (!specFiles().length && f.pipeline_mode !== 'fast') runBatchGate(f)
   if (fullGateBaseline) runFinalFullGate(f, fullGateBaseline.head, fullGateBaseline)
   if (risk && !specFiles().length) {
     if (existsSync(PLAN)) {
