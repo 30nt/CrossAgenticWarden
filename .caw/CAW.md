@@ -67,8 +67,8 @@ index_audience: planning
 pipeline_mode: strict
 planning_max_rounds: 3
 
-# Comma-separated ignored dependency roots exposed read-only inside task-review surfaces.
-# Every other ignored project path is absent there and denied through its delivery-tree path.
+# Comma-separated ignored dependency roots copied writable into task-review surfaces.
+# The delivery copies and every other ignored project path stay denied through their original path.
 review_dependency_roots:
 
 # Task specs, commit messages, notes. Stated explicitly because an agent otherwise

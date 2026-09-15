@@ -1307,6 +1307,8 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.match(planText, /## Planning relation ledger/)
   assert.match(planText, /plan-relation-[0-9a-f]{12}/)
   assert.match(planText, /plan-requirement-[0-9a-f]{12}/)
+  assert.match(planText, /^## Approved — the queue as it was judged$/m)
+  assert.match(planText, /^- 001_baseline-task\.md  [0-9a-f]{12}$/m)
   const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
   assert.match(specText, /^executor_budget_requested: small$/m)
   assert.match(specText, /^executor_budget: small$/m)
@@ -1363,6 +1365,38 @@ test('current plan path constructs three Claude calls and persists an approved q
   const purged = run(f, ['artifacts', 'purge', runNames[0]], [])
   assert.equal(purged.status, 0)
   assert.equal(existsSync(runPath), false)
+})
+
+test('review-specs records a hand-written queue and build reports later edits', () => {
+  const f = fixture({ git: true })
+  const description = 'Ship the hand-written ticket'
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_hand-written.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), [
+    '---', 'title: Hand-written ticket', '---', '',
+    '## Change', '', '- Implement the requested behavior.', '',
+    '## Done when', '', '- The requested behavior works.', '',
+  ].join('\n'))
+
+  let result = run(f, ['review-specs', description], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...planReview(), relations: [] }) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const recordPath = join(f.root, '.caw-tasks', 'PLAN.md')
+  const record = readFileSync(recordPath, 'utf8')
+  assert.match(record, /^approved: true$/m)
+  assert.match(record, /^# Reviewed ticket queue$/m)
+  assert.match(record, new RegExp(`^- ${spec}  [0-9a-f]{12}$`, 'm'))
+  assert.match(record, new RegExp(description))
+
+  writeFileSync(join(f.root, '.caw-tasks', spec), `${readFileSync(
+    join(f.root, '.caw-tasks', spec), 'utf8')}\nChanged after review.\n`)
+  writeFileSync(join(f.root, 'README.md'), '# dirty fixture\n')
+  result = run(f, ['build', '--no-full'], [])
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /001_hand-written\.md — edited since it was approved/)
+  assert.match(result.stderr, /working tree is dirty/)
 })
 
 test('architect repairs one duplicate coverage row without repeating enumeration', () => {
@@ -4559,7 +4593,10 @@ title: Baseline task
       'src/reviewer-leak.txt': 'mutation made after the green gate\n',
       // A malicious absolute address back into the delivery is denied by Seatbelt.
       [join(f.root, 'src', 'escaped.txt')]: 'must not escape\n',
-      'node_modules/fixture/index.js': 'must remain read-only\n',
+      [join(f.root, 'node_modules', 'fixture', 'escaped.js')]: 'must not escape through dependencies\n',
+      // Dependency-local caches and mutations must work without reaching the delivery copy.
+      'node_modules/.vite-temp/config.mjs': 'generated config\n',
+      'node_modules/fixture/index.js': 'review-only dependency mutation\n',
     },
     ignoreWriteErrors: true,
     recordReviewProbe: true,
@@ -4588,12 +4625,13 @@ title: Baseline task
   assert.equal(probe.sectionOffsets.pipeline, 0)
   assert.equal(probe.sectionOffsets.capabilities < probe.sectionOffsets.language, true)
   assert.deepEqual(probe.writes['src/reviewer-leak.txt'], { ok: true, error: null })
-  // Which errno the refusal carries is the outer profile's business — seatbelt says EPERM,
-  // bubblewrap's read-only root says EROFS. What this case pins is that the write did not land.
-  for (const path of [join(f.root, 'src', 'escaped.txt'), 'node_modules/fixture/index.js']) {
-    assert.equal(probe.writes[path].ok, false)
-    assert.ok(DENIED_BY_BOUNDARY.has(probe.writes[path].error), probe.writes[path].error)
-  }
+  assert.equal(probe.writes[join(f.root, 'src', 'escaped.txt')].ok, false)
+  assert.ok(DENIED_BY_BOUNDARY.has(probe.writes[join(f.root, 'src', 'escaped.txt')].error))
+  assert.equal(probe.writes[join(f.root, 'node_modules', 'fixture', 'escaped.js')].ok, false)
+  assert.ok(DENIED_BY_BOUNDARY.has(
+    probe.writes[join(f.root, 'node_modules', 'fixture', 'escaped.js')].error))
+  assert.deepEqual(probe.writes['node_modules/.vite-temp/config.mjs'], { ok: true, error: null })
+  assert.deepEqual(probe.writes['node_modules/fixture/index.js'], { ok: true, error: null })
 })
 
 const readmeMutation = (replacement) => `diff --git a/README.md b/README.md
