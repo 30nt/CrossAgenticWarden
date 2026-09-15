@@ -367,10 +367,16 @@ test('planning invocations keep repository reads and shell but grant writes only
         executable: '/fixture/claude',
         execution: {
           workingRoot, scratchRoot, writeBoundary: 'delivery-tree',
-          writeBoundaryBy: 'os-boundary', deniedReadPaths: [], env: { PWD: workingRoot },
+          writeBoundaryBy: 'os-boundary', deniedReadPaths: [], env: {
+            PWD: workingRoot, CAW_EXECUTOR_MAX_TOOL_EVENTS: '120',
+          },
         },
       })
       assert.equal(grants(executorInvocation, workingRoot), true)
+      assert.equal(executorInvocation.args.some((argument) =>
+        argument.endsWith('/claude/runner.mjs')), true)
+      assert.equal(executorInvocation.args[executorInvocation.args.indexOf('--output-format') + 1],
+        'stream-json')
     }
 
     if (platform() === 'darwin' && arch() === 'arm64') {
