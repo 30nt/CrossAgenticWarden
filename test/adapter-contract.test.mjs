@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 import { SCHEMA, roleGuaranteeMismatch } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -103,6 +104,38 @@ test('adapter telemetry reports provider events only when the transport exposes 
   assert.deepEqual(claudeResult.telemetry, {
     eventCount: null, toolEventCount: null, eventBytes: null,
   })
+
+  const claudeEvents = [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read' }] } },
+    { type: 'result', structured_output: {}, usage: { input_tokens: 10 } },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+  const streamedClaude = claude.decodeSuccess(claudeEvents, {
+    binding: { provider: 'claude', model: 'fixture', reasoning: 'low' },
+    requestedNative: {},
+  }).canonical
+  assert.deepEqual(streamedClaude.telemetry, {
+    eventCount: 2, toolEventCount: 1, eventBytes: Buffer.byteLength(claudeEvents),
+  })
+})
+
+test('Claude runner enforces its live tool-event budget', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'caw-claude-runner-budget-'))
+  const fake = join(parent, 'events.mjs')
+  writeFileSync(fake, [
+    "process.on('SIGINT', () => process.exit(130))",
+    "const event = {type:'assistant',message:{content:[{type:'tool_use',name:'Read'}]}}",
+    'for (let i = 0; i < 20; i++) console.log(JSON.stringify(event))',
+    'setTimeout(() => process.exit(0), 5000)',
+  ].join('\n'))
+  const runner = join(process.cwd(), '.caw', 'adapters', 'claude', 'runner.mjs')
+  const result = spawnSync(process.execPath, [runner, process.execPath, fake], {
+    input: '', encoding: 'utf8', timeout: 3000,
+    env: { ...process.env, CAW_EXECUTOR_MAX_TOOL_EVENTS: '3' },
+  })
+  rmSync(parent, { recursive: true, force: true })
+
+  assert.equal(result.status, 86, result.stderr)
+  assert.match(result.stderr, /CAW_EXECUTOR_BUDGET_EXHAUSTED tool-events 3\/3/)
 })
 
 test('role guarantee matcher accepts every exact cell and rejects every missing or incomparable cell', () => {

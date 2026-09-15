@@ -25,7 +25,7 @@ gate_full_timeout_ms:
 executor_max_tool_events:
 executor_max_event_bytes:
 
-# Adaptive Codex executor budgets. Configure all six or leave all six empty. New planning writes
+# Adaptive executor budgets. Configure all six or leave all six empty. New planning writes
 # an executor_budget class into every task; old or hand-written specs default to normal. The
 # engine raises database/security work and indivisible multi-surface tasks to large. These fields
 # cannot be combined with the two static limits above.
