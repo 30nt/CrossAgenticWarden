@@ -7,11 +7,12 @@ import { join } from 'node:path'
 
 import {
   SCHEMA, buildTaskDossier, executorClaimsIssue, extractTaskTopology, groupFindings,
-  reviewContractIssue, taskDeliveryDiff,
+  requiredGateChecks, reviewContractIssue, reviewNeedsChallenger, taskDeliveryDiff, taskKey,
 } from '../caw.mjs'
 
 const spec = `---
 id: 001
+task_key: profile-language-authority
 title: Dossier
 ---
 
@@ -24,7 +25,23 @@ title: Dossier
 
 ## Done when
 - The mounted settings consumer updates.
+
+## Required gate checks
+- \`settings-language-ui\` — proves the mounted consumer switches
 `
+
+test('task identity and required gate evidence do not depend on queue numbering', () => {
+  assert.equal(taskKey('.caw-tasks/018_any-name.md', spec), 'profile-language-authority')
+  assert.deepEqual(requiredGateChecks('.caw-tasks/018_any-name.md', spec), ['settings-language-ui'])
+})
+
+test('risk challenger policy escalates only concrete risk signals', () => {
+  const f = { review_challenger_policy: 'risk', review_challenger_passes: 1,
+    review_challenger_file_threshold: 8 }
+  assert.equal(reviewNeedsChallenger(f, ['src/plain.js']), false)
+  assert.equal(reviewNeedsChallenger(f, ['src/auth/session.js']), true)
+  assert.equal(reviewNeedsChallenger(f, ['src/plain.js'], [], { broken: [{ id: 'x' }] }), true)
+})
 
 test('task topology gives criteria, surfaces and transitions stable ids', () => {
   const first = extractTaskTopology(spec)

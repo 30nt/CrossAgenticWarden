@@ -93,7 +93,9 @@ digest and truncation marker; the total is capped too. It contains the contract,
 bounded diff, grouped open findings, executor claims, acceptance cases and gate receipt. This
 limits repeated context without removing repository read access.
 
-Executor checks are structured but untrusted claims. The gate runs with engine-provided private
+Executor checks are structured but untrusted navigation claims. Their contract links are not an
+acceptance boundary: an executor may return an empty list, and malformed semantic links do not
+discard correct code. The gate runs with engine-provided private
 manifest and artifact paths. CAW validates links, paths, kinds and bounds, hashes accepted files,
 and creates a receipt bound to the delivery digest. Reviewer evidence references distinguish that
 receipt from claims and from direct repository or isolated-surface experiments.
@@ -109,8 +111,9 @@ state without becoming a duplicate new finding. If a schema-valid reviewer respo
 semantically inconsistent with either ledger, the engine restores the same review baseline and
 allows one correction call. A second inconsistency stops the run before later passes are merged.
 
-A review round contains one primary pass plus `review_challenger_passes` blind challenger passes
-(one by default, at most two). Every pass receives the same delivery digest in a fresh isolated
+A review round contains one primary pass plus up to `review_challenger_passes` blind challenger
+passes. Fixed policy always runs them; risk policy adds them for broad or risky changes, carried
+findings, or a primary pass that finds a blocker. Every pass receives the same delivery digest in a fresh isolated
 surface. The engine merges their census rows and findings before another executor can run.
 Disagreement keeps a carried item open; challenger-only findings are labelled
 `late-same-baseline` with that digest.

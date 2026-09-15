@@ -11,6 +11,11 @@ gate_fast: npm test
 # Optional positive milliseconds. Empty means no engine timeout.
 gate_fast_timeout_ms:
 
+# Optional queue-level suite, run once after all task commits and before gate_full.
+# Put broad unit tests here when gate_fast contains focused checks only.
+gate_batch:
+gate_batch_timeout_ms:
+
 # Run once, at the end of a build. Leave empty when it is the same as gate_fast.
 gate_full:
 gate_full_timeout_ms:
@@ -31,6 +36,16 @@ weak_positive_control_cmd:
 index_cmd:
 # New profiles use strict, versioned JSON. Profiles without this field retain legacy text-v0.
 index_format: json-v1
+# Optional deterministic request-token/file index produced by the engine.
+builtin_index: request-v1
+# `planning` gives the same deterministic index to enumerator, architect, and plan-reviewer.
+index_audience: planning
+
+# fast: existing specs -> executor -> focused gate -> reviewer.
+# standard: one enumerator/architect/plan-review pass, dynamic challengers, batch/full gates.
+# strict: bounded iterative planning and fixed challenger passes, plus batch/full gates.
+pipeline_mode: strict
+planning_max_rounds: 3
 
 # Comma-separated ignored dependency roots exposed read-only inside task-review surfaces.
 # Every other ignored project path is absent there and denied through its delivery-tree path.
@@ -49,6 +64,10 @@ human_review_allowed_signers:
 # Blind reviewer passes after the primary pass. All passes receive the exact same delivery.
 # 1 means two total passes; allowed range is 0..2.
 review_challenger_passes: 1
+# fixed always runs the configured passes; risk adds them only for risky paths, broad changes,
+# carried findings, or a primary review that finds a blocker.
+review_challenger_policy: fixed
+review_challenger_file_threshold: 8
 
 # Require a successful role-specific provider call for the exact model/reasoning binding.
 # Run `node caw.mjs smoke all` after changing .caw/runtime.json.

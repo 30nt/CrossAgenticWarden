@@ -216,6 +216,18 @@ Source probe запускается в review-поверхности и печа
 один reviewer-вызов. `require_role_smoke: true` требует точное доказательство привязки после
 смены model, reasoning, CLI, адаптера или движка.
 
+`pipeline_mode` выбирает `fast`, `standard` или `strict`. Fast использует готовые спеки и путь из
+одного executor, точечного gate и primary review. Standard делает один planning review и включает
+challenger по риску. Strict сохраняет итеративное planning и фиксированные challengers.
+`planning_max_rounds` ограничивает planning диапазоном `1..3`; `review_challenger_policy: risk`
+добавляет настроенные проходы только для широких или рискованных путей, перенесённых findings или
+blocking-результата primary review.
+
+`builtin_index: request-v1` включает ограниченный индекс файлов по токенам запроса, построенный
+движком, а `index_audience: planning` передаёт один и тот же digest вместе с выводом `index_cmd`
+enumerator, architect и plan-reviewer. Широкие тесты, которые нужно запускать один раз после очереди, задайте
+в `gate_batch`; точечные evidence оставьте в `gate_fast`.
+
 Для человеческой независимости задайте `human_review_allowed_signers` как относительный от
 репозитория OpenSSH allowed-signers файл. CAW сам ничего не подписывает: `human-review prepare`
 создаёт точный census, человек заполняет и подписывает его байты в namespace `caw-review`, а

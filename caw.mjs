@@ -150,6 +150,7 @@ const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
 const MAX_REVIEW_CHALLENGER_PASSES = 2
 const MAX_REVIEW_SEMANTIC_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
+const PIPELINE_MODES = new Set(['fast', 'standard', 'strict'])
 const TASK_DOSSIER_TOTAL_MAX = 192 * 1024
 const TASK_DOSSIER_CAPS = Object.freeze({
   spec: 32 * 1024,
@@ -1647,6 +1648,18 @@ const TASK = {
     read: { type: 'array', items: { type: 'string' } },
     change: { type: 'array', items: { type: 'string' } },
     done_when: { type: 'array', items: { type: 'string' } },
+    gate_checks: {
+      type: 'array',
+      description: 'stable check ids the task gate must report as passed before review',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'stable kebab-case gate check id' },
+          description: { type: 'string' },
+        },
+        required: ['id', 'description'],
+      },
+    },
     surfaces: {
       type: 'array', minItems: 1,
       items: {
@@ -1684,7 +1697,7 @@ const TASK = {
       description: 'empty for one surface; for several surfaces, why they cannot be separate tasks',
     },
   },
-  required: ['slug', 'title', 'read', 'change', 'done_when', 'surfaces', 'state_machines',
+  required: ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
     'indivisible_reason'],
 }
 
@@ -2066,7 +2079,8 @@ const SCHEMA = closeSchema({
       claims: {
         type: 'array',
         description: 'untrusted executor-reported checks. The engine retains them as navigation ' +
-          'hints and never upgrades them into gate evidence.',
+          'hints and never upgrades them into gate evidence. Use an empty array rather than ' +
+          'inventing criterion or acceptance-case ids; the engine gate supplies acceptance proof.',
         items: {
           type: 'object',
           properties: {
@@ -3217,7 +3231,7 @@ function profile(preflight = true) {
   // direction: gate() treats an empty command as green, so every task would pass a gate
   // that never ran and be committed on it.
   if (!f.gate_fast) die('.caw/CAW.md sets no gate_fast — refusing to run a pipeline with no gate')
-  for (const key of ['gate_fast_timeout_ms', 'gate_full_timeout_ms']) {
+  for (const key of ['gate_fast_timeout_ms', 'gate_batch_timeout_ms', 'gate_full_timeout_ms']) {
     if (f[key] === undefined || f[key] === '') {
       f[key] = null
       continue
@@ -3232,6 +3246,28 @@ function profile(preflight = true) {
   f.index_format = f.index_format || 'text-v0'
   if (!['text-v0', 'json-v1'].includes(f.index_format)) {
     die(`.caw/CAW.md index_format must be text-v0 or json-v1 — got "${f.index_format}"`)
+  }
+  f.index_audience = f.index_audience || 'enumerator'
+  if (!['enumerator', 'planning'].includes(f.index_audience)) {
+    die(`.caw/CAW.md index_audience must be enumerator or planning — got "${f.index_audience}"`)
+  }
+  f.builtin_index = f.builtin_index || ''
+  if (!['', 'request-v1'].includes(f.builtin_index)) {
+    die(`.caw/CAW.md builtin_index must be empty or request-v1 — got "${f.builtin_index}"`)
+  }
+  f.pipeline_mode = f.pipeline_mode || 'strict'
+  if (!PIPELINE_MODES.has(f.pipeline_mode)) {
+    die(`.caw/CAW.md pipeline_mode must be fast, standard, or strict — got "${f.pipeline_mode}"`)
+  }
+  const defaultPlanRounds = f.pipeline_mode === 'strict' ? MAX_PLAN_ROUNDS : 1
+  if (f.planning_max_rounds === undefined || f.planning_max_rounds === '') {
+    f.planning_max_rounds = defaultPlanRounds
+  } else {
+    const rounds = Number(f.planning_max_rounds)
+    if (!Number.isSafeInteger(rounds) || rounds < 1 || rounds > MAX_PLAN_ROUNDS) {
+      die(`.caw/CAW.md planning_max_rounds must be a whole number from 1 to ${MAX_PLAN_ROUNDS}`)
+    }
+    f.planning_max_rounds = rounds
   }
   const weakControls = ['weak_source_probe_cmd', 'weak_positive_control_cmd']
     .filter((key) => Boolean(f[key]))
@@ -3254,6 +3290,21 @@ function profile(preflight = true) {
         `${MAX_REVIEW_CHALLENGER_PASSES} — got "${f.review_challenger_passes}"`)
     }
     f.review_challenger_passes = passes
+  }
+  f.review_challenger_policy = f.review_challenger_policy ||
+    (f.pipeline_mode === 'strict' ? 'fixed' : 'risk')
+  if (!['fixed', 'risk'].includes(f.review_challenger_policy)) {
+    die(`.caw/CAW.md review_challenger_policy must be fixed or risk — got ` +
+      `"${f.review_challenger_policy}"`)
+  }
+  if (f.review_challenger_file_threshold === undefined || f.review_challenger_file_threshold === '') {
+    f.review_challenger_file_threshold = 8
+  } else {
+    const threshold = Number(f.review_challenger_file_threshold)
+    if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > 1000) {
+      die('.caw/CAW.md review_challenger_file_threshold must be a positive whole number')
+    }
+    f.review_challenger_file_threshold = threshold
   }
   if (f.require_role_smoke === undefined || f.require_role_smoke === '') {
     f.require_role_smoke = false
@@ -4881,6 +4932,7 @@ function collectGateEvidence(manifestPath, artifactsRoot, contract = {}) {
   }
 
   const criteria = new Set((contract.criteria || []).map((row) => row.id))
+  const requiredCheckIds = new Set(contract.requiredCheckIds || [])
   const acceptanceCases = new Map((contract.acceptanceCases || []).map((row) => [row.id, row]))
   const checkIds = new Set()
   const artifactIds = new Set()
@@ -4894,7 +4946,7 @@ function collectGateEvidence(manifestPath, artifactsRoot, contract = {}) {
     if (!/^[a-z][a-z0-9.-]{0,63}$/.test(check.evidence_kind)) {
       throw new Error(`gate evidence check ${check.id} has invalid evidence_kind`)
     }
-    if ((criteria.size || acceptanceCases.size) &&
+    if ((criteria.size || acceptanceCases.size) && !requiredCheckIds.has(check.id) &&
         !check.criterion_ids.length && !check.acceptance_case_ids.length) {
       throw new Error(`gate evidence check ${check.id} is not linked to a criterion or acceptance case`)
     }
@@ -4942,6 +4994,34 @@ function collectGateEvidence(manifestPath, artifactsRoot, contract = {}) {
     }
   }
   return { present: true, checks: manifest.checks, artifacts }
+}
+
+function taskSpecText(spec) {
+  if (!spec) return ''
+  if (existsSync(spec)) return readFileSync(spec, 'utf8')
+  const queued = join(QUEUE_DIR, spec)
+  return existsSync(queued) ? readFileSync(queued, 'utf8') : ''
+}
+
+function taskKey(spec, specText = null) {
+  if (!spec) return null
+  const body = specText ?? taskSpecText(spec)
+  const declared = body.match(/^task_key:\s*([a-z0-9][a-z0-9-]*)\s*$/m)?.[1]
+  if (declared) return declared
+  return spec.split(/[\\/]/).pop().replace(/^\d+_/, '').replace(/\.md$/, '')
+}
+
+function requiredGateChecks(spec, specText = null) {
+  if (!spec) return []
+  const body = specText ?? taskSpecText(spec)
+  const section = body.split(/^## /m).find((part) =>
+    part.toLowerCase().startsWith('required gate checks'))
+  if (!section) return []
+  const ids = section.split('\n').slice(1).flatMap((line) => {
+    const match = line.match(/^-\s+`([a-z][a-z0-9.-]{0,127})`(?:\s|$)/)
+    return match ? [match[1]] : []
+  })
+  return [...new Set(ids)]
 }
 
 function retainGateEvidence({ command, task, kind, deliveryDigest: digest, state, commandState,
@@ -5023,12 +5103,13 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
   const task = context.task || spec || null
   const kind = context.kind || (spec ? 'fast' : 'full')
   const digest = context.deliveryDigest || null
+  const requiredCheckIds = context.requiredCheckIds || requiredGateChecks(spec)
   if (!cmd) {
     try {
       const out = '(none configured)'
       const evidenceError = context.collectEvidence !== false &&
-        (context.acceptanceCases || []).length
-        ? 'acceptance matrix requires a configured gate that emits evidence'
+        ((context.acceptanceCases || []).length || requiredCheckIds.length)
+        ? 'task contract requires a configured gate that emits evidence'
         : null
       const state = evidenceError ? 'refused' : 'green'
       const status = evidenceError ? 75 : 0
@@ -5049,7 +5130,10 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
     } finally { removeTree(evidenceScratch) }
   }
   const env = { ...process.env, PWD: cwd || process.cwd() }
-  if (spec) env.CAW_SPEC = spec
+  if (spec) {
+    env.CAW_SPEC = spec
+    env.CAW_TASK_KEY = taskKey(spec)
+  }
   env.CAW_GATE_EVIDENCE_OUT = manifestPath
   env.CAW_GATE_ARTIFACTS_DIR = artifactsRoot
   const startedAt = Date.now()
@@ -5072,7 +5156,19 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
       if (context.collectEvidence !== false) {
         evidence = collectGateEvidence(manifestPath, artifactsRoot, {
           criteria: context.criteria || [], acceptanceCases: context.acceptanceCases || [],
+          requiredCheckIds,
         })
+        if (commandState === 'green' && requiredCheckIds.length) {
+          if (!evidence.present) {
+            throw new Error('green gate produced no evidence manifest for required task checks')
+          }
+          const passedChecks = new Set(evidence.checks
+            .filter((check) => check.state === 'passed').map((check) => check.id))
+          const missingChecks = requiredCheckIds.filter((id) => !passedChecks.has(id))
+          if (missingChecks.length) {
+            throw new Error(`green gate did not pass required check ids: ${missingChecks.join(', ')}`)
+          }
+        }
         if (commandState === 'green' && (context.acceptanceCases || []).length) {
           if (!evidence.present) {
             throw new Error('green gate produced no evidence manifest for the acceptance matrix')
@@ -5249,6 +5345,65 @@ function index(cmd, format = 'text-v0') {
     text: out, truncated: 0, sha256: createHash('sha256').update(out).digest('hex'),
     format, apiVersion: null,
   }
+}
+
+const REQUEST_INDEX_STOP = new Set([
+  'about', 'after', 'again', 'also', 'before', 'change', 'does', 'every', 'from', 'have',
+  'into', 'must', 'only', 'remain', 'should', 'task', 'test', 'tests', 'that', 'their',
+  'then', 'this', 'when', 'where', 'which', 'with', 'without',
+])
+
+function builtinRequestIndex(description, mode = '') {
+  if (mode !== 'request-v1') return { text: '', truncated: 0, sha256: null }
+  const tokens = [...new Set((description.toLowerCase().match(/[a-z0-9_/-]{4,}/g) || [])
+    .map((token) => token.replace(/^[-/]+|[-/]+$/g, ''))
+    .filter((token) => token.length >= 4 && !REQUEST_INDEX_STOP.has(token)))]
+    .sort((a, b) => b.length - a.length || a.localeCompare(b)).slice(0, 24)
+  const files = git('ls-files').split('\n').filter(Boolean).sort()
+  const selected = []
+  for (const path of files) {
+    const lowerPath = path.toLowerCase()
+    let matched = tokens.some((token) => lowerPath.includes(token))
+    if (!matched) {
+      try {
+        const stat = lstatSync(path)
+        if (stat.isFile() && stat.size <= 256 * 1024) {
+          const bytes = readFileSync(path)
+          if (!bytes.subarray(0, 8192).includes(0)) {
+            const body = bytes.toString('utf8').toLowerCase()
+            matched = tokens.some((token) => body.includes(token))
+          }
+        }
+      } catch { /* a concurrently removed tracked file is simply absent from this snapshot */ }
+    }
+    if (matched || path === '.caw/CAW.md' || /^scripts\/.*gate/.test(path)) selected.push(path)
+  }
+  const members = selected.slice(0, 300)
+  const text = members.length ? [
+    '## [request-files-v1] Deterministic request-related tracked files',
+    `Source: CAW request-v1; ${tokens.length} normalized tokens; first 300 lexical matches of ${selected.length}`,
+    ...members.map((path) => `- ${path}`),
+  ].join('\n') : ''
+  return {
+    text, truncated: Math.max(0, selected.length - members.length),
+    sha256: text ? createHash('sha256').update(text).digest('hex') : null,
+  }
+}
+
+function combinePlanningIndexes(project, builtin) {
+  const text = [project.text, builtin.text].filter(Boolean).join('\n\n')
+  return {
+    text,
+    truncated: (project.truncated || 0) + (builtin.truncated || 0),
+    sha256: text ? createHash('sha256').update(text).digest('hex') : null,
+    format: project.format || 'text-v0',
+    apiVersion: project.apiVersion || null,
+  }
+}
+
+function planningIndex(description, f) {
+  return combinePlanningIndexes(index(f.index_cmd, f.index_format),
+    builtinRequestIndex(description, f.builtin_index))
 }
 
 // The wording that goes with it, kept next to the reader for the same reason populationBlock()
@@ -6139,8 +6294,8 @@ function recordPopulationCache(value) {
   writeRunManifest('active')
 }
 
-function enumerate(description, text, f) {
-  const indexResult = index(f.index_cmd, f.index_format)
+function enumerate(description, text, f, suppliedIndex = null) {
+  const indexResult = suppliedIndex || index(f.index_cmd, f.index_format)
   const prompt = [
     'Profile:\n\n' + text,
     indexBlock(indexResult),
@@ -6380,6 +6535,10 @@ function taskEvidenceLifecycleBlock(f) {
     '  evidence unavailable at task review and is unverifiable, not a task acceptance check.',
     '- Project-specific pre-review checks belong inside the project-owned gate_fast. Executor',
     '  claims and proof files are not substitutes for an engine-owned receipt.',
+    '- Every generated task declares `gate_checks`: stable ids the fast gate must report as',
+    '  passed in CAW_GATE_EVIDENCE_OUT. Use CAW_TASK_KEY for task routing; never branch on the',
+    '  numbered filename in CAW_SPEC. An empty gate_checks list is allowed only when the generic',
+    '  fast gate itself is sufficient evidence for every Done when item.',
   ].join('\n')
 }
 
@@ -6387,6 +6546,10 @@ function plan(description) {
   setProviderBudgetPhase('planning')
   const { f, text: profileText } = profile()
   noticeNotesLog()
+  if (f.pipeline_mode === 'fast') {
+    die('pipeline_mode fast starts from an existing reviewed or hand-written task spec; ' +
+      'use review-specs for a hand-written queue, then build. No planning provider call ran.')
+  }
 
   // Planning over a queue that still holds specs used to merge two plans in silence:
   // `writeSpecs` numbers from 001 again, so an old `001_old-slug.md` and a new
@@ -6403,7 +6566,10 @@ function plan(description) {
 
   const planning = applyPlanningPolicy(description, profileText)
   let text = planning.text
-  const enumeration = enumerate(description, text, f)
+  const resolvedPlanningIndex = planningIndex(description, f)
+  const planningIndexBlock = f.index_audience === 'planning'
+    ? indexBlock(resolvedPlanningIndex) : ''
+  const enumeration = enumerate(description, text, f, resolvedPlanningIndex)
   const population = requireReadyRequest(enumeration)
   const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
   text = populationPolicy.text
@@ -6414,7 +6580,7 @@ function plan(description) {
   let last = null
   const history = []
 
-  for (let round = 1; round <= MAX_PLAN_ROUNDS; round++) {
+  for (let round = 1; round <= f.planning_max_rounds; round++) {
     const architectBudgetIssue = providerBudgetIssue('architect', f.provider_budgets)
     if (architectBudgetIssue && last) {
       planIncomplete(description, last, history, problems || [architectBudgetIssue],
@@ -6453,6 +6619,7 @@ function plan(description) {
     const out = agent('architect', [
       'Request from the human:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      planningIndexBlock,
       taskEvidenceLifecycleBlock(f),
       revision,
       '\n\nSplit this into an ordered list of atomic tasks, and return the coverage mapping.',
@@ -6500,6 +6667,7 @@ function plan(description) {
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      planningIndexBlock,
       taskEvidenceLifecycleBlock(f),
       '\n\nProposed tasks:\n\n' + JSON.stringify(out.tasks, null, 2),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
@@ -6592,7 +6760,7 @@ function plan(description) {
     // bought was an early exit that has never once been right.
   }
   planIncomplete(description, last, history, problems,
-    `Still has holes after ${MAX_PLAN_ROUNDS} rounds.`, population, planProvenance, risk)
+    `Still has holes after ${f.planning_max_rounds} rounds.`, population, planProvenance, risk)
 }
 
 // Writes the specs and says where they went, and nothing else. The next-step line belongs to
@@ -6606,8 +6774,14 @@ function writeSpecs(tasks, coverage) {
     const path = join(QUEUE_DIR, `${id}_${t.slug}.md`)
     const covers = (coverage || []).filter((c) => c.task === t.slug).map((c) => c.case)
     const links = ledger.relations.filter((relation) => relation.task === t.slug)
+    const gateChecks = t.gate_checks || []
+    const gateCheckIds = gateChecks.map((check) => check.id)
+    if (new Set(gateCheckIds).size !== gateCheckIds.length) {
+      die(`task ${t.slug} contains duplicate gate check ids`)
+    }
+    for (const check of gateChecks) gateEvidenceId(check.id, `task ${t.slug} gate check id`)
     writeFileSync(path, [
-      '---', `id: ${id}`, `title: ${t.title}`, '---', '',
+      '---', `id: ${id}`, `task_key: ${t.slug}`, `title: ${t.title}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
       '## Surfaces', ...t.surfaces.map((surface) =>
         `- \`${surface.id}\` — ${surface.responsibility}`), '',
@@ -6627,6 +6801,8 @@ function writeSpecs(tasks, coverage) {
         return `- \`${relation.id}\` / \`${relation.case_id}\` ${relation.case} → ${criteria}`
       }), ''] : []),
       '## Change', ...t.change.map((x) => `- ${x}`), '',
+      ...(gateChecks.length ? ['## Required gate checks', ...gateChecks.map((check) =>
+        `- \`${check.id}\` — ${check.description}`), ''] : []),
       '## Done when', ...t.done_when.map((x) => `- ${x}`), '',
     ].join('\n'))
     say(`  ${path}`)
@@ -6855,6 +7031,28 @@ function runFinalFullGate(f, startHead, fullGateBaseline = null) {
   return g
 }
 
+function runBatchGate(f) {
+  if (!f.gate_batch) return null
+  say(`\n· batch gate: ${f.gate_batch}`)
+  const batchDelivery = deliveryDigest()
+  const g = gate(f.gate_batch, undefined, undefined, f.gate_batch_timeout_ms, {
+    kind: 'batch', deliveryDigest: batchDelivery,
+  })
+  if (deliveryDigest() !== batchDelivery) {
+    die('batch gate changed the tracked delivery tree; its receipt no longer describes the delivery')
+  }
+  if (!g.ok) {
+    if (g.out) say(g.out)
+    if (g.state === 'timeout') {
+      die(`batch gate timed out after ${formatTimeout(g.timeoutMs)}; no verdict exists`)
+    }
+    if (g.state === 'refused') die('batch gate refused to run; no verdict exists')
+    die(`batch gate is red (status ${g.status})`)
+  }
+  say('  green')
+  return g
+}
+
 function requirePersistedFullGateBaseline(f, risk) {
   if (!risk.require_full_gate_baseline) return null
   if (!f.gate_full) {
@@ -6879,6 +7077,17 @@ function requirePersistedFullGateBaseline(f, risk) {
 function requireTaskBranch(f) {
   const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
   if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
+}
+
+const CHALLENGER_RISK_PATH = /(^|\/)(auth|security|billing|payment|migrations?|polic(?:y|ies)|rls)(\/|[._-]|$)/i
+
+function reviewNeedsChallenger(f, files, open = [], verdict = null) {
+  if (f.review_challenger_policy === 'fixed') return f.review_challenger_passes > 0
+  if (open.length || files.length >= f.review_challenger_file_threshold ||
+      files.some((path) => CHALLENGER_RISK_PATH.test(path))) return true
+  if (!verdict) return false
+  return ['broken', 'uncovered', 'weak'].some((slot) => (verdict[slot] || []).length > 0) ||
+    (verdict.criteria || []).some((row) => row.state !== 'met')
 }
 
 function build(noFull) {
@@ -6990,7 +7199,11 @@ function build(noFull) {
     runTask(spec, f, text)
   }
 
-  if (!noFull && f.gate_full) {
+  if (f.pipeline_mode !== 'fast') runBatchGate(f)
+
+  if (f.pipeline_mode === 'fast') {
+    say('\n· fast mode ends after focused task gates and reviews')
+  } else if (!noFull && f.gate_full) {
     runFinalFullGate(f, startHead, fullGateBaseline)
   } else if (!f.gate_full) {
     say('\n· no gate_full configured — fast gate is the whole gate')
@@ -8073,6 +8286,9 @@ function runTask(file, f, profileText, opts = {}) {
       ex = agent('executor', [
         dossier.text,
         '\n\nImplement the task contract. Treat executor claims in the dossier only as prior hints.',
+        '\nReturn a concise summary and notes. Claims are optional navigation metadata in meaning:',
+        ' use an empty claims array unless every referenced id and selector is copied exactly',
+        ' from the dossier. Claim validity never decides whether the delivery passes.',
         open.length
           ? '\nClose every open finding in the dossier before doing unrelated work.' +
             (open.some((i) => i.round < round)
@@ -8080,8 +8296,6 @@ function runTask(file, f, profileText, opts = {}) {
               : '')
           : '',
       ].join(''), SCHEMA.delivery, f, file, { dossier: dossier.meta, round: round + 1 })
-      const claimsProblem = executorClaimsIssue(ex.claims, coreCriteria, acceptanceCases)
-      if (claimsProblem) schemaFailure('executor', '$.claims', claimsProblem)
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
@@ -8273,7 +8487,8 @@ function runTask(file, f, profileText, opts = {}) {
       acceptanceCases,
     })
     let weakBaseline = null
-    const passCount = 1 + f.review_challenger_passes
+    let passCount = 1 + (reviewNeedsChallenger(f, files, open)
+      ? f.review_challenger_passes : 0)
     for (let passIndex = 0; passIndex < passCount; passIndex++) {
       const reviewSurface = createReviewSurface(f, g.receipt)
       reviewSurfaceIds.push(reviewSurface.parent.split(/[\\/]/).pop())
@@ -8425,6 +8640,11 @@ function runTask(file, f, profileText, opts = {}) {
         baseline_digest: deliveryBaseline, ...runtime })
       reviewPasses.push({ verdict: passVerdict, runtime, weakEvents: verified.events,
         weakVerification: verified.verification })
+      if (passIndex === 0 && passCount === 1 &&
+          reviewNeedsChallenger(f, files, open, passVerdict)) {
+        passCount = 1 + f.review_challenger_passes
+        if (passCount > 1) say(`  primary review found risk; adding ${passCount - 1} challenger pass(es)`)
+      }
     }
     const mergedReview = mergeReviewPasses(reviewPasses, deliveryBaseline)
     const rv = mergedReview.verdict
@@ -9873,6 +10093,7 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
-  runProjectPolicy, runWeakReplaySession, taskDeliveryDiff, taskEvidenceLifecycleBlock,
+  requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
+  taskEvidenceLifecycleBlock, taskKey,
   verifyProjectPolicies, zeroAccounting,
 }
