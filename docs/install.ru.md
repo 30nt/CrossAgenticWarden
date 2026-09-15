@@ -233,6 +233,17 @@ enumerator, architect и plan-reviewer. Широкие тесты, которы�
 достижении любого лимита. CAW сохраняет round state до запуска, поэтому частичные изменения и
 последний подтверждённый red receipt остаются доступны для продолжения.
 
+Для автоматического выбора по задаче оставьте два статических поля пустыми и заполните все шесть
+полей `executor_budget_<small|normal|large>_<tool_events|event_bytes>`. Architect назначает
+`executor_budget: small | normal | large`; plan-reviewer видит выбранный класс и обязан записать
+`unverifiable`, если его недостаточно для надёжного завершения. CAW никогда не понижает предложение.
+Он повышает до `large` неделимую работу с несколькими surfaces и задачи про database, schema,
+migration, RLS, authorization, authentication, permissions, credentials, secrets, grants, access policies
+или security; четыре и более state transitions требуют минимум `normal`. Старые и написанные
+вручную спеки без поля начинают с `normal` и получают тот же защитный минимум. Точный выбор и
+лимиты сохраняются в run record каждого executor-вызова; сгенерированные спеки хранят предложение
+architect в `executor_budget_requested`, а выбранное движком значение — в `executor_budget`.
+
 `gate_unavailable_review: true` запускает ровно один advisory-review, если task gate отказался
 стартовать или превысил timeout. Такой review сохраняет findings и останавливается; без зелёного
 обязательного gate результат не сертифицируется и не коммитится.

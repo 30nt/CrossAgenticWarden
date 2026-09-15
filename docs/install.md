@@ -228,6 +228,17 @@ limit is reached. CAW saves round state before launch, so partial edits and the 
 receipt remain recoverable. Start with a measured ceiling above ordinary tasks; a value below the
 smallest complete delivery only converts spend into repeated partial attempts.
 
+For automatic per-task selection, leave those two static fields empty and configure all six
+`executor_budget_<small|normal|large>_<tool_events|event_bytes>` fields. The architect assigns
+`executor_budget: small | normal | large`; the plan reviewer sees the selected class and must file
+an `unverifiable` hole when it is too small for reliable completion. CAW never lowers the proposal.
+It raises indivisible multi-surface work and tasks naming database, schema, migration, RLS,
+authorization, authentication, permissions, credentials, secrets, grants, access policies, or security to
+`large`; four or more state transitions impose at least `normal`. Old and hand-written specs without
+the field start at `normal` and receive the same safety floor. The exact selection and limits are
+retained in every executor call's run record; generated specs keep the architect proposal in
+`executor_budget_requested` and the engine-selected value in `executor_budget`.
+
 Set `gate_unavailable_review: true` only when an advisory code review is useful during a refused
 or timed-out task gate. CAW runs exactly one reviewer pass, records its findings, and stops. The
 delivery is never certified or committed without a green required gate.
