@@ -7,6 +7,7 @@ import {
   canonicalAuthorityPaths,
   decidePlanningAction,
   effectiveExecutorBudgetClass,
+  executorBudgetFloor,
   executorBudgetForSpec,
   planRelationIssue,
   planningLedger,
@@ -133,6 +134,16 @@ test('executor budget class is proposed by planning and raised by deterministic 
     ...local, change: ['Update the RLS authorization policy.'],
   })
   assert.equal(security.effective, 'large')
+  assert.deepEqual(executorBudgetFloor(`---
+title: Keep the UI harness deterministic
+---
+
+## Change
+- Do not change production source, schema, migration, credentials, or security policy.
+- Update only the local UI-test launch helper.
+`), {
+    class: 'small', reason: 'one non-sensitive surface with fewer than four transitions',
+  })
   assert.throws(() => effectiveExecutorBudgetClass('tiny', local),
     /executor_budget must be small, normal, or large/)
 })
