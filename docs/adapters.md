@@ -6,10 +6,17 @@ implementations, which are in English.
 > **The adapter contract is not stable until v1.** `apiVersion` is `3` today and will change.
 > Pin the tag you built against.
 
-An adapter is one `.mjs` file at `.caw/adapters/<id>/adapter.mjs`. It teaches the engine how to
-launch one provider, what that provider guarantees per role, and how to read what comes back.
-It does **not** decide policy — the engine compares what you declare against fixed role
+An adapter is an implementation directory at `.caw/adapters/<id>/`, rooted at `adapter.mjs`.
+It may keep its provider runner and other helpers beside that entry point. It teaches the engine
+how to launch one provider, what that provider guarantees per role, and how to read what comes
+back. It does **not** decide policy — the engine compares what you declare against fixed role
 requirements and refuses anything short.
+
+The adapter digest covers every implementation file below that directory, recursively. Paths,
+executable modes, and bytes all participate. The reserved legacy `probes/` directory may contain
+only regular JSON evidence files and is excluded because those records contain the digest they
+attest. Symlinks and other special entries are rejected so an implementation helper cannot escape
+the trusted tree or change without invalidating probe and role-smoke evidence.
 
 Two references ship in the tree: `.caw/adapters/claude/` and `.caw/adapters/codex/`. A minimal
 third is at `test/third-adapter/adapter.mjs`, and `test/adapter-contract.test.mjs` is the

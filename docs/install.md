@@ -39,17 +39,18 @@ Two steps of this procedure have their own file, because each is a job rather th
 - **Every provider executable named by `.caw/runtime.json`.** Claude resolves as
   `CAW_CLAUDE` or `claude`; Codex resolves as `CAW_CODEX` or `codex`. Executable overrides and
   credentials stay environment-owned, never in the runtime file. The currently measured Codex
-  executor/reviewer path is macOS arm64 and exact-version probed: a new CLI version may declare the
-  same semantic rows, but remains unavailable until its own probe is green. The default npm wrapper
+  executor/reviewer path is macOS arm64. A new CLI version may reuse current boundary evidence,
+  while exact role-smoke evidence becomes stale when that check is enabled. The default npm wrapper
   is not replaced automatically when it is broken. If authentication must be staged for Codex, point
   `CAW_CODEX_AUTH_FILE` at a regular private auth file. The adapter copies it into a private
   transport, caps it at 1 MiB and removes the copy after observing that the turn started. This is
   cleanup, not an access barrier: from child start until that event, the role's first shell command
   can read the copy. Set `CAW_CODEX_AUTH_FILE` only if you accept that residual exposure.
 - **Green live evidence for every configured binding that declares a probe.** Run
-  `node caw.mjs probe <provider>` on the machine that will execute it. A CLI upgrade, adapter
-  change, executable change, missing evidence or red probe makes that binding unavailable before
-  spend. This is not a warning you can opt past.
+  `node caw.mjs probe <provider>` on the machine that will execute it. An adapter implementation
+  change, executable change, expired or missing evidence, or red probe makes that binding
+  unavailable before spend. CLI drift is recorded and reported; `require_role_smoke: true` binds
+  the exact CLI as well. This is not a warning you can opt past.
 - **`bash` on `PATH`.** Every gate runs as `bash -lc "<your gate command>"` from the
   repository root. It is a **login** shell, so PATH comes from the login profile: a gate that
   needs nvm, rbenv or asdf behaves differently here than in your own shell. On Windows this
@@ -381,8 +382,8 @@ rejected with a complete five-row migration starting point; move the choices to 
 then remove the legacy fields rather than keeping two sources of truth.
 
 The enumerator is bound by outcome, not by which repository-reading tool a provider happens to
-use. It must read delivery while an exact-version OS-boundary probe demonstrates that delivery
-writes fail and engine-private writes succeed. Every adapter still reports shell availability, but
+use. It must read delivery while a current OS-boundary probe demonstrates that delivery writes
+fail and engine-private writes succeed. Every adapter still reports shell availability, but
 the enumerator row does not compare it. After a paid enumeration, the engine independently resolves
 every case's structured source against the current repository, the exact human request or the exact
 digested `index_cmd` block delivered to that call. One malformed or invented anchor discards the

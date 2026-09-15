@@ -13,6 +13,7 @@ import {
   realpathSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
@@ -20,7 +21,8 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  groupFindings, mergeReviewPasses, planningLedger, populationBlock, providerLaunch, readProjectPolicies, resolvePopulation,
+  adapterImplementationDigest, groupFindings, mergeReviewPasses, planningLedger, populationBlock,
+  providerLaunch, readProjectPolicies, resolvePopulation,
   resolvePopulationSource, retainWeakVerificationEvents, taskEvidenceLifecycleBlock,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -51,14 +53,14 @@ const claudeOuterProfileSkip = () => CLAUDE_OUTER_PROFILE_HOST
   : 'this host publishes no bounded Claude row: the adapter resolves no outer profile'
 const boundedSurfaceSkip = () => claudeOuterProfileSkip() || symlinkSkip()
 
-function writeFixtureAttestation(adapterDir, provider, source) {
+function writeFixtureAttestation(adapterDir, provider) {
   const probeDir = join(adapterDir, 'probes')
   mkdirSync(probeDir)
   writeFileSync(join(probeDir, 'fixture-review-boundary-v2.json'), `${JSON.stringify({
     version: 1,
     provider,
     probe_id: 'fixture-review-boundary-v2',
-    adapter_digest: createHash('sha256').update(source).digest('hex'),
+    adapter_digest: adapterImplementationDigest(adapterDir, provider),
     os: `${platform()}-${arch()}`,
     executable: realpathSync(FAKE),
     cli_version: 'fake-claude 1.0.0',
@@ -232,6 +234,31 @@ test('ordinary native provider paths pass through without a shell or extra argum
   })
 })
 
+test('adapter identity covers helper files, excludes evidence, and rejects symlinks',
+  { skip: symlinkSkip() }, () => {
+    const directory = mkdtempSync(join(tmpdir(), 'caw-adapter-identity-'))
+    TEMP_ROOTS.add(directory)
+    writeFileSync(join(directory, 'adapter.mjs'), 'export default {}\n')
+    writeFileSync(join(directory, 'runner.mjs'), 'export const version = 1\n')
+    const before = adapterImplementationDigest(directory, 'fixture')
+
+    writeFileSync(join(directory, 'runner.mjs'), 'export const version = 2\n')
+    const changed = adapterImplementationDigest(directory, 'fixture')
+    assert.notEqual(changed, before)
+
+    chmodSync(join(directory, 'runner.mjs'), 0o755)
+    const modeChanged = adapterImplementationDigest(directory, 'fixture')
+    assert.notEqual(modeChanged, changed)
+
+    mkdirSync(join(directory, 'probes'))
+    writeFileSync(join(directory, 'probes', 'evidence.json'), '{}\n')
+    assert.equal(adapterImplementationDigest(directory, 'fixture'), modeChanged)
+
+    symlinkSync('runner.mjs', join(directory, 'linked-runner.mjs'))
+    assert.throws(() => adapterImplementationDigest(directory, 'fixture'),
+      /adapter fixture contains unsupported symlink linked-runner\.mjs/)
+  })
+
 test('Windows command scripts are refused intentionally instead of being launched', () => {
   for (const extension of ['cmd', 'bat', 'ps1']) {
     assert.throws(
@@ -328,7 +355,8 @@ export default {
 }
 `
   writeFileSync(join(testAdapterDir, 'adapter.mjs'), testAdapterSource)
-  writeFixtureAttestation(testAdapterDir, 'test-claude', testAdapterSource)
+  writeFileSync(join(testAdapterDir, 'runner.mjs'), '// fixture adapter helper\n')
+  writeFixtureAttestation(testAdapterDir, 'test-claude')
   writeFileSync(join(root, '.caw', 'CAW.md'), `---
 name: Baseline fixture
 main_branch: main
@@ -3035,8 +3063,8 @@ test('probe command writes bounded Git-private evidence that unblocks exact pref
   assert.match(olderBuild.stdout,
     /test-claude: probe evidence observed on CLI fake-claude 0\.0\.1-from-an-older-build; running fake-claude 1\.0\.0/)
 
-  const adapterPath = join(f.root, '.caw', 'adapters', 'test-claude', 'adapter.mjs')
-  writeFileSync(adapterPath, `${readFileSync(adapterPath, 'utf8')}\n// digest changed\n`)
+  const runnerPath = join(f.root, '.caw', 'adapters', 'test-claude', 'runner.mjs')
+  writeFileSync(runnerPath, `${readFileSync(runnerPath, 'utf8')}// implementation changed\n`)
   const stale = run(f, ['build', '--no-full'], [])
   assert.equal(stale.status, 1)
   assert.match(stale.stderr, /lacks current green probe evidence/)
@@ -3581,7 +3609,7 @@ title: Baseline task
   mkdirSync(otherAdapterDir)
   const otherSource = readFileSync(originalAdapter, 'utf8').replaceAll('test-claude', 'other')
   writeFileSync(join(otherAdapterDir, 'adapter.mjs'), otherSource)
-  writeFixtureAttestation(otherAdapterDir, 'other', otherSource)
+  writeFixtureAttestation(otherAdapterDir, 'other')
   changedRuntime.roles.reviewer.provider = 'other'
   changedRuntime.roles.reviewer.model = 'opus-next'
   changedRuntime.roles.reviewer.reasoning = 'medium'

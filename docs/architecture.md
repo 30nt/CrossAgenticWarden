@@ -183,8 +183,9 @@ writeScope=engine-private-only; adapter field is shell-residual-delivery` is wha
 
 A binding that declares a probe is unavailable until that probe is green **on this machine**.
 `node caw.mjs probe <provider>` makes a live call that attempts a write inside the boundary and
-one outside it, and stores an attestation keyed by provider, probe id, adapter digest,
-OS/architecture and canonical executable path.
+one outside it, and stores an attestation keyed by provider, probe id, the complete adapter
+implementation digest, OS/architecture and canonical executable path. The implementation digest
+covers the entry point, runner and helper files, including their executable modes.
 
 `cli_version` is deliberately **not** part of that key. Keying evidence to the exact build made
 every routine provider update refuse the whole pipeline until three paid boundary calls
@@ -218,7 +219,9 @@ of slashes collapse. Three Windows spellings walked past an exact-match guard be
 - **No self-hosting.** This repository is edited by hand and tested by running it on something
   else. The previous version ran on itself, and that made every document about the pipeline
   simultaneously the product and an instance of it.
-- **No metrics ledger, no queue file, no history tiers.** `ls .caw-tasks/` is the queue and
-  `git log` is the record.
-- **No scope-selection map.** Two gate tiers, `gate_fast` and `gate_full`, and no per-path rows.
+- **No payload or conversation metrics ledger, separate queue-state file, or history tiers.**
+  `ls .caw-tasks/` is the queue and `git log` is the public record. Compact payload-free counters
+  are retained under Git's private `caw/metrics/` path.
+- **No per-path scope-selection map.** The three explicit tiers are `gate_fast`, `gate_batch`,
+  and `gate_full`; batch and full gates are queue-level and remain project-owned commands.
 - **No `--force` on `build`.**

@@ -167,7 +167,7 @@ artifacts themselves are not published.
 | Codex executor / Claude reviewer | task 002 round 3, commit `cfaff0a`; carried Codex finding adjudicated by Claude with origin retained | engine contract suite also covers provider-change carry |
 | all-Claude | task 003, commit `1ef3768` | engine contract suite also covers it |
 | Claude executor / Codex reviewer | task 004, commit `86b2d10` | engine contract suite also covers it |
-| all-Codex | none | not run; the earlier release could not bind its enumerator, while this version requires new green `codex-enumerator-boundary-v1` evidence and still has no live all-Codex matrix evidence |
+| all-Codex | reported by one install: a separate two-task `ae_club` sample completed and committed at `0f33479` and `56c6930` | **not verified here** — the disposable run artifacts were intentionally removed after comparison; the engine contract suite covers the binding and exact smoke/probe checks |
 | red-gate retry and gate exit 75 | none; three attempts stopped earlier as truthful executor `blocked` results | deterministic only; neither branch has fired live |
 | Claude reviewer weak capture | reported by one Linux install, 2026-09-03: three weaks on one task, capture commits at `caw-weak-N`, closed by replay | **not verified here** — the run record is a gitignored log on that machine; what reached this repository is the same claim in a commit. The earlier statement that no round had ever produced one was a claim about this repository's evidence, and is withdrawn as a blanket one |
 | native macOS Xcode/Swift review gate | direct experiment failed four of five checks inside the current profile; controls passed outside it | the review-boundary limitation above; Node-gate acceptance does not generalize to toolchains needing external writable temp/cache state |
@@ -175,10 +175,11 @@ artifacts themselves are not published.
 | Linux, `build` | reported in progress by the same install: executor under bwrap, `createReviewSurface()` built by the engine, `gate_fast` green and red inside it | **not verified here**. Not reported even there: a task commit, five remaining tasks, a completed `build` |
 | Windows | none | portable contract tests do not substitute for an OS boundary run |
 
-Across the four supported live bindings, four tasks were planned, spec-reviewed, built,
-task-reviewed and committed through one engine. The queue emptied, `.caw-tasks/PLAN.md` cleared and the
-resulting tree passed 24 tests. This is evidence about the exact measured machine, CLI versions and
-adapters; your install still needs its own current probes and smoke task.
+Across the four bindings in the published acceptance summary, four tasks were planned,
+spec-reviewed, built, task-reviewed and committed through one engine. The separate all-Codex
+sample adds two reported task deliveries whose raw run artifacts are not published. This is
+evidence about exact measured machines, CLI versions and adapters; your install still needs its
+own current probes and smoke task.
 
 A plan revision costs a fraction of the pass it revises. Reported by one Linux install, and not verified in this repository: the
 architect's first pass cost $3.98 and its two revisions $1.09 and $1.15, across a `plan` that
@@ -190,14 +191,14 @@ one install, and the first number attached to a claim this tool had been making 
 
 Recorded so they are not re-proposed as omissions.
 
-- **No metrics ledger.** Cost is printed and discarded. A run reports what it did; where that
-  report is kept is not the tool's business. One install lost a $3.87 plan to a truncated
-  terminal and re-planned the same ground three times — the answer was to redirect output to a
-  file, and on that install a guard now refuses a run whose command line does not name the log
-  directory.
+- **No payload or conversation metrics ledger.** Before private run records are pruned, CAW
+  appends compact counters, usage states, durations and certification outcomes to Git's private
+  `caw/metrics/runs.jsonl`. Prompts, responses and diagnostics remain only in bounded run records;
+  operator logs are still the durable place for a full transcript.
 - **No queue file the tool can write to, no history tiers, no archive command.** `ls .caw-tasks/`
   is the whole queue and existence is its whole state. What `round` and `review` resume is not
   progress — it is what a reviewer already checked, which is the one thing in this pipeline with
   nowhere else to live.
-- **No scoping tier between "fast" and "full".** A per-task scope-selection map with three
-  branches resolved to the full suite on 2 tasks out of 2.
+- **No per-path scope-selection map.** CAW exposes `gate_fast`, `gate_batch`, and `gate_full`.
+  The project chooses their commands explicitly; CAW does not infer a different gate from the
+  files touched by an individual task.
