@@ -152,6 +152,8 @@ const MAX_REVIEW_SEMANTIC_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
 const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
 const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
+const EXECUTOR_BUDGET_CLASSES = Object.freeze(['small', 'normal', 'large'])
+const EXECUTOR_BUDGET_RANK = new Map(EXECUTOR_BUDGET_CLASSES.map((name, index) => [name, index]))
 const PIPELINE_MODES = new Set(['fast', 'standard', 'strict'])
 const TASK_DOSSIER_TOTAL_MAX = 192 * 1024
 const TASK_DOSSIER_CAPS = Object.freeze({
@@ -1698,9 +1700,15 @@ const TASK = {
       type: 'string',
       description: 'empty for one surface; for several surfaces, why they cannot be separate tasks',
     },
+    executor_budget: {
+      type: 'string', enum: EXECUTOR_BUDGET_CLASSES,
+      description: 'small for one bounded local surface, normal for an ordinary feature, large ' +
+        'for cross-layer, database, authorization, security, credential, or migration work. ' +
+        'The engine may raise this proposal but never lower it.',
+    },
   },
   required: ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
-    'indivisible_reason'],
+    'indivisible_reason', 'executor_budget'],
 }
 
 // One shape for every blocking slot of a task verdict. `where` and `fix` are what the executor
@@ -2535,6 +2543,7 @@ function beginProviderAttempt(role, provider, binding, invocation, budgetLimits,
       bytes: promptMetrics.promptBytes ?? null,
       instructions_bytes: promptMetrics.instructionsBytes ?? null,
       dossier: promptMetrics.dossier ?? null,
+      executor_budget: promptMetrics.executorBudget ?? null,
     },
     task: promptMetrics.task ?? null,
     round: promptMetrics.round ?? null,
@@ -3262,6 +3271,44 @@ function profile(preflight = true) {
       die(`.caw/CAW.md ${key} must be a positive whole number no greater than ${maximum}`)
     }
     f[key] = value
+  }
+  const adaptiveExecutorKeys = EXECUTOR_BUDGET_CLASSES.flatMap((name) => [
+    [`executor_budget_${name}_tool_events`, EXECUTOR_TOOL_EVENT_LIMIT_MAX],
+    [`executor_budget_${name}_event_bytes`, EXECUTOR_EVENT_BYTE_LIMIT_MAX],
+  ])
+  const configuredAdaptiveKeys = adaptiveExecutorKeys.filter(([key]) =>
+    f[key] !== undefined && f[key] !== '')
+  if (configuredAdaptiveKeys.length && configuredAdaptiveKeys.length !== adaptiveExecutorKeys.length) {
+    const missing = adaptiveExecutorKeys.filter(([key]) =>
+      f[key] === undefined || f[key] === '').map(([key]) => key)
+    die(`adaptive executor budgets require all six class limits; missing ${missing.join(', ')}`)
+  }
+  if (configuredAdaptiveKeys.length &&
+      (f.executor_max_tool_events || f.executor_max_event_bytes)) {
+    die('adaptive executor budgets cannot be combined with executor_max_tool_events or ' +
+        'executor_max_event_bytes')
+  }
+  if (configuredAdaptiveKeys.length) {
+    for (const [key, maximum] of adaptiveExecutorKeys) {
+      const value = Number(f[key])
+      if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+        die(`.caw/CAW.md ${key} must be a positive whole number no greater than ${maximum}`)
+      }
+      f[key] = value
+    }
+    for (const dimension of ['tool_events', 'event_bytes']) {
+      const values = EXECUTOR_BUDGET_CLASSES.map((name) =>
+        f[`executor_budget_${name}_${dimension}`])
+      if (values.some((value, index) => index > 0 && value < values[index - 1])) {
+        die(`adaptive executor ${dimension} limits must be monotonic: small <= normal <= large`)
+      }
+    }
+    f.executor_budgets = Object.fromEntries(EXECUTOR_BUDGET_CLASSES.map((name) => [name, {
+      tool_events: f[`executor_budget_${name}_tool_events`],
+      event_bytes: f[`executor_budget_${name}_event_bytes`],
+    }]))
+  } else {
+    f.executor_budgets = null
   }
   if (f.gate_unavailable_review === undefined || f.gate_unavailable_review === '') {
     f.gate_unavailable_review = false
@@ -4491,6 +4538,52 @@ function planningLedger(out) {
   return { version: 1, tasks, requirements, cases, relations }
 }
 
+function executorBudgetFloor(taskOrSpec) {
+  const body = typeof taskOrSpec === 'string'
+    ? taskOrSpec
+    : JSON.stringify(taskOrSpec || {})
+  const surfaceCount = typeof taskOrSpec === 'string'
+    ? (body.split(/^## Surfaces\s*$/m)[1]?.split(/^## /m)[0]
+      ?.split('\n').filter((line) => /^-\s+`[^`]+`/.test(line)).length || 0)
+    : (taskOrSpec?.surfaces?.length || 0)
+  const transitionCount = typeof taskOrSpec === 'string'
+    ? (body.match(/^\s+-\s+`[^`]+`\s+--\s+.+\s+-->\s+`[^`]+`\s*$/gm)?.length || 0)
+    : (taskOrSpec?.state_machines || []).reduce((sum, machine) =>
+      sum + (machine.transitions?.length || 0), 0)
+  const sensitive = /\b(?:migration|database|schema|postgres|supabase|rls|row[- ]level security|authentication|authorization|credential|secret|security|permission|privilege|grant|access policy|security policy)\b/i
+    .test(body)
+  if (surfaceCount > 1 || sensitive) {
+    return {
+      class: 'large',
+      reason: surfaceCount > 1
+        ? `${surfaceCount} indivisible surfaces make this cross-layer work`
+        : 'the task names database, authorization, security, credential, or migration work',
+    }
+  }
+  if (transitionCount >= 4) {
+    return { class: 'normal', reason: `${transitionCount} state transitions need a normal floor` }
+  }
+  return { class: 'small', reason: 'one non-sensitive surface with fewer than four transitions' }
+}
+
+function effectiveExecutorBudgetClass(requested, taskOrSpec) {
+  const proposed = requested || 'normal'
+  if (!EXECUTOR_BUDGET_RANK.has(proposed)) {
+    throw new TypeError(`executor_budget must be small, normal, or large — got ${JSON.stringify(proposed)}`)
+  }
+  const floor = executorBudgetFloor(taskOrSpec)
+  const effective = EXECUTOR_BUDGET_RANK.get(proposed) >= EXECUTOR_BUDGET_RANK.get(floor.class)
+    ? proposed : floor.class
+  return { requested: proposed, floor: floor.class, effective, reason: floor.reason }
+}
+
+function executorBudgetSelections(tasks) {
+  return (tasks || []).map((task) => ({
+    task: task.slug,
+    ...effectiveExecutorBudgetClass(task.executor_budget, task),
+  }))
+}
+
 function validatePlanRelations(out) {
   const slugs = out.tasks.map((task) => task.slug.trim())
   const unique = new Set(slugs)
@@ -4754,11 +4847,12 @@ function agent(role, prompt, schema, f, spec, context = null) {
   const scratchRoot = context?.scratchRoot || invocationScratch?.scratchRoot || null
   const env = { ...process.env, PWD: context?.workingRoot || process.cwd(), CAW_ROLE: role }
   if (spec) env.CAW_SPEC = spec
-  if (role === 'executor' && f.executor_max_tool_events) {
-    env.CAW_EXECUTOR_MAX_TOOL_EVENTS = String(f.executor_max_tool_events)
+  const executorBudget = role === 'executor' ? context?.executorBudget || null : null
+  if (executorBudget?.tool_events) {
+    env.CAW_EXECUTOR_MAX_TOOL_EVENTS = String(executorBudget.tool_events)
   }
-  if (role === 'executor' && f.executor_max_event_bytes) {
-    env.CAW_EXECUTOR_MAX_EVENT_BYTES = String(f.executor_max_event_bytes)
+  if (executorBudget?.event_bytes) {
+    env.CAW_EXECUTOR_MAX_EVENT_BYTES = String(executorBudget.event_bytes)
   }
   const instructions = assembledInstructions(role, binding, provider, f.docs_language)
   const providerVector = providerLaunch(provider.executable, process.platform, binding.provider)
@@ -4790,6 +4884,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     promptBytes: Buffer.byteLength(prompt || ''),
     instructionsBytes: Buffer.byteLength(instructions),
     dossier: context?.dossier || null,
+    executorBudget,
     task: spec || null,
     round: context?.round ?? null,
     pass: context?.pass ?? null,
@@ -5048,6 +5143,28 @@ function taskKey(spec, specText = null) {
   const declared = body.match(/^task_key:\s*([a-z0-9][a-z0-9-]*)\s*$/m)?.[1]
   if (declared) return declared
   return spec.split(/[\\/]/).pop().replace(/^\d+_/, '').replace(/\.md$/, '')
+}
+
+function executorBudgetForSpec(f, specText) {
+  if (!f.executor_budgets) {
+    if (!f.executor_max_tool_events && !f.executor_max_event_bytes) return null
+    return {
+      mode: 'static', class: null, requested: null, floor: null,
+      reason: 'project-wide static executor limit',
+      tool_events: f.executor_max_tool_events,
+      event_bytes: f.executor_max_event_bytes,
+    }
+  }
+  const declared = specText.match(/^executor_budget:\s*(\S+)\s*$/m)?.[1] || 'normal'
+  const planningRequested = specText.match(/^executor_budget_requested:\s*(\S+)\s*$/m)?.[1] || null
+  const selected = effectiveExecutorBudgetClass(declared, specText)
+  const limits = f.executor_budgets[selected.effective]
+  return {
+    mode: 'adaptive', class: selected.effective, requested: selected.requested,
+    planning_requested: planningRequested,
+    floor: selected.floor, reason: selected.reason,
+    tool_events: limits.tool_events, event_bytes: limits.event_bytes,
+  }
 }
 
 function requiredGateChecks(spec, specText = null) {
@@ -6665,9 +6782,13 @@ function plan(description) {
       ' Give every independently changeable surface a globally unique id and one explicit state',
       ' machine. Put unrelated surfaces in separate tasks. If several surfaces truly cannot be',
       ' delivered independently, keep them together only with a concrete indivisible_reason.',
+      ' Assign executor_budget small to one bounded local surface, normal to an ordinary feature,',
+      ' and large to cross-layer, database, authorization, security, credential, or migration work.',
+      ' The engine may raise your proposal to its safety floor and never lowers it.',
     ].join(''), SCHEMA.plan, f)
     planProvenance.push({ round, role: 'architect', ...runtimeIdentity(out) })
 
+    const budgetSelections = executorBudgetSelections(out.tasks)
     const ledger = validatePlanRelations(out)
 
     if (blocked(out.blocked)) {
@@ -6709,6 +6830,10 @@ function plan(description) {
       planningIndexBlock,
       taskEvidenceLifecycleBlock(f),
       '\n\nProposed tasks:\n\n' + JSON.stringify(out.tasks, null, 2),
+      '\n\nEngine-owned executor budget selections. The requested value came from the architect;',
+      ' effective is max(requested, safety floor). Treat an effective class that is still too',
+      ' small for reliable complete delivery as an `unverifiable` hole:\n\n' +
+        JSON.stringify(budgetSelections, null, 2),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
       '\n\nEngine-owned relation ledger. Return exactly one `relations` row for every id:',
       '\n\n' + JSON.stringify(ledger.relations, null, 2),
@@ -6814,13 +6939,16 @@ function writeSpecs(tasks, coverage) {
     const covers = (coverage || []).filter((c) => c.task === t.slug).map((c) => c.case)
     const links = ledger.relations.filter((relation) => relation.task === t.slug)
     const gateChecks = t.gate_checks || []
+    const budget = effectiveExecutorBudgetClass(t.executor_budget, t)
     const gateCheckIds = gateChecks.map((check) => check.id)
     if (new Set(gateCheckIds).size !== gateCheckIds.length) {
       die(`task ${t.slug} contains duplicate gate check ids`)
     }
     for (const check of gateChecks) gateEvidenceId(check.id, `task ${t.slug} gate check id`)
     writeFileSync(path, [
-      '---', `id: ${id}`, `task_key: ${t.slug}`, `title: ${t.title}`, '---', '',
+      '---', `id: ${id}`, `task_key: ${t.slug}`, `title: ${t.title}`,
+      `executor_budget_requested: ${budget.requested}`,
+      `executor_budget: ${budget.effective}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
       '## Surfaces', ...t.surfaces.map((surface) =>
         `- \`${surface.id}\` — ${surface.responsibility}`), '',
@@ -8245,6 +8373,9 @@ function runTask(file, f, profileText, opts = {}) {
   let spec
   try { spec = readFileSync(join(QUEUE_DIR, file), 'utf8') }
   catch (e) { die(`${file} — cannot read it: ${(e?.message || e).toString().split('\n')[0]}`) }
+  let executorBudget
+  try { executorBudget = executorBudgetForSpec(f, spec) }
+  catch (error) { die(`${file} — ${error?.message || error}`) }
   const topology = extractTaskTopology(spec)
   const coreCriteria = topology.criteria
   const acceptancePolicy = runProjectPolicy('acceptance', {
@@ -8255,6 +8386,13 @@ function runTask(file, f, profileText, opts = {}) {
   })
   const acceptanceCases = acceptancePolicy?.output.cases || []
   say(`\n· ${file}`)
+  if (executorBudget) {
+    const selection = executorBudget.mode === 'adaptive'
+      ? `${executorBudget.class} (requested ${executorBudget.requested}, floor ${executorBudget.floor})`
+      : 'static'
+    say(`  executor budget: ${selection}; ${executorBudget.tool_events || 'unlimited'} tool events, ` +
+        `${executorBudget.event_bytes || 'unlimited'} event bytes — ${executorBudget.reason}`)
+  }
 
   const history = resume?.history || []
   const startRound = resume?.round || 0
@@ -8334,12 +8472,13 @@ function runTask(file, f, profileText, opts = {}) {
         '\nReturn a concise summary and notes. Claims are optional navigation metadata in meaning:',
         ' use an empty claims array unless every referenced id and selector is copied exactly',
         ' from the dossier. Claim validity never decides whether the delivery passes.',
-        f.executor_max_tool_events
-          ? `\nYou have a hard live budget of ${f.executor_max_tool_events} provider tool events.` +
+        executorBudget?.tool_events
+          ? `\nYou have a hard live ${executorBudget.class || 'static'} budget of ` +
+            `${executorBudget.tool_events} provider tool events.` +
             ' Finish the smallest contract-complete change and return before it is reached.'
           : '',
-        f.executor_max_event_bytes
-          ? `\nYour provider event stream is capped at ${f.executor_max_event_bytes} bytes.` +
+        executorBudget?.event_bytes
+          ? `\nYour provider event stream is capped at ${executorBudget.event_bytes} bytes.` +
             ' Keep command output narrow and avoid rereading files already inspected.'
           : '',
         open.length
@@ -8348,7 +8487,9 @@ function runTask(file, f, profileText, opts = {}) {
               ? ' Older ids have survived at least one attempted fix; use their checked evidence.'
               : '')
           : '',
-      ].join(''), SCHEMA.delivery, f, file, { dossier: dossier.meta, round: round + 1 })
+      ].join(''), SCHEMA.delivery, f, file, {
+        dossier: dossier.meta, round: round + 1, executorBudget,
+      })
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
@@ -9260,6 +9401,8 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' not when `change` mentions it.',
     ' Preserve the explicit surfaces and state machines. Split unrelated surfaces into separate',
     ' tasks unless the task carries a concrete indivisible_reason.',
+    ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
+    ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
   ].join(''), SCHEMA.plan, f)
 
   validatePlanRelations(out)
@@ -9336,6 +9479,9 @@ function judgeSpecs(description, f, text, population) {
     '\n\nProfile:\n\n' + text,
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they will run:\n\n' + bodies,
+    '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',
+    ' reliable complete delivery is an `unverifiable` hole; the engine will separately enforce',
+    ' its structural and sensitive-work floor when the executor starts.',
     '\n\nThese were written by hand, so there is no separate coverage mapping: each spec\'s',
     ' "## Must cover" block is its coverage claim, and a spec with no such block is claiming',
     ' nothing.',
@@ -10165,6 +10311,7 @@ export {
   canonicalAuthorityPaths, compactRunMetrics,
   collectGateEvidence, retainGateEvidence,
   decideGateFailure, decidePlanningAction, deltaAccounting, executorClaimsIssue,
+  effectiveExecutorBudgetClass, executorBudgetFloor, executorBudgetForSpec,
   extractReviewCriteria, formatAccounting,
   extractTaskTopology, groupFindings, mergeReviewPasses, normalizeAccounting, planRelationIssue, planningLedger,
   reviewContractIssue, reviewCriteriaIssue,

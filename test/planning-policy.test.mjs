@@ -6,6 +6,8 @@ import {
   SCHEMA,
   canonicalAuthorityPaths,
   decidePlanningAction,
+  effectiveExecutorBudgetClass,
+  executorBudgetForSpec,
   planRelationIssue,
   planningLedger,
 } from '../caw.mjs'
@@ -54,6 +56,7 @@ const relatedPlan = () => ({
       transitions: [{ from: 'empty', event: 'store value', to: 'populated' }],
     }],
     indivisible_reason: '',
+    executor_budget: 'small',
   }],
   coverage: [{
     case: 'empty and populated states',
@@ -104,5 +107,59 @@ test('plan-reviewer schema requires the complete relation ledger', () => {
     ['case', 'task', 'acceptance_criteria'])
   assert.deepEqual(SCHEMA.plan.properties.tasks.items.required,
     ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
-      'indivisible_reason'])
+      'indivisible_reason', 'executor_budget'])
+})
+
+test('executor budget class is proposed by planning and raised by deterministic safety floors', () => {
+  const local = relatedPlan().tasks[0]
+  assert.deepEqual(effectiveExecutorBudgetClass('small', local), {
+    requested: 'small', floor: 'small', effective: 'small',
+    reason: 'one non-sensitive surface with fewer than four transitions',
+  })
+
+  const crossLayer = {
+    ...local,
+    surfaces: [
+      ...local.surfaces,
+      { id: 'stored-policy', responsibility: 'Persist the same decision.' },
+    ],
+  }
+  const raised = effectiveExecutorBudgetClass('small', crossLayer)
+  assert.equal(raised.requested, 'small')
+  assert.equal(raised.floor, 'large')
+  assert.equal(raised.effective, 'large')
+
+  const security = effectiveExecutorBudgetClass('normal', {
+    ...local, change: ['Update the RLS authorization policy.'],
+  })
+  assert.equal(security.effective, 'large')
+  assert.throws(() => effectiveExecutorBudgetClass('tiny', local),
+    /executor_budget must be small, normal, or large/)
+})
+
+test('adaptive executor limits resolve from approved spec and legacy specs default to normal', () => {
+  const f = {
+    executor_budgets: {
+      small: { tool_events: 80, event_bytes: 1048576 },
+      normal: { tool_events: 160, event_bytes: 2097152 },
+      large: { tool_events: 240, event_bytes: 4194304 },
+    },
+    executor_max_tool_events: null,
+    executor_max_event_bytes: null,
+  }
+  const localSpec = `---\nexecutor_budget: small\n---\n\n## Surfaces\n- \`one\` — local output\n\n## State machines\n- \`one\`: states \`a\`, \`b\`\n  - \`a\` -- write --> \`b\`\n`
+  assert.deepEqual(executorBudgetForSpec(f, localSpec), {
+    mode: 'adaptive', class: 'small', requested: 'small', floor: 'small',
+    planning_requested: null,
+    reason: 'one non-sensitive surface with fewer than four transitions',
+    tool_events: 80, event_bytes: 1048576,
+  })
+
+  const legacySensitiveSpec = `---\ntitle: policy\n---\n\n## Surfaces\n- \`one\` — database migration and RLS policy\n`
+  const selected = executorBudgetForSpec(f, legacySensitiveSpec)
+  assert.equal(selected.requested, 'normal')
+  assert.equal(selected.planning_requested, null)
+  assert.equal(selected.floor, 'large')
+  assert.equal(selected.class, 'large')
+  assert.equal(selected.tool_events, 240)
 })

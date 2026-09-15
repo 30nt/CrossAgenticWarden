@@ -124,6 +124,7 @@ const plan = () => ({
       transitions: [{ from: 'absent', event: 'write fixture', to: 'present' }],
     }],
     indivisible_reason: '',
+    executor_budget: 'small',
   }],
   coverage: [{
     case: 'fixture output', task: 'baseline-task',
@@ -1279,6 +1280,8 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.match(planText, /plan-relation-[0-9a-f]{12}/)
   assert.match(planText, /plan-requirement-[0-9a-f]{12}/)
   const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
+  assert.match(specText, /^executor_budget_requested: small$/m)
+  assert.match(specText, /^executor_budget: small$/m)
   assert.match(specText, /## Acceptance links/)
   assert.match(specText, /plan-case-[0-9a-f]{12}/)
 
@@ -1332,6 +1335,37 @@ test('current plan path constructs three Claude calls and persists an approved q
   const purged = run(f, ['artifacts', 'purge', runNames[0]], [])
   assert.equal(purged.status, 0)
   assert.equal(existsSync(runPath), false)
+})
+
+test('planning raises an undersized executor budget and preserves the architect proposal', () => {
+  const f = fixture()
+  const proposed = plan()
+  proposed.tasks[0].surfaces.push({
+    id: 'fixture-index', responsibility: 'The index that exposes the generated fixture output.',
+  })
+  proposed.tasks[0].state_machines.push({
+    surface: 'fixture-index', states: ['absent', 'present'],
+    transitions: [{ from: 'absent', event: 'index fixture', to: 'present' }],
+  })
+  proposed.tasks[0].indivisible_reason = 'The output and its index must become visible together.'
+
+  const result = run(f, ['plan', 'Create and index the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(proposed) },
+    { envelope: envelope(planReview(proposed)) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
+  assert.match(specText, /^executor_budget_requested: small$/m)
+  assert.match(specText, /^executor_budget: large$/m)
+
+  const reviewCall = calls(f).find((call) => call.role === 'plan-reviewer')
+  assert.match(reviewCall.input, /Engine-owned executor budget selections/)
+  assert.match(reviewCall.input, /"requested": "small"/)
+  assert.match(reviewCall.input, /"floor": "large"/)
+  assert.match(reviewCall.input, /"effective": "large"/)
+  assert.match(reviewCall.input, /2 indivisible surfaces make this cross-layer work/)
 })
 
 test('request, planning and role budgets stop before the next provider process', () => {
@@ -5376,6 +5410,32 @@ test('Codex runner enforces its live tool-event budget', () => {
   assert.match(result.stderr, /CAW_EXECUTOR_BUDGET_EXHAUSTED tool-events 3\/3/)
 })
 
+test('adaptive executor budget is selected before delivery and retained in the run record', () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, {
+    executor_budget_small_tool_events: 80,
+    executor_budget_small_event_bytes: 1048576,
+    executor_budget_normal_tool_events: 160,
+    executor_budget_normal_event_bytes: 2097152,
+    executor_budget_large_tool_events: 240,
+    executor_budget_large_event_bytes: 4194304,
+  })
+  execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'configure adaptive executor budgets'], { cwd: f.root })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /executor budget: normal \(requested normal, floor small\); 160 tool events/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls[0].prompt.executor_budget, {
+    mode: 'adaptive', class: 'normal', requested: 'normal', floor: 'small',
+    planning_requested: null,
+    reason: 'one non-sensitive surface with fewer than four transitions',
+    tool_events: 160, event_bytes: 2097152,
+  })
+})
+
 test('task gate receives stable task key and must pass every required check id', () => {
   const f = fixture({ git: true, gateFast: 'node gate.mjs' })
   writeFileSync(join(f.root, 'gate.mjs'), `
@@ -5548,6 +5608,36 @@ test('invalid executor and unavailable-gate budgets fail before provider calls',
     { executor_max_event_bytes: '1.5' },
     { gate_unavailable_review: 'sometimes' },
   ]) {
+    const f = fixture({ git: true })
+    configureProfileFields(f, fields)
+    const result = run(f, ['plan', 'x'], [])
+    assert.equal(result.status, 1)
+    assert.equal(calls(f).length, 0)
+  }
+})
+
+test('adaptive executor profiles reject partial, mixed, and non-monotonic limits', () => {
+  const invalid = [
+    { executor_budget_small_tool_events: 80 },
+    {
+      executor_max_tool_events: 100,
+      executor_budget_small_tool_events: 80,
+      executor_budget_small_event_bytes: 1048576,
+      executor_budget_normal_tool_events: 160,
+      executor_budget_normal_event_bytes: 2097152,
+      executor_budget_large_tool_events: 240,
+      executor_budget_large_event_bytes: 4194304,
+    },
+    {
+      executor_budget_small_tool_events: 80,
+      executor_budget_small_event_bytes: 1048576,
+      executor_budget_normal_tool_events: 70,
+      executor_budget_normal_event_bytes: 2097152,
+      executor_budget_large_tool_events: 240,
+      executor_budget_large_event_bytes: 4194304,
+    },
+  ]
+  for (const fields of invalid) {
     const f = fixture({ git: true })
     configureProfileFields(f, fields)
     const result = run(f, ['plan', 'x'], [])

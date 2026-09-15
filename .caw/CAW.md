@@ -25,6 +25,17 @@ gate_full_timeout_ms:
 executor_max_tool_events:
 executor_max_event_bytes:
 
+# Adaptive Codex executor budgets. Configure all six or leave all six empty. New planning writes
+# an executor_budget class into every task; old or hand-written specs default to normal. The
+# engine raises database/security work and indivisible multi-surface tasks to large. These fields
+# cannot be combined with the two static limits above.
+executor_budget_small_tool_events: 120
+executor_budget_small_event_bytes: 1048576
+executor_budget_normal_tool_events: 180
+executor_budget_normal_event_bytes: 2097152
+executor_budget_large_tool_events: 260
+executor_budget_large_event_bytes: 4194304
+
 # When true, a refused or timed-out task gate receives one advisory reviewer pass. That pass
 # records findings but can never certify or commit the delivery.
 gate_unavailable_review: false
