@@ -150,6 +150,8 @@ const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
 const MAX_REVIEW_CHALLENGER_PASSES = 2
 const MAX_REVIEW_SEMANTIC_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
+const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
+const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
 const PIPELINE_MODES = new Set(['fast', 'standard', 'strict'])
 const TASK_DOSSIER_TOTAL_MAX = 192 * 1024
 const TASK_DOSSIER_CAPS = Object.freeze({
@@ -3088,6 +3090,10 @@ function readRoundState(file) {
       }
       s.state_version = 5
     }
+    if ((s.state_version || 0) < 6) {
+      s.gate_fact = null
+      s.state_version = 6
+    }
     return s
   } catch (error) {
     die(`${p} cannot be recovered: ${(error?.message || error).toString().split('\n')[0]}`)
@@ -3242,6 +3248,27 @@ function profile(preflight = true) {
         `${GATE_TIMEOUT_MAX_MS} — got "${f[key]}"`)
     }
     f[key] = ms
+  }
+  for (const [key, maximum] of [
+    ['executor_max_tool_events', EXECUTOR_TOOL_EVENT_LIMIT_MAX],
+    ['executor_max_event_bytes', EXECUTOR_EVENT_BYTE_LIMIT_MAX],
+  ]) {
+    if (f[key] === undefined || f[key] === '') {
+      f[key] = null
+      continue
+    }
+    const value = Number(f[key])
+    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+      die(`.caw/CAW.md ${key} must be a positive whole number no greater than ${maximum}`)
+    }
+    f[key] = value
+  }
+  if (f.gate_unavailable_review === undefined || f.gate_unavailable_review === '') {
+    f.gate_unavailable_review = false
+  } else if (!['true', 'false'].includes(f.gate_unavailable_review)) {
+    die('.caw/CAW.md gate_unavailable_review must be true or false')
+  } else {
+    f.gate_unavailable_review = f.gate_unavailable_review === 'true'
   }
   f.index_format = f.index_format || 'text-v0'
   if (!['text-v0', 'json-v1'].includes(f.index_format)) {
@@ -4727,6 +4754,12 @@ function agent(role, prompt, schema, f, spec, context = null) {
   const scratchRoot = context?.scratchRoot || invocationScratch?.scratchRoot || null
   const env = { ...process.env, PWD: context?.workingRoot || process.cwd(), CAW_ROLE: role }
   if (spec) env.CAW_SPEC = spec
+  if (role === 'executor' && f.executor_max_tool_events) {
+    env.CAW_EXECUTOR_MAX_TOOL_EVENTS = String(f.executor_max_tool_events)
+  }
+  if (role === 'executor' && f.executor_max_event_bytes) {
+    env.CAW_EXECUTOR_MAX_EVENT_BYTES = String(f.executor_max_event_bytes)
+  }
   const instructions = assembledInstructions(role, binding, provider, f.docs_language)
   const providerVector = providerLaunch(provider.executable, process.platform, binding.provider)
   let invocation
@@ -4801,10 +4834,16 @@ function agent(role, prompt, schema, f, spec, context = null) {
   }
   if (r.status !== 0) {
     discardInvocationTransport(invocation)
+    const budgetExhausted = r.status === 86 &&
+      /CAW_EXECUTOR_BUDGET_EXHAUSTED/.test(`${r.stderr || ''}`)
     const interrupted = Boolean(r.signal) || [130, 143].includes(r.status)
     recordMissingEnumeratorPopulation(role, interrupted ? 'call was interrupted' : 'call failed')
     recordProviderFailure(role, provider, r, attempt,
-      interrupted ? 'interrupted' : 'nonzero-exit')
+      budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted' : 'nonzero-exit')
+    if (budgetExhausted) {
+      die(`${role} reached its configured live budget and was stopped. Its partial edits remain ` +
+        `in the tree and the pre-call round state preserves recovery context.\n${r.stderr.trim()}`)
+    }
     die(`${role} exited ${r.status}\n${provider.adapter.decodeFailure(r)}`)
   }
   let decoded, result
@@ -8225,7 +8264,7 @@ function runTask(file, f, profileText, opts = {}) {
   let confirmationRuns = 0 // provider-free reruns since the last executor delivery
   let projectGateRetries = 0 // bounded policy retries for a confirmed project-classified flaky gate
   let ex = resume?.ex || null
-  let gateFact = null // a red gate's output, which is a fact handed over rather than a finding
+  let gateFact = resume?.gate_fact || null // last confirmed red, handed to the next executor
   let weakVerification = resume?.weak_verification || null
   // The reviewer's non-blocking sightings, kept per task so the commit can carry them. The
   // global `notes` array cannot serve here: it spans every task in the run and is printed once
@@ -8283,12 +8322,26 @@ function runTask(file, f, profileText, opts = {}) {
         spec, profile: profileText, open, files: changedFiles(), diff: taskDeliveryDiff(),
         gateEvidence: gateFact, executorClaims: ex?.claims || [], acceptanceCases,
       })
+      // Persist before spending. A live provider budget, terminal close, or machine failure may
+      // stop the executor after it has edited the tree but before it returns canonical output.
+      // The dirty tree is recoverable on its own; this state preserves the prior confirmed-red
+      // receipt and review history needed to continue it without a fresh reading.
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
       ex = agent('executor', [
         dossier.text,
         '\n\nImplement the task contract. Treat executor claims in the dossier only as prior hints.',
         '\nReturn a concise summary and notes. Claims are optional navigation metadata in meaning:',
         ' use an empty claims array unless every referenced id and selector is copied exactly',
         ' from the dossier. Claim validity never decides whether the delivery passes.',
+        f.executor_max_tool_events
+          ? `\nYou have a hard live budget of ${f.executor_max_tool_events} provider tool events.` +
+            ' Finish the smallest contract-complete change and return before it is reached.'
+          : '',
+        f.executor_max_event_bytes
+          ? `\nYour provider event stream is capped at ${f.executor_max_event_bytes} bytes.` +
+            ' Keep command output narrow and avoid rereading files already inspected.'
+          : '',
         open.length
           ? '\nClose every open finding in the dossier before doing unrelated work.' +
             (open.some((i) => i.round < round)
@@ -8329,9 +8382,9 @@ function runTask(file, f, profileText, opts = {}) {
       // Before the gate, because the gate is the next thing that can take minutes and the
       // delivery is already real: the files are written and this is the earliest moment at
       // which losing the process would lose something that cost money.
-      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
-        weakVerification)
       gateFact = null
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
       confirmationRuns = 0
       projectGateRetries = 0
     }
@@ -8358,7 +8411,15 @@ function runTask(file, f, profileText, opts = {}) {
           gatePolicy.output.reason.trim(),
         taskAccounting(), runtimeHistory, weakVerification)
     }
-    if (!g.ok) {
+    const gateUnavailable = !g.ok && ['refused', 'timeout'].includes(g.state) &&
+      f.gate_unavailable_review
+    if (gateUnavailable) {
+      say(g.out)
+      gateFact = g.receipt
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+      say(`  fast gate ${g.state}; running one advisory reviewer pass without certification`)
+    } else if (!g.ok) {
       if (g.state === 'timeout') {
         say(g.out)
         stop(file, spec, ex, history, round, how, noted,
@@ -8426,6 +8487,8 @@ function runTask(file, f, profileText, opts = {}) {
       confirmationRuns = 0
       say(`  gate reproducibly red (executor retry ${retry}/${MAX_GATE_RETRIES})`)
       gateFact = g.receipt
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
       continue
     }
 
@@ -8467,7 +8530,7 @@ function runTask(file, f, profileText, opts = {}) {
       : ''
     if (f.task_independence === 'human-review') {
       saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
-        weakVerification)
+        weakVerification, gateFact)
       die(`${file} — automated task review is disabled by task_independence: human-review.\n` +
         `  The green-gate delivery is preserved. Prepare its signed review with:\n` +
         `    node caw.mjs human-review prepare task ${file} <identity>`)
@@ -8487,7 +8550,7 @@ function runTask(file, f, profileText, opts = {}) {
       acceptanceCases,
     })
     let weakBaseline = null
-    let passCount = 1 + (reviewNeedsChallenger(f, files, open)
+    let passCount = gateUnavailable ? 1 : 1 + (reviewNeedsChallenger(f, files, open)
       ? f.review_challenger_passes : 0)
     for (let passIndex = 0; passIndex < passCount; passIndex++) {
       const reviewSurface = createReviewSurface(f, g.receipt)
@@ -8509,8 +8572,13 @@ function runTask(file, f, profileText, opts = {}) {
             ? 'This is the primary pass.'
             : 'This is a blind challenger pass. Do not assume the primary pass found everything.'),
         `\n\nAll passes judge the exact delivery digest ${deliveryBaseline}.`,
-        `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
-        ` Its engine-owned receipt is ${g.receipt.receipt_id}. Whether it passes is settled.`,
+        gateUnavailable
+          ? `\n\nThe gate \`${f.gate_fast}\` was ${g.state}; no test verdict exists.`
+          : `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
+        gateUnavailable
+          ? ` Its engine-owned receipt is ${g.receipt.receipt_id}. This is one advisory pass:` +
+            ' inspect the delivery and record blockers, but do not claim unavailable checks passed.'
+          : ` Its engine-owned receipt is ${g.receipt.receipt_id}. Whether it passes is settled.`,
         ' Use receipt checks and artifacts before consulting executor claims. Claims are untrusted',
         ' navigation hints. Judge whether the gate passes for the right reason.',
         '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
@@ -8640,7 +8708,7 @@ function runTask(file, f, profileText, opts = {}) {
         baseline_digest: deliveryBaseline, ...runtime })
       reviewPasses.push({ verdict: passVerdict, runtime, weakEvents: verified.events,
         weakVerification: verified.verification })
-      if (passIndex === 0 && passCount === 1 &&
+      if (!gateUnavailable && passIndex === 0 && passCount === 1 &&
           reviewNeedsChallenger(f, files, open, passVerdict)) {
         passCount = 1 + f.review_challenger_passes
         if (passCount > 1) say(`  primary review found risk; adding ${passCount - 1} challenger pass(es)`)
@@ -8674,8 +8742,8 @@ function runTask(file, f, profileText, opts = {}) {
     // the tree and can be read, a reviewer's reading of it cannot — so it goes to disk before
     // anything is printed about it.
     saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
-      weakVerification)
-    const certification = recordTaskCertification({
+      weakVerification, gateFact)
+    const certification = gateUnavailable ? null : recordTaskCertification({
       task: file,
       round,
       criteria: rv.criteria,
@@ -8690,6 +8758,13 @@ function runTask(file, f, profileText, opts = {}) {
       executorClaims: ex?.claims || [],
     })
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
+
+    if (gateUnavailable) {
+      stop(file, spec, ex, history, round, how, noted,
+        `${file} — advisory review finished after the fast gate was ${g.state}. ` +
+        `The delivery is not certified or committed.`, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+    }
 
     if (!nowOpen.length) {
       return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline,
@@ -8743,9 +8818,9 @@ function runTask(file, f, profileText, opts = {}) {
 // executor still leaves its work in the tree: without this, a later `review` that approves would
 // commit that work under the previous round's summary.
 function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory = [],
-  weakVerification = null) {
+  weakVerification = null, gateFact = null) {
   writeRoundState(file, {
-    state_version: 5,
+    state_version: 6,
     spec_digest: specDigest(spec),
     round,
     history,
@@ -8757,6 +8832,7 @@ function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, r
     runtime_history: runtimeHistory,
     project_policies: projectPolicySnapshot(),
     weak_verification: weakVerification,
+    gate_fact: gateFact,
     // Kept so that a `review` which approves has a delivery to commit. A hand-finished task has
     // no executor of its own, and a commit with an empty summary line is one nobody can read
     // back later.
@@ -8765,9 +8841,10 @@ function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, r
 }
 
 function stop(file, spec, ex, history, round, how, noted, why,
-  taskAccounting = zeroAccounting(), runtimeHistory = [], weakVerification = null) {
+  taskAccounting = zeroAccounting(), runtimeHistory = [], weakVerification = null,
+  gateFact = null) {
   saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory,
-    weakVerification)
+    weakVerification, gateFact)
   const open = openItems(history)
   say(`\n· ${why}`)
   say(`  This task has cost ${formatAccounting(taskAccounting)} over ${round} round(s).`)

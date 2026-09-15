@@ -222,6 +222,16 @@ Set `builtin_index: request-v1` for the engine's bounded request-token/file inde
 enumerator, architect, and plan-reviewer. Use `gate_batch` for broad tests that should run once after the task
 queue; keep focused evidence in `gate_fast`.
 
+For Codex executors, `executor_max_tool_events` and `executor_max_event_bytes` are live limits,
+not accounting warnings after the call. The adapter interrupts the provider when either observed
+limit is reached. CAW saves round state before launch, so partial edits and the last confirmed-red
+receipt remain recoverable. Start with a measured ceiling above ordinary tasks; a value below the
+smallest complete delivery only converts spend into repeated partial attempts.
+
+Set `gate_unavailable_review: true` only when an advisory code review is useful during a refused
+or timed-out task gate. CAW runs exactly one reviewer pass, records its findings, and stops. The
+delivery is never certified or committed without a green required gate.
+
 For human independence, set `human_review_allowed_signers` to a repository-relative OpenSSH
 allowed-signers file. CAW signs no decision itself: `human-review prepare` writes the exact census,
 the reviewer fills it and signs its bytes in namespace `caw-review`, and `human-review accept`

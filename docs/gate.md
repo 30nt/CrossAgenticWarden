@@ -20,6 +20,10 @@ suites can move there instead of repeating after every ticket. `gate_full` remai
 integration gate. Fast pipeline mode ends after focused task gates and reviews; standard and
 strict modes run the configured batch and full gates.
 
+With `gate_unavailable_review: true`, a refused or timed-out task gate can receive one advisory
+review pass. This is a diagnosis path: it records findings against the preserved dirty tree and
+receipt, then stops without certification or commit.
+
 Generated specs carry a stable `task_key` independent of their numbered queue position. The
 engine exports it as `CAW_TASK_KEY`; gate routing should use that value. `CAW_SPEC` remains
 available for compatibility and for reading the current spec.

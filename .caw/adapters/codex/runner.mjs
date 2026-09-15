@@ -10,6 +10,17 @@ if (!authCopyArg || !executable) {
 }
 
 const authCopyPath = authCopyArg === '-' ? null : authCopyArg
+const positiveLimit = (name) => {
+  const raw = process.env[name]
+  if (!raw) return null
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+const toolEventLimit = positiveLimit('CAW_EXECUTOR_MAX_TOOL_EVENTS')
+const eventByteLimit = positiveLimit('CAW_EXECUTOR_MAX_EVENT_BYTES')
+const toolTypes = new Set([
+  'command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'tool_call', 'tool_use',
+])
 const removeAuthCopy = () => {
   if (authCopyPath) rmSync(authCopyPath, { force: true })
 }
@@ -21,16 +32,38 @@ process.stdin.pipe(child.stdin)
 child.stderr.pipe(process.stderr)
 
 let pending = ''
+let toolEvents = 0
+let eventBytes = 0
+let budgetExceeded = null
+let hardKill = null
+const stopForBudget = (kind, observed, limit) => {
+  if (budgetExceeded) return
+  budgetExceeded = { kind, observed, limit }
+  process.stderr.write(`\nCAW_EXECUTOR_BUDGET_EXHAUSTED ${kind} ${observed}/${limit}\n`)
+  child.kill('SIGINT')
+  hardKill = setTimeout(() => child.kill('SIGKILL'), 2000)
+}
 child.stdout.on('data', (chunk) => {
   const text = chunk.toString()
   process.stdout.write(text)
+  eventBytes += chunk.length
+  if (eventByteLimit && eventBytes > eventByteLimit) {
+    stopForBudget('event-bytes', eventBytes, eventByteLimit)
+  }
   pending += text
   let newline
   while ((newline = pending.indexOf('\n')) !== -1) {
     const line = pending.slice(0, newline)
     pending = pending.slice(newline + 1)
     try {
-      if (JSON.parse(line)?.type === 'thread.started') removeAuthCopy()
+      const event = JSON.parse(line)
+      if (event?.type === 'thread.started') removeAuthCopy()
+      if (toolTypes.has(event?.item?.type || event?.type)) {
+        toolEvents += 1
+        if (toolEventLimit && toolEvents >= toolEventLimit) {
+          stopForBudget('tool-events', toolEvents, toolEventLimit)
+        }
+      }
     } catch { /* non-JSON diagnostics are passed through unchanged */ }
   }
 })
@@ -45,7 +78,9 @@ child.on('error', (error) => {
   process.exitCode = 127
 })
 child.on('exit', (code, signal) => {
+  if (hardKill) clearTimeout(hardKill)
   removeAuthCopy()
-  if (signal) process.kill(process.pid, signal)
+  if (budgetExceeded) process.exitCode = 86
+  else if (signal) process.kill(process.pid, signal)
   else process.exitCode = code ?? 1
 })

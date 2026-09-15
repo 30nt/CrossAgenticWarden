@@ -228,6 +228,15 @@ blocking-результата primary review.
 enumerator, architect и plan-reviewer. Широкие тесты, которые нужно запускать один раз после очереди, задайте
 в `gate_batch`; точечные evidence оставьте в `gate_fast`.
 
+Для Codex-executor поля `executor_max_tool_events` и `executor_max_event_bytes` задают живые
+ограничения, а не предупреждения после завершения вызова. Адаптер прерывает провайдера при
+достижении любого лимита. CAW сохраняет round state до запуска, поэтому частичные изменения и
+последний подтверждённый red receipt остаются доступны для продолжения.
+
+`gate_unavailable_review: true` запускает ровно один advisory-review, если task gate отказался
+стартовать или превысил timeout. Такой review сохраняет findings и останавливается; без зелёного
+обязательного gate результат не сертифицируется и не коммитится.
+
 Для человеческой независимости задайте `human_review_allowed_signers` как относительный от
 репозитория OpenSSH allowed-signers файл. CAW сам ничего не подписывает: `human-review prepare`
 создаёт точный census, человек заполняет и подписывает его байты в namespace `caw-review`, а

@@ -20,6 +20,15 @@ gate_batch_timeout_ms:
 gate_full:
 gate_full_timeout_ms:
 
+# Optional live Codex executor caps. The runner interrupts the provider as soon as either
+# observed boundary is reached. Empty leaves that dimension uncapped.
+executor_max_tool_events:
+executor_max_event_bytes:
+
+# When true, a refused or timed-out task gate receives one advisory reviewer pass. That pass
+# records findings but can never certify or commit the delivery.
+gate_unavailable_review: false
+
 # Optional strict weak verification. Configure both fields or leave both empty.
 # The source probe must print only {"loaded_paths":["/absolute/path", ...]} to stdout.
 # The positive control must change a tracked file so gate_fast becomes red.
