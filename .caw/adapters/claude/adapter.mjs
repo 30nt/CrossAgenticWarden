@@ -341,8 +341,10 @@ export default {
       if (!execution.scratchRoot) throw new Error('bounded Claude invocation requires an engine scratch root')
       const profile = outerProfile()
       if (!profile) throw new Error('bounded Claude invocation has no outer profile on this host')
+      const wrappedTarget = target
+      const wrappedArgs = targetArgs
       target = profile.executable
-      targetArgs = profile.wrap(execution, executable, [...executableArgs, ...args])
+      targetArgs = profile.wrap(execution, wrappedTarget, wrappedArgs)
     }
     const {
       CLAUDECODE: _claudeCode,
