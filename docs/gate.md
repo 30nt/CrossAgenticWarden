@@ -6,7 +6,7 @@ The gate is the one thing in this pipeline whose verdict never passes through a 
 or red is an exit code. That makes it the piece most worth getting right, and these rules were
 each bought by an install that did without one.
 
-`gate_fast` and `gate_full` are each **one command**. A project whose gate is really five
+`gate_fast`, `gate_batch`, and `gate_full` are each **one command**. A project whose gate is really five
 checks wraps them in a script and names that — `bash scripts/gate_fast.sh`, or a `make check`
 that already does it. Five rules, every one of them bought by an install that did without it:
 
@@ -14,6 +14,20 @@ Set `gate_fast_timeout_ms` and `gate_full_timeout_ms` in `.caw/CAW.md` when the 
 defensible limit. They are positive whole milliseconds; an empty value leaves that gate without
 an engine timeout. A timeout is recorded separately from red and exit-75 refusal: CAW kills the
 gate, keeps task recovery state, and does not wake an executor or recommend a bisect.
+
+`gate_fast` runs for every task. Optional `gate_batch` runs once after the queue, so broad unit
+suites can move there instead of repeating after every ticket. `gate_full` remains the final
+integration gate. Fast pipeline mode ends after focused task gates and reviews; standard and
+strict modes run the configured batch and full gates.
+
+Generated specs carry a stable `task_key` independent of their numbered queue position. The
+engine exports it as `CAW_TASK_KEY`; gate routing should use that value. `CAW_SPEC` remains
+available for compatibility and for reading the current spec.
+
+A spec may declare `## Required gate checks` with bullets beginning in a backticked check id. A
+zero exit is then insufficient: `CAW_GATE_EVIDENCE_OUT` must contain every declared id with state
+`passed`. CAW refuses the receipt before reviewer judgment if the manifest or a required passed
+check is missing.
 
 A project policy API v2 risk class may require a full-gate baseline. In that mode `gate_full`
 runs once on the starting commit before any executor and once after the queue. `--no-full` and an

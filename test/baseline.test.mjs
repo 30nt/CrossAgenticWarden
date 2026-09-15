@@ -117,6 +117,7 @@ const plan = () => ({
     read: ['README.md'],
     change: ['Write the fixture output.'],
     done_when: ['The fixture output exists.'],
+    gate_checks: [],
     surfaces: [{ id: 'fixture-output', responsibility: 'The generated fixture output.' }],
     state_machines: [{
       surface: 'fixture-output', states: ['absent', 'present'],
@@ -250,10 +251,17 @@ function fixture({
   git = false,
   gateFast = 'node -e "process.exit(0)"',
   gateFastTimeout = '',
+  gateBatch = '',
+  gateBatchTimeout = '',
   gateFull = '',
   gateFullTimeout = '',
   indexCmd = '',
   indexFormat = '',
+  indexAudience = '',
+  builtinIndex = '',
+  pipelineMode = '',
+  planningMaxRounds = '',
+  challengerPolicy = '',
   reviewDependencies = '',
   planningIndependence = '',
   taskIndependence = '',
@@ -322,15 +330,22 @@ name: Baseline fixture
 main_branch: main
 gate_fast: ${gateFast}
 gate_fast_timeout_ms: ${gateFastTimeout}
+gate_batch: ${gateBatch}
+gate_batch_timeout_ms: ${gateBatchTimeout}
 gate_full: ${gateFull}
 gate_full_timeout_ms: ${gateFullTimeout}
 index_cmd: ${indexCmd}
 index_format: ${indexFormat}
+index_audience: ${indexAudience}
+builtin_index: ${builtinIndex}
+pipeline_mode: ${pipelineMode}
+planning_max_rounds: ${planningMaxRounds}
 review_dependency_roots: ${reviewDependencies}
 docs_language: English
 planning_independence: ${planningIndependence}
 task_independence: ${taskIndependence}
 review_challenger_passes: 0
+review_challenger_policy: ${challengerPolicy}
 require_role_smoke: false
 weak_source_probe_cmd: ${weakSourceProbe}
 weak_positive_control_cmd: ${weakPositiveControl}
@@ -665,7 +680,7 @@ test('population repair uses exact first-line then longest-block anchors and rec
     { envelope: envelope(plan()) },
     { envelope: envelope(planReview()) },
   ])
-  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
   assert.match(result.stdout, /repaired 1 anchor\(s\) by unique exact search/)
   const reviewCall = calls(f).find((call) => call.role === 'plan-reviewer')
   assert.match(reviewCall.input, /README\.md:1 — "# fixture"/)
@@ -5127,6 +5142,39 @@ test('index_cmd output goes to the enumerator and to no other role', () => {
   }
 })
 
+test('planning index audience sends one deterministic index to all planning roles', () => {
+  const marker = 'PLANNING-INDEX-MARKER-4d21'
+  const f = fixture({ git: true, indexCmd: 'cat index-fixture.txt', indexAudience: 'planning' })
+  writeFileSync(join(f.root, 'index-fixture.txt'), `${marker}\n`)
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  for (const role of ['enumerator', 'architect', 'plan-reviewer']) {
+    assert.equal(seen.find((call) => call.role === role).input.includes(marker), true, role)
+  }
+})
+
+test('builtin request index gives planning roles a bounded deterministic file map', () => {
+  const f = fixture({ git: true, builtinIndex: 'request-v1', indexAudience: 'planning' })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'language-authority.swift'), 'profile language authority\n')
+  execFileSync('git', ['add', 'src/language-authority.swift'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add authority fixture'], { cwd: f.root })
+  const result = run(f, ['plan', 'make profile language authoritative'], [
+    { envelope: envelope(population([])) }, { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  for (const call of calls(f).filter((entry) =>
+    ['enumerator', 'architect', 'plan-reviewer'].includes(entry.role))) {
+    assert.match(call.input, /src\/language-authority\.swift/)
+  }
+})
+
 test('index_cmd that exits non-zero enumerates without it and says so', () => {
   const f = fixture({ indexCmd: 'node -e "console.log(\\"partial\\"); process.exit(3)"' })
   const result = indexPlan(f)
@@ -5233,14 +5281,14 @@ test('unknown project index formats fail before provider calls', () => {
 // `gate_full` had no coverage at all. The three outcomes below are the whole of its interface,
 // and the second is the one with a measured cost behind it: an install whose gate used exit 1 for
 // both a failure and a refusal sent a reader bisecting a range where no test had executed.
-const buildOneTask = (f, extraResponses = [], args = ['build']) => {
+const buildOneTask = (f, extraResponses = [], args = ['build'], extraEnv = {}) => {
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
   writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
   return run(f, args, [
     { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
     { envelope: envelope(verdict()) },
     ...extraResponses,
-  ])
+  ], extraEnv)
 }
 
 test('build wakes an executor only after the same delivery makes the gate red twice', () => {
@@ -5266,6 +5314,42 @@ test('build wakes an executor only after the same delivery makes the gate red tw
   assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
 })
 
+test('task gate receives stable task key and must pass every required check id', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { writeFileSync } from 'node:fs'
+writeFileSync(process.env.CAW_TASK_KEY_LOG, process.env.CAW_TASK_KEY)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add focused gate'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '018_renumbered.md'), `---
+title: Task
+task_key: stable-output-authority
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`)
+  const keyLog = join(f.parent, 'task-key.log')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ], { CAW_TASK_KEY_LOG: keyLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.equal(readFileSync(keyLog, 'utf8'), 'stable-output-authority')
+})
+
 test('a configured gate_full runs once at the end of a build and reports green', () => {
   const f = fixture({ git: true, gateFull: 'node -e "process.exit(0)"' })
   const result = buildOneTask(f)
@@ -5273,6 +5357,28 @@ test('a configured gate_full runs once at the end of a build and reports green',
   assert.match(result.stdout, /· full gate: node -e "process\.exit\(0\)"/)
   assert.match(result.stdout, /\n {2}green/)
   assert.doesNotMatch(result.stdout, /no gate_full configured/)
+})
+
+test('a batch gate runs once after task commits and before the full gate', () => {
+  const f = fixture({
+    git: true,
+    gateBatch: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'batch\\n\')"',
+    gateFull: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'full\\n\')"',
+  })
+  const log = join(f.parent, 'batch.log')
+  const result = buildOneTask(f, [], ['build'], { CAW_BATCH_LOG: log })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(readFileSync(log, 'utf8'), 'batch\nfull\n')
+})
+
+test('fast mode ends after focused task review and skips queue-level gates', () => {
+  const f = fixture({
+    git: true, pipelineMode: 'fast',
+    gateBatch: 'node -e "process.exit(1)"', gateFull: 'node -e "process.exit(1)"',
+  })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /fast mode ends after focused task gates and reviews/)
 })
 
 test('--no-full skips a configured gate_full', () => {

@@ -211,6 +211,17 @@ two total passes and is the distributed default; the allowed range is `0..2`. Ev
 reviewer call. `require_role_smoke: true` requires exact binding evidence after any model,
 reasoning, CLI, adapter or engine change.
 
+`pipeline_mode` selects `fast`, `standard`, or `strict`. Fast consumes existing specs and uses
+one executor, focused gate, and primary review path. Standard performs one planning review and
+uses risk-triggered challenger passes. Strict retains iterative planning and fixed challengers.
+`planning_max_rounds` bounds planning at `1..3`; `review_challenger_policy: risk` adds configured
+challengers only for broad or risky paths, carried findings, or a primary blocking result.
+
+Set `builtin_index: request-v1` for the engine's bounded request-token/file index, and
+`index_audience: planning` to pass the same digest, together with any `index_cmd` output, to
+enumerator, architect, and plan-reviewer. Use `gate_batch` for broad tests that should run once after the task
+queue; keep focused evidence in `gate_fast`.
+
 For human independence, set `human_review_allowed_signers` to a repository-relative OpenSSH
 allowed-signers file. CAW signs no decision itself: `human-review prepare` writes the exact census,
 the reviewer fills it and signs its bytes in namespace `caw-review`, and `human-review accept`

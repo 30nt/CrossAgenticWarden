@@ -47,6 +47,7 @@ const relatedPlan = () => ({
     read: ['src/state.js'],
     change: ['Keep both states explicit.'],
     done_when: ['The empty state survives.', 'The populated state survives.'],
+    gate_checks: [],
     surfaces: [{ id: 'state-storage', responsibility: 'Preserve the stored state.' }],
     state_machines: [{
       surface: 'state-storage', states: ['empty', 'populated'],
@@ -102,6 +103,6 @@ test('plan-reviewer schema requires the complete relation ledger', () => {
   assert.deepEqual(SCHEMA.plan.properties.coverage.items.required,
     ['case', 'task', 'acceptance_criteria'])
   assert.deepEqual(SCHEMA.plan.properties.tasks.items.required,
-    ['slug', 'title', 'read', 'change', 'done_when', 'surfaces', 'state_machines',
+    ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
       'indivisible_reason'])
 })

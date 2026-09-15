@@ -47,6 +47,19 @@ test('gate evidence validates linked checks and hashes regular artifacts', (t) =
   assert.match(evidence.artifacts[0].sha256, /^[0-9a-f]{64}$/)
 })
 
+test('task-required check ids may stand alone and remain machine-verifiable', (t) => {
+  const f = fixture()
+  t.after(() => rmSync(f.root, { recursive: true, force: true }))
+  writeManifest(f.manifest, [{
+    id: 'focused-language-ui', criterion_ids: [], acceptance_case_ids: [], selector: '',
+    evidence_kind: 'command', state: 'passed', summary: 'focused UI test passed', artifacts: [],
+  }])
+  const evidence = collectGateEvidence(f.manifest, f.artifacts, {
+    criteria: [{ id: 'done-when-1' }], requiredCheckIds: ['focused-language-ui'],
+  })
+  assert.equal(evidence.checks[0].id, 'focused-language-ui')
+})
+
 test('gate evidence rejects traversal, symlinks, unknown links and unbound checks', (t) => {
   const f = fixture()
   t.after(() => rmSync(f.root, { recursive: true, force: true }))
