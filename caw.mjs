@@ -3192,9 +3192,16 @@ function specDigest(text) {
 
 const APPROVED_HEAD = '## Approved — the queue as it was judged'
 
-// Returns null when the plan carries no such section: every plan approved before this existed,
-// and every hand-written ticket, which has no PLAN.md at all. Both must stay silent rather than
-// read as tampering.
+const approvedSpecLines = (specs) => specs.map((s) =>
+  `- ${s}  ${specDigest(readFileSync(join(QUEUE_DIR, s), 'utf8'))}`)
+
+function withApprovedDigests(text, specs) {
+  return `${text.split(APPROVED_HEAD)[0].trimEnd()}\n\n${APPROVED_HEAD}\n\n` +
+    `${approvedSpecLines(specs).join('\n')}\n`
+}
+
+// Returns null when an artifact predates recorded queue digests. That legacy state stays silent
+// rather than being reported as tampering.
 function approvedDigests(plan) {
   const after = plan.split(APPROVED_HEAD)[1]
   if (after === undefined) return null
@@ -3542,17 +3549,39 @@ function deliverySnapshotDigest() {
   return hash.digest('hex')
 }
 
-function ignoredReadDenials(deliveryRoot, dependencies) {
-  const allowed = dependencies.map((d) => resolve(deliveryRoot, d.entry))
+function ignoredReadDenials(deliveryRoot) {
   const raw = surfaceGit(deliveryRoot, 'status', '--ignored', '--porcelain=v1', '-z')
   const out = []
   for (const record of raw.split('\0').filter(Boolean)) {
     if (!record.startsWith('!! ')) continue
     const lexical = resolve(deliveryRoot, record.slice(3).replace(/\/$/, ''))
-    if (allowed.some((root) => inside(root, lexical))) continue
     if (existsSync(lexical)) out.push(realpathSync(lexical))
   }
   return [...new Set(out)]
+}
+
+// A dependency tree is executable test input, and modern runners also use it for transient
+// state. Vite, for example, bundles its config into node_modules/.vite-temp before it imports
+// it. Pointing the surface at the delivery dependency tree and making that target read-only
+// therefore prevents the test process from starting at all. Copy the ignored tree into the
+// engine-owned surface and make the copy owner-writable. `verbatimSymlinks` keeps relative
+// package links relative to the copied tree instead of resolving them back into delivery.
+function stageReviewDependency(source, target) {
+  cpSync(source, target, {
+    recursive: true,
+    preserveTimestamps: true,
+    verbatimSymlinks: true,
+  })
+  const pending = [target]
+  while (pending.length) {
+    const path = pending.pop()
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) continue
+    chmodSync(path, (stat.mode & 0o7777) | (stat.isDirectory() ? 0o700 : 0o600))
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) pending.push(join(path, name))
+    }
+  }
 }
 
 // Some dependency managers make cached directories read-only. Removing one of CAW's own
@@ -3760,7 +3789,7 @@ function writeSurfaceManifest(surface, state, reason = '') {
     reason: reason.slice(0, 2000),
     apparent_bytes: apparentSurfaceBytes(surface.parent),
     scratch_root: surface.scratchRoot && relative(surface.parent, surface.scratchRoot),
-    dependency_symlinks: surface.dependencies.map((dependency) => dependency.entry),
+    dependency_copies: surface.dependencies.map((dependency) => dependency.entry),
     ...(surface.weakGate ? { weak_gate: surface.weakGate } : {}),
   }
   writeFileSync(join(surface.parent, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, {
@@ -3872,12 +3901,18 @@ function createReviewSurface(f, gateReceipt = null) {
       const target = join(workingRoot, dependency.entry)
       if (existsSync(target)) die(`review dependency collides with delivery content: ${dependency.entry}`)
       mkdirSync(dirname(target), { recursive: true })
-      symlinkSync(dependency.canonical, target, 'dir')
+      const projectedBytes = apparentSurfaceBytes(parent) + apparentSurfaceBytes(dependency.canonical)
+      if (projectedBytes > REVIEW_SURFACE_MAX) {
+        throw new Error(`review surface is at least ${projectedBytes} bytes; limit is ${REVIEW_SURFACE_MAX}`)
+      }
+      stageReviewDependency(dependency.canonical, target)
       const exclude = surfaceGit(workingRoot, 'rev-parse', '--git-path', 'info/exclude').trim()
       appendFileSync(join(workingRoot, exclude), `\n/${dependency.entry.replace(/\\/g, '/')}\n`)
     }
     surface.gateArtifacts = stageReviewGateArtifacts(surface, gateReceipt)
-    surface.deniedReadPaths = ignoredReadDenials(deliveryRoot, dependencies)
+    // The reviewer reads and writes the private copy. The ignored source remains denied so an
+    // absolute path or a surviving absolute symlink cannot mutate the delivery dependency tree.
+    surface.deniedReadPaths = ignoredReadDenials(deliveryRoot)
     const bytes = apparentSurfaceBytes(parent)
     if (bytes > REVIEW_SURFACE_MAX) {
       throw new Error(`review surface is ${bytes} bytes; limit is ${REVIEW_SURFACE_MAX}`)
@@ -6281,7 +6316,7 @@ function writePlan(description, out, history, unclosed, population, undecidable 
   risk = null) {
   const populationRecord = populationPlanRecord(population)
   const ledger = planningLedger(out)
-  writeFileSync(PLAN, [
+  const text = [
     '---',
     `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`,
     `population_state: ${populationRecord.state}`,
@@ -6370,7 +6405,10 @@ function writePlan(description, out, history, unclosed, population, undecidable 
          'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
          '`approved:` above. `build` refuses until it does.', '']
       : []),
-  ].join('\n'))
+  ].join('\n')
+  writeFileSync(PLAN, unclosed.length || undecidable.length
+    ? text
+    : withApprovedDigests(text, specFiles()))
   if (risk) writeRiskRecord(risk)
 }
 
@@ -7384,8 +7422,8 @@ function build(noFull) {
   // The flag outlives the terminal that printed the holes, which is the whole point of it
   // being on disk. Flipped by `review-specs` when it comes back clean — the one thing in this
   // tool whose job is judging a spec against the request — or by hand, which is an explicit
-  // act rather than a scrollback nobody read. A hand-written ticket has no PLAN.md and so no
-  // gate here, which is right: there was never a plan to approve.
+  // act rather than a scrollback nobody read. `review-specs` creates the same durable approval
+  // artifact for a hand-written queue, while naming that no plan was generated.
   if (existsSync(PLAN)) {
     const plan = readFileSync(PLAN, 'utf8')
     planText = plan
@@ -8891,7 +8929,7 @@ function runTask(file, f, profileText, opts = {}) {
           kind: REVIEW_WRITE_BOUNDARY,
           writableRoot: reviewSurface.workingRoot,
           deniedReadPaths: reviewSurface.deniedReadPaths,
-          readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
+          readOnlyDependencyRoots: [],
         },
       }
       try {
@@ -9481,7 +9519,9 @@ function reviewSpecs(description, noFix) {
 
   for (let round = 1; round <= FIX_ROUNDS; round++) {
     const verdict = judgeSpecs(description, f, text, population)
-    if (!verdict.problems.length) return approveSpecs(verdict.specs)
+    if (!verdict.problems.length) {
+      return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
+    }
 
     say(`\nholes (round ${round}/${FIX_ROUNDS}):\n  - ${verdict.problems.join('\n  - ')}`)
 
@@ -9646,10 +9686,40 @@ function judgeSpecs(description, f, text, population) {
 // Approving the specs is exactly what the flag was waiting for, so this is where it flips.
 // No `--force` on `build` does this job: a flag that bypasses a gate is the one that gets
 // typed reflexively, whereas the cheap path here is also the correct one.
-function approveSpecs(specs) {
-  if (existsSync(PLAN)) {
+function ticketReviewRecord(description, specs, population, risk) {
+  const record = populationPlanRecord(population)
+  return withApprovedDigests([
+    '---',
+    'approved: true',
+    `population_state: ${record.state}`,
+    `population_returned: ${record.returned}`,
+    `population_repaired: ${record.repaired}`,
+    `population_dropped: ${record.dropped}`,
+    `population_retained: ${record.retained}`,
+    `population_witness_withdrawn: ${record.witness_withdrawn}`,
+    `population_digest: ${record.digest}`,
+    ...(risk ? Object.entries(riskPlanFields(risk)).map(([name, value]) => `${name}: ${value}`) : []),
+    '---', '',
+    '# Reviewed ticket queue', '',
+    'Written by `caw.mjs` after `review-specs` approved a queue supplied without a generated',
+    'plan. It records the request and exact spec digests that were judged; it does not claim',
+    'that CAW generated the tickets.', '',
+    '## Request', '', description, '',
+    ...(risk ? [
+      '## Project risk attestation', '',
+      '```json', JSON.stringify(risk, null, 2), '```', '',
+    ] : []),
+  ].join('\n'), specs)
+}
+
+function approveSpecs(specs, description, population, risk) {
+  if (!existsSync(PLAN)) {
+    writeFileSync(PLAN, ticketReviewRecord(description, specs, population, risk))
+    say(`\n  ${PLAN} — review recorded. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
+  } else {
     const before = readFileSync(PLAN, 'utf8')
-    if (/^approved:\s*false\s*$/m.test(before)) {
+    let approved = before
+    if (/^approved:\s*false\s*$/m.test(approved)) {
       // The holes leave with the flag they were holding down. A plan reading `approved:
       // true` while still listing what it was stopped on cannot be told apart from one a
       // hand flipped — and telling those apart is what build() does with exactly this
@@ -9658,18 +9728,15 @@ function approveSpecs(specs) {
       // Recorded here because this is the only moment anything knows which bytes were judged, and
       // the queue is deleted spec by spec after it. `build` compares against this; a plan approved
       // before the section existed simply has none, and is read as silence rather than tampering.
-      const judged = specs.map((s) => `- ${s}  ${specDigest(readFileSync(join(QUEUE_DIR, s), 'utf8'))}`)
-      const flipped = before
+      approved = approved
         .replace(/^approved:\s*false\s*$/m, 'approved: true')
         .replace(/\n## Undecidable[\s\S]*?(?=\n## |$)/, '\n')
         .replace(/\n## Unclosed[\s\S]*$/, '\n')
-        .split(APPROVED_HEAD)[0].trimEnd()
-      writeFileSync(PLAN, `${flipped}\n\n${APPROVED_HEAD}\n\n${judged.join('\n')}\n`)
-      // What was judged is the specs on disk. Nothing compared them to the task list inside
-      // PLAN.md, so a spec deleted by hand or added by one leaves the flag saying more than
-      // was checked.
-      say(`\n  ${PLAN} — approved: true. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
     }
+    writeFileSync(PLAN, withApprovedDigests(approved, specs))
+    // What was judged is the specs on disk. Nothing compares them to the task list inside
+    // PLAN.md; the digest section therefore records additions and byte changes directly.
+    say(`\n  ${PLAN} — approved: true. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
   }
   say(`\n${specs.length} spec(s), no holes. Ready for: node caw.mjs build`)
   say(`  spent ${formatAccounting(accounting)}`)
@@ -10187,7 +10254,7 @@ function smokeRoles(target) {
           deniedReadPaths: surface.deniedReadPaths,
           ...(reviewer ? { writeBoundary: {
             kind: REVIEW_WRITE_BOUNDARY,
-            readOnlyDependencyRoots: surface.dependencies.map((dependency) => dependency.canonical),
+            readOnlyDependencyRoots: [],
           } } : {}),
         })
     } finally {
