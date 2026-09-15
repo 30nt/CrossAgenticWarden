@@ -36,6 +36,18 @@ A second install splits the finding: the surface is built there too, unasked, bu
 enumerated subtrees, so its two credential files never left. **The behaviour is 2 of 2; the
 exposure is 1 of 2**, and nothing measured yet predicts which shape you get.
 
+### One invalid coverage row discarded a complete paid planning run
+
+Current status: fixed. Architect and plan-reviewer canonical failures now receive one bounded
+repair call with the exact validation path, the original role request, and the complete rejected
+value. A second invalid answer still stops.
+
+Measured on one vendored 0.1.0 install: `ship` enumerated 104 cases, completed one architect pass
+and two plan-review rounds, then stopped because one coverage case appeared twice. No specs were
+written and the role received no diagnostic. The discarded run cost $10.66. The repair path does
+not enumerate again, and 0.2.0's exact population cache also preserves that work across a later
+restart.
+
 ## Current hazards
 
 ### A mutation can be inert without anything noticing

@@ -39,6 +39,8 @@ Target release: **0.2.0**.
   baseline identity across retries and provider changes.
 - Gate timeouts, unavailable verification, stale evidence, interrupted calls, and executor budget
   exhaustion remain distinct states instead of collapsing into success or an ordinary red gate.
+- Architect and plan-reviewer canonical failures receive one bounded repair with the rejected
+  value and exact diagnostic, without repeating independent enumeration.
 
 ## [0.1.0] - 2026-09-03
 

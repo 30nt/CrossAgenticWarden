@@ -149,6 +149,7 @@ const MAX_TASK_ROUNDS = 4 // rounds a task runs before the run stops and asks th
 const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
 const MAX_REVIEW_CHALLENGER_PASSES = 2
 const MAX_REVIEW_SEMANTIC_REPAIRS = 1
+const MAX_PLANNING_CANONICAL_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
 const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
 const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
@@ -3910,8 +3911,20 @@ process.once('exit', (code) => {
   }
 })
 
-function schemaFailure(role, path, message) {
-  die(`${role} returned invalid canonical output at ${path}: ${message}`)
+class CanonicalOutputError extends Error {
+  constructor(role, path, detail, value = null, attemptId = null) {
+    super(`${role} returned invalid canonical output at ${path}: ${detail}`)
+    this.name = 'CanonicalOutputError'
+    this.role = role
+    this.path = path
+    this.detail = detail
+    this.value = value
+    this.attemptId = attemptId
+  }
+}
+
+function schemaFailure(role, path, message, value = null, attemptId = null) {
+  throw new CanonicalOutputError(role, path, message, value, attemptId)
 }
 
 function canonicalIssue(schema, value, path = '$') {
@@ -4489,8 +4502,9 @@ function projectPolicySnapshot() {
 function validateBlockedValue(role, value) {
   if (!Object.prototype.hasOwnProperty.call(value, 'blocked')) return
   const raw = value.blocked.trim()
-  if (raw && !blocked(raw)) throw new Error(
-    `${role} returned invalid canonical output at $.blocked: use the empty string, not a placeholder`)
+  if (raw && !blocked(raw)) {
+    schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder', value)
+  }
 }
 
 function executorClaimsIssue(claims, criteria = [], acceptanceCases = []) {
@@ -5031,12 +5045,18 @@ function agent(role, prompt, schema, f, spec, context = null) {
   if (canonicalProblem) {
     recordMissingEnumeratorPopulation(role, 'response failed schema validation', 'failed')
     recordProviderFailure(role, provider, r, attempt, 'schema-validation', result)
-    schemaFailure(role, canonicalProblem.path, canonicalProblem.message)
+    removeInvocationScratch(invocationScratch)
+    schemaFailure(role, canonicalProblem.path, canonicalProblem.message, result.value, attempt.id)
   }
   try { validateBlockedValue(role, result.value) }
   catch (error) {
     recordMissingEnumeratorPopulation(role, 'response failed blocked-value validation', 'failed')
     recordProviderFailure(role, provider, r, attempt, 'blocked-value-validation', result)
+    removeInvocationScratch(invocationScratch)
+    if (error instanceof CanonicalOutputError) {
+      error.attemptId = attempt.id
+      throw error
+    }
     die(error.message)
   }
   valueRuntime.set(result.value, {
@@ -5068,6 +5088,41 @@ function agent(role, prompt, schema, f, spec, context = null) {
     `${result.durationMs === null ? '?s' : `${(result.durationMs / 1000).toFixed(0)}s`}\n`)
   removeInvocationScratch(invocationScratch)
   return result.value
+}
+
+function planningCanonicalCall(role, prompt, schema, f, validate = null) {
+  let problem = null
+  for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
+    const repairPrompt = repair === 0 ? prompt : [
+      `Canonical repair ${repair} for ${role}.`,
+      '\n\nYour previous response failed the engine canonical validation at ',
+      `${problem.path}: ${problem.detail}.`,
+      '\nReturn one complete replacement value. Preserve every valid task, case, relation, and',
+      ' decision from the rejected value; change only what is required to satisfy that exact',
+      ' diagnostic. Do not return a patch or an explanation.',
+      '\n\nOriginal request to this role:\n\n', prompt,
+      '\n\nRejected canonical value:\n\n', JSON.stringify(problem.value, null, 2),
+    ].join('')
+    let value = null
+    try {
+      value = agent(role, repairPrompt, schema, f)
+      const validation = validate ? validate(value) : null
+      return { value, validation }
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError) || error.role !== role) throw error
+      if (error.value === null) error.value = value
+      if (!error.attemptId && value) error.attemptId = runtimeIdentity(value)?.attempt_id || null
+      problem = error
+    }
+    recordEngineDiagnostic(role, 'canonical-validation', {
+      repair,
+      path: problem.path,
+      message: problem.detail,
+    }, problem.attemptId)
+    if (repair >= MAX_PLANNING_CANONICAL_REPAIRS) throw problem
+    say(`  ${role} canonical inconsistency; retrying once: ${problem.path} ${problem.detail}`)
+  }
+  throw problem
 }
 
 function gateEvidenceId(value, label) {
@@ -6832,7 +6887,7 @@ function plan(description) {
         ' leaves behind, not when `change` mentions it.'
       : ''
 
-    const out = agent('architect', [
+    const architectPrompt = [
       'Request from the human:\n\n' + description,
       '\n\nProfile:\n\n' + text,
       planningIndexBlock,
@@ -6845,11 +6900,12 @@ function plan(description) {
       ' Assign executor_budget small to one bounded local surface, normal to an ordinary feature,',
       ' and large to cross-layer, database, authorization, security, credential, or migration work.',
       ' The engine may raise your proposal to its safety floor and never lowers it.',
-    ].join(''), SCHEMA.plan, f)
+    ].join('')
+    const { value: out, validation: ledger } = planningCanonicalCall(
+      'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
     planProvenance.push({ round, role: 'architect', ...runtimeIdentity(out) })
 
     const budgetSelections = executorBudgetSelections(out.tasks)
-    const ledger = validatePlanRelations(out)
 
     if (blocked(out.blocked)) {
       die(`architect stopped:\n\n${out.blocked}\n\n` +
@@ -6883,7 +6939,7 @@ function plan(description) {
         `provider budget stopped planning before plan-reviewer: ${reviewerBudgetIssue}`,
         population, planProvenance, risk)
     }
-    const r = agent('plan-reviewer', [
+    const planReviewPrompt = [
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
       '\n\nProfile:\n\n' + text,
@@ -6901,11 +6957,13 @@ function plan(description) {
       collisionBlock(collided),
       '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
       ' dimension.',
-    ].join(''), SCHEMA.planReview, f)
+    ].join('')
+    const { value: r } = planningCanonicalCall(
+      'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
+        const issue = planRelationIssue(ledger, value.relations)
+        if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+      })
     planProvenance.push({ round, role: 'plan-reviewer', ...runtimeIdentity(r) })
-
-    const relationProblem = planRelationIssue(ledger, r.relations)
-    if (relationProblem) schemaFailure('plan-reviewer', '$.relations', relationProblem)
 
     // The script derives the verdict from the slots. The reviewer does not get to state one.
     //
@@ -9446,7 +9504,7 @@ function fixSpecs(description, f, text, specs, problems, round) {
     .map((s) => `### .caw-tasks/${s}\n\n${readFileSync(join(QUEUE_DIR, s), 'utf8')}`)
     .join('\n\n')
 
-  const out = agent('architect', [
+  const architectPrompt = [
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
@@ -9463,9 +9521,9 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' tasks unless the task carries a concrete indivisible_reason.',
     ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
     ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
-  ].join(''), SCHEMA.plan, f)
-
-  validatePlanRelations(out)
+  ].join('')
+  const { value: out } = planningCanonicalCall(
+    'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
 
   if (out.blocked) {
     die(`architect stopped while closing holes:\n\n${out.blocked}\n\n` +
@@ -9532,7 +9590,7 @@ function judgeSpecs(description, f, text, population) {
   sayCollisions(collided)
   const ledger = specsPlanningLedger(specs)
 
-  const r = agent('plan-reviewer', [
+  const planReviewPrompt = [
     'Judge these task specs. There is no code for them yet: you are judging the split and its',
     ' coverage. They are already on disk and will be built as they stand unless you name a hole.',
     '\n\nRequest they are meant to satisfy:\n\n' + description,
@@ -9552,10 +9610,12 @@ function judgeSpecs(description, f, text, population) {
     collisionBlock(collided),
     '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
     ' dimension.',
-  ].join(''), SCHEMA.planReview, f)
-
-  const relationProblem = planRelationIssue(ledger, r.relations)
-  if (relationProblem) schemaFailure('plan-reviewer', '$.relations', relationProblem)
+  ].join('')
+  const { value: r } = planningCanonicalCall(
+    'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
+      const issue = planRelationIssue(ledger, value.relations)
+      if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+    })
 
   // The four other slots are built BEFORE the question is raised, so a verdict that stopped
   // the run still shows what else it found. It was paid for either way: the same call fills
