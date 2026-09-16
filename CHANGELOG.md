@@ -47,6 +47,14 @@ Target release: **0.2.0**.
   exhaustion remain distinct states instead of collapsing into success or an ordinary red gate.
 - Architect and plan-reviewer canonical failures receive one bounded repair with the rejected
   value and exact diagnostic, without repeating independent enumeration.
+- A placeholder in an executor's `blocked` field — `""`, `''`, `"none"`, bare `none` — no longer
+  stops the task. Quoting is unwrapped before the field is judged, and for the executor a
+  placeholder is read as not blocked, so the delivery goes on to the gate and the reviewer.
+  Measured: a complete, gate-green delivery returned `blocked` as two quote characters and went to
+  a blocked patch unjudged. Planning roles still refuse a placeholder, quoted or bare, and repair.
+- A real executor stop is retained in Git's private `caw/executor-stops/` with the spec and the full
+  response, and its message names `review <spec>` — which judges the tree as it stands — before any
+  advice that clears the tree.
 - A role contract failure is retained in Git's private `caw/contract-failures/`, outside the
   rotation that sweeps run records and operator logs. It carries the spec or planning request the
   run was about, the rejected value, every repair attempt, and the exact runtime — none of which

@@ -5594,6 +5594,73 @@ const buildOneTask = (f, extraResponses = [], args = ['build'], extraEnv = {}) =
   ], extraEnv)
 }
 
+// Measured on one install: an executor returned `blocked` as exactly two quote characters on a
+// complete, gate-green delivery. The predicate read them as a reason, the branch runs before the
+// gate, and the work went to a blocked patch unjudged. `none` bare used to end the run as a
+// contract failure with no repair, which stops the same delivery by a different road.
+for (const placeholder of ['""', "''", '"none"', 'none', '``']) {
+  test(`an executor placeholder blocker ${JSON.stringify(placeholder)} still sends the delivery to the gate and the reviewer`, () => {
+    const f = fixture({ git: true })
+    mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+    writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+    const result = run(f, ['build'], [
+      { writeFiles: { 'src/output.txt': 'done\n' },
+        envelope: envelope({ ...delivery('did it'), blocked: placeholder }) },
+      { envelope: envelope(verdict()) },
+    ])
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stdout, /executor wrote a placeholder in blocked/)
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /executor stopped/)
+    assert.match(result.stdout, /committed {2}[0-9a-f]{7}/)
+    assert.equal(existsSync(join(f.root, '.git', 'caw', 'executor-stops')), false)
+  })
+}
+
+test('a planning role placeholder blocker in quotes is refused like a bare one', () => {
+  const f = fixture()
+  const result = run(f, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), blocked: '""' }) },
+    { envelope: envelope({ ...plan(), blocked: '""' }) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /\$\.blocked: use the empty string/)
+})
+
+test('a real executor stop is retained outside rotation and offers review before clearing', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const specText = '---\ntitle: Task\n---\n\nDo it.\n'
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), specText)
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'partial\n' },
+      envelope: envelope({ ...delivery('stopped'), blocked: 'the spec contradicts itself' }) },
+  ])
+  assert.equal(result.status, 1)
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.match(output, /executor stopped/)
+  // The command that keeps the tree comes before the advice that clears it.
+  const reviewAt = output.indexOf('node caw.mjs review 001_task.md')
+  const clearAt = output.indexOf('<clear the tree, fix the spec>')
+  assert.ok(reviewAt > 0 && clearAt > reviewAt, output)
+
+  const root = join(f.root, '.git', 'caw', 'executor-stops')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+  assert.equal(record.reason, 'the spec contradicts itself')
+  assert.equal(record.task, '001_task.md')
+  assert.equal(record.spec, specText)
+  assert.equal(JSON.parse(record.response).blocked, 'the spec contradicts itself')
+  assert.match(record.blocked_patch || '', /blocked-001_task/)
+  assert.match(output, /full response is retained at/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  rmSync(join(f.root, '.caw-logs', runName), { recursive: true, force: true })
+  const listed = run(f, ['artifacts', 'list'], [])
+  assert.match(listed.stdout, new RegExp(`executor-stops/${names[0]}`))
+})
+
 test('build wakes an executor only after the same delivery makes the gate red twice', () => {
   const gateFast = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');const ok=f.readFileSync('src/output.txt','utf8').includes('fixed');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
