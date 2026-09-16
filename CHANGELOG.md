@@ -47,6 +47,14 @@ Target release: **0.2.0**.
   exhaustion remain distinct states instead of collapsing into success or an ordinary red gate.
 - Architect and plan-reviewer canonical failures receive one bounded repair with the rejected
   value and exact diagnostic, without repeating independent enumeration.
+- A reviewer is shown the engine-owned surface and transition ids every blocking finding must
+  name. They are derived content hashes that appeared in no form the role read, so only a
+  REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
+  Measured on one install, a correct finding about a real defect ended a run as an engine
+  diagnostic instead of a verdict.
+- A non-met criterion whose blocking item does not quote it now names the exact text to quote.
+  The repair call hands back the rejected value, and the rule alone told a role that believed it
+  had quoted the criterion nothing it could act on; the failure survived its own repair twice.
 - The queue guard no longer withdraws an approved plan over a call that never wrote to the queue.
   A write verb and a queue path are paired per statement, following one hop of binding, and the
   bytes a program writes are excluded from both halves — instead of matching anywhere in one

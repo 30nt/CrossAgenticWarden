@@ -369,6 +369,33 @@ function buildTaskDossier({
   }
 }
 
+// Criteria have had this since the census existed; surfaces and transitions never did. A
+// transition's id is a content hash — `transition-<12 hex>` from extractTaskTopology — and it
+// appears nowhere a reviewer reads: the spec's own `## State machines` section renders
+// `- `from` -- event --> `to`` with no id at all, and the only place the ids exist is the
+// dossier's `contract` JSON blob, under a 24 KiB cap.
+//
+// Measured on one install: asked for `transition_ids` and shown no ids, a reviewer built one out
+// of the readable form — `check-d-header-doc:<from>-><to>` — naming a transition that really does
+// exist in the spec. That is a contract the prompt did not state, not a hallucination.
+//
+// The blast radius is asymmetric, which is what makes it worth fixing rather than documenting.
+// reviewContractIssue walks the blocking slots only, so an approval with empty slots is never
+// asked for a transition id and serializes fine, while a REJECTION must produce one. The role
+// could express approval and not rejection — and a delivery with a real defect ended the run
+// with an engine diagnostic instead of a readable finding.
+function renderTaskTopology(topology) {
+  const surfaces = (topology?.surfaces || []).map((surface) =>
+    `- ${surface.id} — ${surface.responsibility}`)
+  const transitions = (topology?.transitions || []).map((row) =>
+    `- ${row.id} [${row.surface}] ${row.from} -- ${row.event} --> ${row.to}`)
+  if (!surfaces.length && !transitions.length) return '(this task declares no topology)'
+  return [
+    ...(surfaces.length ? ['Surfaces:', ...surfaces] : []),
+    ...(transitions.length ? ['', 'Transitions:', ...transitions] : []),
+  ].join('\n')
+}
+
 function renderReviewCriteria(spec, additional = []) {
   const criteria = [...extractReviewCriteria(spec), ...additional]
   return criteria.length
@@ -412,7 +439,12 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = [], priorOpen = [
         [item?.evidence, disposition?.evidence].some((evidence) => evidence?.includes(criterion))
     })
     if (!newItemQuotes && !openCarriedQuotes) {
-      return `${row.id} is ${row.state} but no ${slot} item quotes its exact criterion`
+      // The text itself, not just the rule. The repair call hands back the rejected value and
+      // this message, and "quotes its exact criterion" tells a role that already believed it had
+      // quoted it nothing it can act on. Measured on one install, this failure survived its own
+      // repair twice. What the check compares is a plain substring, so naming it is sufficient.
+      return `${row.id} is ${row.state} but no ${slot} item quotes its exact criterion; ` +
+        `one ${slot} item's evidence must contain this text verbatim: ${JSON.stringify(criterion)}`
     }
   }
 
@@ -9041,6 +9073,10 @@ function runTask(file, f, profileText, opts = {}) {
         ' stable property_key. Use empty surface/transition arrays only when the contract has no',
         ' applicable topology. Repeated symptoms share a work package only when all these stable',
         ' links and property_key match; similar prose or a shared file is not enough.',
+        '\n\nThe engine-owned surface and transition ids, which are the only values those two',
+        ' arrays accept. A transition id is opaque and derived; it is not the arrow you read in',
+        ' the spec, and it cannot be composed from the state names:\n\n' +
+          renderTaskTopology(topology),
         projectReviewInstructions,
         '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
           ` baseline is commit ${passBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
