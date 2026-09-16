@@ -110,6 +110,33 @@ express it. It is not built because it needs measuring first: the gate runs insi
 boundary, and a gate that takes an index lock or stashes would break. The falsifier is "denying
 `.git` writes to the executor breaks no gate the manual's own rules permit".
 
+### An executor undoing its own probe with git destroys the task it is delivering
+
+Measured across two queues on one install — a ten-task queue and a six-task one — by reading
+every `git checkout --` in `.caw-tasks/notes.log`: **four incidents, three in the first queue and
+one in the second.** All four are one shape. The executor breaks the code its new test covers, to
+see the test go red, then undoes the probe with `git checkout -- <file>`. On a build tree that
+command does not undo the probe: it restores the file to `HEAD` and discards the task's entire
+uncommitted delivery for that file. One lost 114 lines; another dropped 83 of 107 tests in the
+file back to red.
+
+The executor is the one role that always works on a dirty tree, so this is not a mistake a
+careful executor avoids — the tool's safe reading is false in exactly the place that role stands.
+Reviewers run the same probes and lose nothing: their surface is a clone at a committed baseline,
+where the command means what it says. **The asymmetry is the finding.**
+
+`.caw/agents/executor.md` now names `git checkout --`, `git restore`, `git stash` and `git reset`
+as things that role never undoes anything with, tells it to use the inverse `Edit` or a copy
+aside instead, and to check `git status --short -- <path>` at the point of the command rather
+than from something read earlier in the conversation. That is prose, and prose is a preference —
+the same limit as the hazard above, with the same shape of fix available and unbuilt.
+
+**All four were self-reported**, counted from notes the roles chose to write, so the rate is
+unknown and the floor is four. Every one reports a successful reconstruction from an earlier read
+in the same session, each verified by the role against a `git diff --stat` it had seen before —
+that is a role checking its own memory, not an independent record. No fourth party saw the
+original bytes. The fifth will be the one that is not recovered.
+
 ## Limits that are not hazards
 
 - **The request is the only input nothing checks.** The engine refuses a case the enumerator

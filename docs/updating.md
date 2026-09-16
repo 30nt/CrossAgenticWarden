@@ -35,6 +35,25 @@ The engine and adapter digests are part of role-smoke identity. After committing
 `node caw.mjs smoke all` when the project enables `require_role_smoke`; old model-path evidence is
 intentionally stale even when `runtime.json` did not change.
 
+### Migrating the gate to evidence manifests — coming from 0.1.0
+
+**The engine changed; your gate did not.** A 0.1.0 gate answers with an exit code alone. From
+0.2.0 an architect writes `## Required gate checks` into task specs, and a task declaring one is
+not satisfied by a green exit: the gate must also write a version-1 manifest naming each declared
+id as passed. The ids arrive in `CAW_GATE_REQUIRED_CHECKS`, one per line, beside the output path
+in `CAW_GATE_EVIDENCE_OUT`. The shape is in the `## Structured evidence` section of
+[gate.md](gate.md), and emitting **more** checks than were declared is refused just as emitting
+none is — so read that section rather than guessing.
+
+Measured on one install that did not do this: the first build stopped at
+`green gate produced no evidence manifest for required task checks`, over a green gate with 985
+tests passing. It reads as a defect in the pipeline rather than as an un-migrated contract. The
+engine now asks the gate this question once, before any executor runs, and refuses for nothing
+instead of after $1.55 of executor work and the tree it produced — but the migration is still
+yours to do, and doing it before the first build is cheaper than reading that refusal.
+
+Nothing is needed if your specs declare no required checks. The engine says which tasks do.
+
 If your project patched the engine, mark each patch with a `LOCAL CHANGE` comment at its site
 and run `grep -rn 'LOCAL CHANGE' caw.mjs .caw/` **before** copying, not after: the point is to
 make re-application a list rather than a memory. A local change that survives two updates is

@@ -5651,6 +5651,147 @@ task_key: stable-output-authority
   assert.equal(readFileSync(keyLog, 'utf8'), 'stable-output-authority')
 })
 
+// The gate used to be handed the output path and nothing else, so the only way to emit a
+// conforming manifest was to re-derive the contract — one install parsed `## Required gate
+// checks` out of CAW_SPEC, which is correct and invisible. A gate emitting MORE than was asked
+// for is refused exactly like one emitting nothing, so the contract has to arrive with the path.
+test('the gate is told which check ids are required and against what they are judged', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { readFileSync, writeFileSync } from 'node:fs'
+writeFileSync(process.env.CAW_CONTRACT_LOG, JSON.stringify({
+  required: process.env.CAW_GATE_REQUIRED_CHECKS,
+  contract: JSON.parse(readFileSync(process.env.CAW_GATE_CONTRACT, 'utf8')),
+}))
+// Emit exactly what the engine asked for, derived from the engine's own list rather than
+// from the spec. This is the shape the export exists to make writable.
+const ids = process.env.CAW_GATE_REQUIRED_CHECKS.split('\\n').filter(Boolean)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks: ids.map((id) => ({
+  id, criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'required check passed', artifacts:[]
+}))}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add contract-reading gate'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '019_contract.md'), `---
+title: Task
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+- \`tier-output\` — second required proof
+
+## Done when
+- The fixture output exists.
+`)
+  const contractLog = join(f.parent, 'gate-contract.json')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ], { CAW_CONTRACT_LOG: contractLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+
+  const seen = JSON.parse(readFileSync(contractLog, 'utf8'))
+  // The plain list is what a shell gate loops over with no dependency at all.
+  assert.equal(seen.required, 'focused-output\ntier-output')
+  assert.equal(seen.contract.version, 1)
+  assert.equal(seen.contract.task, '019_contract.md')
+  assert.equal(seen.contract.kind, 'fast')
+  assert.deepEqual(seen.contract.required_check_ids, ['focused-output', 'tier-output'])
+  // A check MAY link a criterion instead of being required, and cannot guess the engine's
+  // stable ids — so the census travels with the list.
+  assert.deepEqual(seen.contract.criteria, [
+    { id: 'done-when-1', section: 'Done when', criterion: 'The fixture output exists.' },
+  ])
+  assert.deepEqual(seen.contract.acceptance_cases, [])
+})
+
+// The install this is written for updated from 0.1.0: its gate predates evidence manifests, its
+// new architect declares required checks, and the two met after an executor round had been paid
+// for. The refusal has to arrive before the provider does.
+test('a gate that writes no evidence manifest is refused before any executor runs', () => {
+  const f = fixture({ git: true, gateFast: 'node -e "process.exit(0)"' })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '020_unmigrated.md'), `---
+title: Task
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`)
+  // No provider responses are queued: reaching one would itself be the failure.
+  const result = run(f, ['build'], [])
+
+  assert.notEqual(result.status, 0)
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.match(output, /declare '## Required gate checks'/)
+  assert.match(output, /no evidence manifest to CAW_GATE_EVIDENCE_OUT/)
+  assert.match(output, /020_unmigrated\.md/)
+  // The point of the check is where it happens, not that it happens.
+  assert.doesNotMatch(output, /green gate produced no evidence manifest/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal((manifest.calls || []).length, 0, 'no provider call may precede this refusal')
+})
+
+test('the contract preflight is paid once per gate, not once per build', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { appendFileSync, writeFileSync } from 'node:fs'
+appendFileSync(process.env.CAW_GATE_RUN_LOG, process.env.CAW_GATE_EVIDENCE_OUT + '\\n')
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add manifest-writing gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+
+  const spec = (n) => `---
+title: Task ${n}
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`
+  const responses = (n) => [
+    { writeFiles: { [`src/output-${n}.txt`]: 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ]
+
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '021_first.md'), spec(1))
+  const first = run(f, ['build'], responses(1), { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`)
+  const afterFirst = readFileSync(runLog, 'utf8').split('\n').filter(Boolean).length
+
+  writeFileSync(join(f.root, '.caw-tasks', '022_second.md'), spec(2))
+  const second = run(f, ['build'], responses(2), { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`)
+  const afterSecond = readFileSync(runLog, 'utf8').split('\n').filter(Boolean).length
+
+  assert.match(first.stdout, /gate evidence contract/)
+  // The second build asks nothing: same gate, same engine, same profile.
+  assert.doesNotMatch(second.stdout, /gate evidence contract/)
+  assert.equal(afterFirst, 2, 'the first build pays one preflight plus the task gate')
+  assert.equal(afterSecond - afterFirst, 1, 'the second build pays only the task gate')
+})
+
 test('a configured gate_full runs once at the end of a build and reports green', () => {
   const f = fixture({ git: true, gateFull: 'node -e "process.exit(0)"' })
   const result = buildOneTask(f)
