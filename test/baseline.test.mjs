@@ -21,8 +21,9 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  adapterImplementationDigest, groupFindings, mergeReviewPasses, planningLedger, populationBlock,
-  providerLaunch, readProjectPolicies, resolvePopulation,
+  adapterImplementationDigest, extractTaskTopology, groupFindings, mergeReviewPasses,
+  planningLedger, populationBlock,
+  providerLaunch, readProjectPolicies, resolvePopulation, reviewCriteriaIssue,
   resolvePopulationSource, retainWeakVerificationEvents, taskEvidenceLifecycleBlock,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -5739,6 +5740,93 @@ title: Task
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
   assert.equal((manifest.calls || []).length, 0, 'no provider call may precede this refusal')
+})
+
+// A reviewer is required to name transition_ids on every blocking finding, and the ids are
+// content hashes that appear in no form it reads: the spec renders arrows, not ids. Measured on
+// one install, the role answered with `<surface>:<from>-><to>` over a transition that really
+// exists. Only a REJECTION is asked for them — reviewContractIssue walks the blocking slots —
+// so the role could approve and could not reject, and a real defect ended the run as an engine
+// diagnostic instead of a finding.
+test('the reviewer is shown the engine-owned surface and transition ids it must name', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  // Two surfaces, and the second carries TWO transitions that share a state name. A
+  // one-transition surface cannot measure this fix: `<surface>:<from>-><to>` is unambiguous
+  // there, so a composed id still reads as the right one. The shape below is taken from the
+  // install that reported it, where one surface hops A->B and then B->C.
+  const specText = [
+    '---', 'title: Topology', '---', '',
+    '## Surfaces',
+    '- `check-d-header-doc` — the dated measurement header',
+    '- `onboarding-step-extraction` — the step enum and its registration', '',
+    '## State machines',
+    '- `check-d-header-doc`: states `undated-restatement`, `dated-with-listing`',
+    '  - `undated-restatement` -- attach the ticket listing --> `dated-with-listing`',
+    '- `onboarding-step-extraction`: states `inline`, `registered`, `partition-confirmed`',
+    '  - `inline` -- cut the enum into its own file --> `registered`',
+    '  - `registered` -- re-check the counterfactual patches --> `partition-confirmed`', '',
+    '## Done when',
+    '- The header carries its original date.', '',
+  ].join('\n')
+  writeFileSync(join(f.root, '.caw-tasks', '023_topology.md'), specText)
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '023_topology.md'], [
+    {
+      // The reviewer cannot write outside its surface, so what CAW sent it comes back in `noted`.
+      echoPromptMatch: 'transition-[0-9a-f]{12}|Transitions:|check-d-header-doc'
+        + '|onboarding-step-extraction',
+      envelope: envelope(verdict({ criteria: [{
+        id: 'done-when-1', state: 'met', evidence: 'read the header',
+        evidence_refs: ['repository:delivery.txt'],
+      }] })),
+    },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+
+  const topology = extractTaskTopology(specText)
+  assert.equal(topology.transitions.length, 3)
+  // The ids are derived, so the test takes them from the engine rather than restating hashes.
+  for (const row of topology.transitions) assert.match(row.id, /^transition-[0-9a-f]{12}$/)
+  const sharedSurface = topology.transitions
+    .filter((row) => row.surface === 'onboarding-step-extraction')
+  assert.equal(sharedSurface.length, 2, 'the ambiguous case needs two hops on one surface')
+  assert.notEqual(sharedSurface[0].id, sharedSurface[1].id)
+
+  const echo = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-prompt-echo:'))
+  assert.ok(echo, 'the reviewer pass recorded no prompt echo')
+  const seen = JSON.parse(echo.slice('fake-prompt-echo:'.length))
+  // Every one of them, not just the first: a reviewer picking between two hops on one surface
+  // is exactly where a composed `<surface>:<from>-><to>` stays plausible and means nothing.
+  for (const row of topology.transitions) {
+    assert.ok(seen.includes(row.id),
+      `the reviewer prompt must carry ${row.id} (${row.surface}); saw ${echo}`)
+  }
+  assert.ok(seen.includes('check-d-header-doc'), 'and the surface ids beside them')
+  assert.ok(seen.includes('onboarding-step-extraction'))
+  // The arrow form alone is what produced the composed id; it must not be the only rendering.
+  assert.ok(seen.includes('Transitions:'))
+})
+
+test('a non-met criterion names the exact text its blocking item has to quote', () => {
+  const spec = [
+    '## Done when',
+    '- The header carries its original date.',
+  ].join('\n')
+  const verdictValue = {
+    criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'the header was rewritten' }],
+    broken: [{ evidence: 'the header lost its date' }],
+    uncovered: [], weak: [], carried: [],
+  }
+
+  const issue = reviewCriteriaIssue(spec, verdictValue.criteria, verdictValue)
+
+  // Without the text, a role that believes it already quoted the criterion learns nothing from
+  // its repair call. Measured: this failure survived its own repair twice on one install.
+  assert.match(issue, /must contain this text verbatim/)
+  assert.ok(issue.includes('The header carries its original date.'))
 })
 
 test('the contract preflight is paid once per gate, not once per build', () => {

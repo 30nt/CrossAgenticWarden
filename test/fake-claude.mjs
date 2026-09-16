@@ -78,6 +78,15 @@ if (next.probeWrites) {
   next.writeFiles = { ...(next.writeFiles || {}), [inside]: sentinel, [outside]: sentinel }
   next.ignoreWriteErrors = true
 }
+// A reviewer is confined to its isolated surface, so its append to the calls log is denied and
+// swallowed above: the prompt CAW sent that role reaches no test through `CAW_FAKE_CALLS`.
+// Anything a test needs to assert about it has to travel back inside the verdict, which is the
+// route `probeGateArtifacts` already takes.
+if (next.echoPromptMatch) {
+  const value = next.envelope?.structured_output ?? next.structured_output ?? next
+  const found = input.match(new RegExp(next.echoPromptMatch, 'g')) || []
+  value.noted = [...(value.noted || []), `fake-prompt-echo:${JSON.stringify(found)}`]
+}
 if (next.probeReads) {
   const value = next.envelope?.structured_output ?? next.structured_output ?? next
   value.observed_nonce = readFileSync(resolve(process.cwd(), 'README.md'), 'utf8')
