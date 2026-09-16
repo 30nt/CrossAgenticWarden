@@ -166,7 +166,8 @@ A run stopped by a role returning invalid canonical output never reaches a commi
 that normally carries a task — the public commit with its spec verbatim, the private audit —
 is written. That failure is retained on its own under Git's private `caw/contract-failures/`,
 with the spec or request, the rejected value, the repair attempts and the exact runtime, and it
-is not swept by the rotation that keeps the newest twenty run records. `artifacts list` shows it.
+is not swept by the rotation that keeps the newest twenty run records. An executor that stops on
+`blocked` is retained the same way under `caw/executor-stops/`. `artifacts list` shows both.
 
 `ls .caw-tasks/` is the queue. A task commit stays public and compact; its `CAW-Audit` digest
 points to the complete private record under Git's `caw/audit/` path. That record keeps the spec,

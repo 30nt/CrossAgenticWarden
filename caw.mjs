@@ -1843,8 +1843,23 @@ const NO_BLOCK = new Set([
   'nothing blocked', 'nothing blocked me', 'nothing to report', 'nothing blocked this',
   'ok', 'done', 'completed', 'complete', 'success',
 ])
+// Quoting is unwrapped before anything is judged. A role writing `""` for "nothing" is writing
+// the empty string in the notation it was thinking in, not a reason, and neither is `"none"`.
+// Measured on one install: an executor returned `blocked` as exactly two quote characters on a
+// complete delivery whose gate was green — status success, terminal_reason completed, summary,
+// claims and notes all present — and this predicate read those two characters as a reason. The
+// branch it guards runs before the gate, so the delivery went to a blocked patch with no gate
+// and no reviewer, under a message telling the operator to clear the tree.
+const unquotedBlocker = (s) => {
+  let t = String(s || '').trim()
+  for (;;) {
+    const m = t.match(/^(["'`])([\s\S]*)\1$/)
+    if (!m) return t
+    t = m[2].trim()
+  }
+}
 const blocked = (s) => {
-  const t = (s || '').trim().toLowerCase().replace(/[.!]+$/, '').replace(/\s+/g, ' ')
+  const t = unquotedBlocker(s).toLowerCase().replace(/[.!]+$/, '').replace(/\s+/g, ' ')
   return t && !/^[-\u2013\u2014]+$/.test(t) && !NO_BLOCK.has(t) ? s : ''
 }
 
@@ -3023,20 +3038,45 @@ function contractFailureRuntime(role) {
   }
 }
 
-function recordContractFailure(error) {
-  if (!(error instanceof CanonicalOutputError)) return null
+// One writer for the records that outlive the rotation: a stopped run's only durable trace.
+// A repository this cannot reach is one where the refusal still has to print, so every failure
+// here returns null rather than becoming the reason the operator never sees what stopped the run.
+function retainStopRecord(directory, label, body) {
   let root
-  // A repository this cannot reach is one where the refusal still has to print. Never let the
-  // record-keeping become the reason the operator does not see what stopped the run.
-  try { root = gitPrivatePath('caw', 'contract-failures') } catch { return null }
+  try { root = gitPrivatePath('caw', directory) } catch { return null }
   try {
     mkdirSync(root, { recursive: true, mode: 0o700 })
+    const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+    if (bytes.length > CONTRACT_FAILURE_MAX) return null
+    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+    const stamp = body.created_at.replace(/[-:.]/g, '')
+    const target = join(root, `${stamp}-${label}-${digest}.json`)
+    const temp = `${target}.tmp-${process.pid}`
+    writeFileSync(temp, bytes, { mode: 0o600 })
+    renameSync(temp, target)
+    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+    return target
+  } catch { return null }
+}
+
+function activeSpecRecord() {
+  const spec = activeTaskContract?.spec
+    ? boundedUtf8(activeTaskContract.spec, CONTRACT_FAILURE_SPEC_MAX)
+    : null
+  return {
+    task: activeTaskContract?.task || null,
+    request: activeRequest,
+    spec: spec?.text ?? null,
+    spec_truncated: spec?.truncated ?? false,
+  }
+}
+
+function recordContractFailure(error) {
+  if (!(error instanceof CanonicalOutputError)) return null
+  try {
     const rejected = boundedUtf8(
       error.value === undefined ? 'undefined' : JSON.stringify(error.value, null, 2) ?? 'null',
       CONTRACT_FAILURE_VALUE_MAX)
-    const spec = activeTaskContract?.spec
-      ? boundedUtf8(activeTaskContract.spec, CONTRACT_FAILURE_SPEC_MAX)
-      : null
     const body = {
       version: 1,
       created_at: new Date().toISOString(),
@@ -3046,11 +3086,8 @@ function recordContractFailure(error) {
       detail: error.detail,
       attempt_id: error.attemptId || null,
       runtime: contractFailureRuntime(error.role),
-      task: activeTaskContract?.task || null,
-      request: activeRequest,
       // The spec, verbatim, because the commit that would have carried it never happened.
-      spec: spec?.text ?? null,
-      spec_truncated: spec?.truncated ?? false,
+      ...activeSpecRecord(),
       rejected_value: rejected.text,
       rejected_value_truncated: rejected.truncated,
       // Every repair attempt this run already recorded for the role, so a failure that survived
@@ -3060,16 +3097,36 @@ function recordContractFailure(error) {
       // Where the transcript still is, for as long as the rotation above leaves it there.
       run_record: runRecord?.path || null,
     }
-    const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
-    if (bytes.length > CONTRACT_FAILURE_MAX) return null
-    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
-    const stamp = body.created_at.replace(/[-:.]/g, '')
-    const target = join(root, `${stamp}-${error.role}-${digest}.json`)
-    const temp = `${target}.tmp-${process.pid}`
-    writeFileSync(temp, bytes, { mode: 0o600 })
-    renameSync(temp, target)
-    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
-    return target
+    return retainStopRecord('contract-failures', error.role, body)
+  } catch { return null }
+}
+
+// An executor that stops on `blocked` returned a VALID response, so the contract-failure record
+// above never sees it — and it is the same kind of loss. The task does not commit, the reason is
+// printed once, and the only structured copy of what the role said is the run record under the
+// newest-twenty rotation. Measured on one install, that copy was the only evidence that settled
+// whether a misrouted delivery was a real blocker or two quote characters, and it was found by
+// knowing where to look rather than by being told.
+function recordExecutorStop(ex, kept) {
+  try {
+    const value = boundedUtf8(JSON.stringify(ex, null, 2) ?? 'null', CONTRACT_FAILURE_VALUE_MAX)
+    const body = {
+      version: 1,
+      created_at: new Date().toISOString(),
+      command: providerBudgetState.command || null,
+      role: 'executor',
+      reason: ex?.blocked ?? null,
+      attempt_id: runtimeIdentity(ex)?.attempt_id || null,
+      runtime: contractFailureRuntime('executor'),
+      ...activeSpecRecord(),
+      response: value.text,
+      response_truncated: value.truncated,
+      blocked_patch: kept?.path || null,
+      blocked_patch_unverified: kept?.unverified || null,
+      run_id: runRecord?.id || null,
+      run_record: runRecord?.path || null,
+    }
+    return retainStopRecord('executor-stops', 'executor', body)
   } catch { return null }
 }
 
@@ -4672,9 +4729,22 @@ function projectPolicySnapshot() {
 function validateBlockedValue(role, value) {
   if (!Object.prototype.hasOwnProperty.call(value, 'blocked')) return
   const raw = value.blocked.trim()
-  if (raw && !blocked(raw)) {
-    schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder', value)
+  if (!raw || blocked(raw)) return
+  // The executor is the one role whose output is not its words. Its delivery is in the tree, and
+  // the gate and the reviewer exist to judge it; refusing the whole call over the notation of an
+  // empty field would stop exactly the work this field is meant to let through — a contract
+  // failure there has no repair, so it ends the run as surely as the misread blocker did. The
+  // placeholder is normalised, said out loud, and recorded, and the delivery goes on to be judged.
+  if (role === 'executor') {
+    say(`  executor wrote a placeholder in blocked (${JSON.stringify(value.blocked)}); ` +
+      'reading it as not blocked, so the delivery goes to the gate and the reviewer')
+    try {
+      recordEngineDiagnostic(role, 'blocked-placeholder', { value: boundedUtf8(value.blocked, 256).text })
+    } catch { /* the delivery must still be judged when the run record cannot be written */ }
+    value.blocked = ''
+    return
   }
+  schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder', value)
 }
 
 function executorClaimsIssue(claims, criteria = [], acceptanceCases = []) {
@@ -8937,15 +9007,25 @@ function runTask(file, f, profileText, opts = {}) {
 
       if (blocked(ex.blocked)) {
         const kept = keepBlocked(file)
-        die(`${file} — executor stopped:\n\n${ex.blocked}\n\n` +
+        const stopRecord = recordExecutorStop(ex, kept)
+        die(`${file} — executor stopped:\n\n${JSON.stringify(ex.blocked)}\n\n` +
+            (stopRecord ? `  The full response is retained at ${stopRecord}.\n` : '') +
             (kept.path
               ? `  Its work is in the tree and a copy is at ${kept.path}.\n` +
                 (kept.unverified
                   ? `  THAT COPY DID NOT VERIFY: git apply --check --reverse says "${kept.unverified}".\n` +
                     `  So it may not restore what is in the tree. Copy the tree out by hand as well.\n`
                   : '') +
-                `  NOTHING JUDGED IT — no gate ran on it and no reviewer saw it, so it is a\n` +
-                `  starting point, not a delivery. build refuses a dirty tree, so to run again:\n` +
+                `  NOTHING JUDGED IT — no gate ran on it and no reviewer saw it.\n` +
+                // Before any advice that removes the tree. Measured on one install: a complete,
+                // gate-green delivery arrived here, and following the next lines literally would
+                // have thrown away 117 lines that later passed five review rounds and committed.
+                // What saved it was looking at the tree first, so the command that judges the
+                // tree as it stands is named first.
+                `  Read the tree before anything else. If the work there is complete despite the\n` +
+                `  reason above, judge it as it stands — nothing is cleared:\n` +
+                `    node caw.mjs review ${file} > ${LOG_DIR}/review-$(date +%H%M%S).log 2>&1\n` +
+                `  If the reason is real, build refuses a dirty tree, so to run again:\n` +
                 `    cp ${kept.path} ..            # 'git clean' would take it with the tree\n` +
                 `    <clear the tree, fix the spec>\n` +
                 `    git apply ../${kept.path.split('/').pop()}   # from the repository root\n`
@@ -10596,13 +10676,15 @@ function artifacts(args) {
     // purgeable here, for the same reason the task audit is not — it is the durable record, and
     // in the failure case it is the only copy of the spec or request the run was about.
     let failures = []
-    try {
-      const root = gitPrivatePath('caw', 'contract-failures')
-      if (existsSync(root)) {
-        failures = readdirSync(root).filter((name) => name.endsWith('.json'))
-          .map((name) => `contract-failures/${name}`).sort()
-      }
-    } catch { /* outside a repository there is no private path to read */ }
+    for (const directory of ['contract-failures', 'executor-stops']) {
+      try {
+        const root = gitPrivatePath('caw', directory)
+        if (existsSync(root)) {
+          failures.push(...readdirSync(root).filter((name) => name.endsWith('.json'))
+            .map((name) => `${directory}/${name}`).sort())
+        }
+      } catch { /* outside a repository there is no private path to read */ }
+    }
     say(`artifacts:\n${[...local, ...probes, ...surfaces, ...transports, ...failures]
       .map((name) => `  ${name}`).join('\n') || '  (none)'}`)
     return
