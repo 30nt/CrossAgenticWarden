@@ -162,6 +162,12 @@ node caw.mjs verify-project          # validate project policy extensions
 node caw.mjs artifacts list          # retained run/recovery/probe/transport artifacts
 ```
 
+A run stopped by a role returning invalid canonical output never reaches a commit, so nothing
+that normally carries a task — the public commit with its spec verbatim, the private audit —
+is written. That failure is retained on its own under Git's private `caw/contract-failures/`,
+with the spec or request, the rejected value, the repair attempts and the exact runtime, and it
+is not swept by the rotation that keeps the newest twenty run records. `artifacts list` shows it.
+
 `ls .caw-tasks/` is the queue. A task commit stays public and compact; its `CAW-Audit` digest
 points to the complete private record under Git's `caw/audit/` path. That record keeps the spec,
 notes, certification, policy identity, reviewed delivery digest and staged tree after the queue

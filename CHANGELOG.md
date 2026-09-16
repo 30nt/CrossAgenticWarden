@@ -47,6 +47,11 @@ Target release: **0.2.0**.
   exhaustion remain distinct states instead of collapsing into success or an ordinary red gate.
 - Architect and plan-reviewer canonical failures receive one bounded repair with the rejected
   value and exact diagnostic, without repeating independent enumeration.
+- A role contract failure is retained in Git's private `caw/contract-failures/`, outside the
+  rotation that sweeps run records and operator logs. It carries the spec or planning request the
+  run was about, the rejected value, every repair attempt, and the exact runtime — none of which
+  survived before, because a task stopped this way never commits and the audit is written at the
+  commit. `caw.mjs artifacts list` shows them.
 - A reviewer is shown the engine-owned surface and transition ids every blocking finding must
   name. They are derived content hashes that appeared in no form the role read, so only a
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.

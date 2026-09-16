@@ -2970,6 +2970,109 @@ function finalizeTaskAudit(audit, commitHash) {
   return target
 }
 
+// A role returning invalid canonical output is the one event this engine keeps nothing about.
+// Everything durable a task produces is written at its commit: the public commit carries the
+// spec verbatim, and writeTaskAudit above carries the private record. A task stopped by a
+// contract failure reaches neither. What holds the diagnostic is the run record and the
+// `.caw-logs/` transcript, and both are swept by the same newest-twenty rotation —
+// pruneRunRecords keeps 20 or 30 days, the operator log guard keeps 20, and what survives that
+// is compactRunMetrics, which is payload-free counters with no path, message, role contract or
+// rejected value anywhere in it.
+//
+// Measured on one install: a Codex executor stopped a task at `$.claims: backlog-verify-002
+// names unknown acceptance case id(s): plan-case-807ef9c3078b`. Neither the spec slug nor that
+// case id exists anywhere in that repository's history — the task never committed, so the rule
+// that a spec lives verbatim in the commit that built it never engaged, and the spec was gone
+// from the queue. The log holding the diagnostic sat at position 20 of 22, one pipeline run
+// from deletion, and was rescued by hand. A failure nobody can re-derive cannot be fixed
+// against: a later run of the same backlog item draws different case ids and need not
+// reproduce it at all.
+//
+// So this is written beside the audit rather than inside the run record it would die with, and
+// it carries the spec, because the spec is the thing that dies first.
+const CONTRACT_FAILURE_MAX = 4 * 1024 * 1024
+const CONTRACT_FAILURE_VALUE_MAX = 1024 * 1024
+const CONTRACT_FAILURE_SPEC_MAX = 1024 * 1024
+
+// Which spec is in flight, so the record can carry it. Planning failures have no task and say
+// so rather than guessing one from a queue they were about to write.
+let activeTaskContract = null
+// A planning failure has no spec to lose and loses the request instead: `plan` writes nothing
+// until the architect and plan-reviewer both return, so a role contract failure there leaves
+// the queue empty and the request only in a terminal. Measured on another install at $6.04.
+let activeRequest = null
+
+function setActiveTaskContract(task) {
+  if (!task) { activeTaskContract = null; return }
+  let spec = null
+  try { spec = taskSpecText(task) } catch { spec = null }
+  activeTaskContract = { task, spec }
+}
+
+function contractFailureRuntime(role) {
+  if (!resolvedRuntime?.value?.roles?.[role]) return null
+  const binding = resolvedRuntime.value.roles[role]
+  const provider = resolvedRuntime.providers?.get(binding.provider) || null
+  return {
+    runtime_digest: resolvedRuntime.digest || null,
+    provider: binding.provider,
+    model: binding.model,
+    reasoning: binding.reasoning,
+    adapter_digest: provider?.adapter?.implementationDigest || null,
+    cli_version: provider?.cliVersion || null,
+  }
+}
+
+function recordContractFailure(error) {
+  if (!(error instanceof CanonicalOutputError)) return null
+  let root
+  // A repository this cannot reach is one where the refusal still has to print. Never let the
+  // record-keeping become the reason the operator does not see what stopped the run.
+  try { root = gitPrivatePath('caw', 'contract-failures') } catch { return null }
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const rejected = boundedUtf8(
+      error.value === undefined ? 'undefined' : JSON.stringify(error.value, null, 2) ?? 'null',
+      CONTRACT_FAILURE_VALUE_MAX)
+    const spec = activeTaskContract?.spec
+      ? boundedUtf8(activeTaskContract.spec, CONTRACT_FAILURE_SPEC_MAX)
+      : null
+    const body = {
+      version: 1,
+      created_at: new Date().toISOString(),
+      command: providerBudgetState.command || null,
+      role: error.role,
+      path: error.path,
+      detail: error.detail,
+      attempt_id: error.attemptId || null,
+      runtime: contractFailureRuntime(error.role),
+      task: activeTaskContract?.task || null,
+      request: activeRequest,
+      // The spec, verbatim, because the commit that would have carried it never happened.
+      spec: spec?.text ?? null,
+      spec_truncated: spec?.truncated ?? false,
+      rejected_value: rejected.text,
+      rejected_value_truncated: rejected.truncated,
+      // Every repair attempt this run already recorded for the role, so a failure that survived
+      // its own repair is visible as that rather than as one bad draw.
+      diagnostics: (runRecord?.diagnostics || []).filter((row) => row.role === error.role),
+      run_id: runRecord?.id || null,
+      // Where the transcript still is, for as long as the rotation above leaves it there.
+      run_record: runRecord?.path || null,
+    }
+    const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+    if (bytes.length > CONTRACT_FAILURE_MAX) return null
+    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+    const stamp = body.created_at.replace(/[-:.]/g, '')
+    const target = join(root, `${stamp}-${error.role}-${digest}.json`)
+    const temp = `${target}.tmp-${process.pid}`
+    writeFileSync(temp, bytes, { mode: 0o600 })
+    renameSync(temp, target)
+    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+    return target
+  } catch { return null }
+}
+
 // `.caw-tasks/` holds three kinds of file and only one of them is work to run. `PLAN.md` is
 // reserved: it is the plan artifact. notes.log dodges the spec glob with its extension, but a
 // plan wants to be markdown, so this is the one name that has to be excluded by hand — and
@@ -8710,6 +8813,9 @@ function runTask(file, f, profileText, opts = {}) {
   let spec
   try { spec = readFileSync(join(QUEUE_DIR, file), 'utf8') }
   catch (e) { die(`${file} — cannot read it: ${(e?.message || e).toString().split('\n')[0]}`) }
+  // From here a contract failure has a spec to retain. The queue file is deleted at this
+  // task's commit, so by the time anyone reads the failure it is the only copy left.
+  setActiveTaskContract(file)
   let executorBudget
   try { executorBudget = executorBudgetForSpec(f, spec) }
   catch (error) { die(`${file} — ${error?.message || error}`) }
@@ -9179,7 +9285,13 @@ function runTask(file, f, profileText, opts = {}) {
       } finally {
         removeReviewSurface(reviewSurface)
       }
-      if (semanticProblem) schemaFailure('reviewer', semanticProblem.path, semanticProblem.message)
+      // With the verdict, not without it. This is the terminal end of the semantic repair, so
+      // the value it rejects is the last thing anyone gets to read about why the run stopped —
+      // and it is what recordContractFailure retains once the transcript is rotated away.
+      if (semanticProblem) {
+        schemaFailure('reviewer', semanticProblem.path, semanticProblem.message, passVerdict,
+          runtimeIdentity(passVerdict)?.attempt_id || null)
+      }
       let verified
       try { verified = verifyWeakMutations(passVerdict.weak, f, file, deliveryBaseline) }
       catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }
@@ -10479,7 +10591,19 @@ function artifacts(args) {
       ? readdirSync(ADAPTER_TRANSPORT_PARENT).filter((name) => adapterTransportPath(name))
         .map((name) => `transports/${name}`).sort()
       : []
-    say(`artifacts:\n${[...local, ...probes, ...surfaces, ...transports]
+    // Listed, because a record nobody is told about is one nobody reads: the failure prints its
+    // own path when it happens, and that terminal is gone by the time anyone asks. Not
+    // purgeable here, for the same reason the task audit is not — it is the durable record, and
+    // in the failure case it is the only copy of the spec or request the run was about.
+    let failures = []
+    try {
+      const root = gitPrivatePath('caw', 'contract-failures')
+      if (existsSync(root)) {
+        failures = readdirSync(root).filter((name) => name.endsWith('.json'))
+          .map((name) => `contract-failures/${name}`).sort()
+      }
+    } catch { /* outside a repository there is no private path to read */ }
+    say(`artifacts:\n${[...local, ...probes, ...surfaces, ...transports, ...failures]
       .map((name) => `  ${name}`).join('\n') || '  (none)'}`)
     return
   }
@@ -10617,12 +10741,18 @@ if (AGENT_TIMEOUT_MS !== AGENT_TIMEOUT_DEFAULT_MS) {
       `(default ${formatTimeout(AGENT_TIMEOUT_DEFAULT_MS)})`)
 }
 
-if (cmd === 'plan') { if (!arg) die('plan needs a description'); plan(arg) }
+if (cmd === 'plan') { if (!arg) die('plan needs a description'); activeRequest = arg; plan(arg) }
 else if (cmd === 'build') build(noFull)
-else if (cmd === 'ship') { if (!arg) die('ship needs a description'); plan(arg); build(noFull) }
+else if (cmd === 'ship') {
+  if (!arg) die('ship needs a description')
+  activeRequest = arg
+  plan(arg)
+  build(noFull)
+}
 else if (cmd === 'round' || cmd === 'review') resumeTask(cmd, arg)
 else if (cmd === 'review-specs') {
   if (!arg) die('review-specs needs the request the specs are meant to satisfy')
+  activeRequest = arg
   reviewSpecs(arg, rest.includes('--no-fix'))
 }
 else if (cmd === 'done') {
@@ -10675,7 +10805,19 @@ else die(USAGE)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => die(error?.message || String(error)))
+  main().catch((error) => {
+    // The single place a contract failure actually ends a run: planningCanonicalCall throws
+    // here after its repair, the reviewer loop reaches here through schemaFailure once its
+    // semantic repair is spent, and a role with no repair at all — the executor — arrives
+    // directly. Recording once, here, is what keeps one failure from being written twice.
+    const record = recordContractFailure(error)
+    if (record) {
+      console.error(`\ncaw: the role contract failure is retained at ${record}`)
+      console.error('  It carries the spec, the rejected value and the runtime that produced it,')
+      console.error('  because the commit that would have carried them never happened.')
+    }
+    die(error?.message || String(error))
+  })
 }
 
 export {

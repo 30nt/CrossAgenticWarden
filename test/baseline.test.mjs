@@ -3628,6 +3628,89 @@ test('reviewer semantic repair preserves the pass and still runs the challenger'
     item.role === 'reviewer' && item.kind === 'semantic-validation').length, 1)
 })
 
+// A task stopped by a role contract failure never commits, so nothing carries its spec: the
+// commit that would have is the commit that did not happen, and the audit is written there too.
+// Measured on one install, the spec of the task that failed was already gone from the queue and
+// the log holding the diagnostic sat one pipeline run from the newest-twenty prune.
+test('a role contract failure is retained outside the rotation that sweeps the run record',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const specText = 'title: Durable failure\n\n## Done when\n- Delivery is complete.\n'
+  writeFileSync(join(f.root, '.caw-tasks', '001_durable-failure.md'), specText)
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_durable-failure.md'], [
+    { reviewPass: 1, semanticRepair: 0, envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1, envelope: envelope(verdict({ criteria: invalid })) },
+  ])
+  assert.equal(result.status, 1)
+
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1, `expected one retained failure, got ${names.join(', ')}`)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+
+  assert.equal(record.version, 1)
+  assert.equal(record.role, 'reviewer')
+  assert.equal(record.path, '$.criteria')
+  assert.equal(record.task, '001_durable-failure.md')
+  assert.equal(record.command, 'review')
+  // The spec verbatim, which is the thing that dies first.
+  assert.equal(record.spec, specText)
+  assert.equal(record.spec_truncated, false)
+  // The rejected value, so the failure can be read without the transcript.
+  assert.match(record.rejected_value, /claim lacks its required blocking item/)
+  // Both repair attempts, so a failure that survived its own repair reads as that rather than
+  // as one bad draw.
+  assert.equal(record.diagnostics.length, 2)
+  assert.ok(record.diagnostics.every((row) => row.kind === 'semantic-validation'))
+  assert.equal(record.runtime.provider, 'test-claude')
+  assert.equal(record.runtime.model, 'opus')
+  assert.match(record.runtime.runtime_digest, /^[0-9a-f]{64}$/)
+  // The path is printed, because a record nobody is told about is one nobody reads.
+  assert.match(result.stderr, /role contract failure is retained at/)
+
+  // The point of the record: it outlives the run record it was derived from.
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  assert.equal(record.run_id, runName)
+  rmSync(join(f.root, '.caw-logs', runName), { recursive: true, force: true })
+  assert.equal(readdirSync(root).length, 1, 'the retained failure must not live in .caw-logs')
+
+  // Findable after the terminal that printed the path is gone.
+  const listed = run(f, ['artifacts', 'list'], [])
+  assert.equal(listed.status, 0, listed.stderr || listed.stdout)
+  assert.match(listed.stdout, new RegExp(`contract-failures/${names[0]}`))
+})
+
+test('a planning contract failure retains the request it was about',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const result = run(f, ['plan', 'add a durable failure record'], [
+    { envelope: envelope({ cases: [] }) },
+    { envelope: envelope({ tasks: [], coverage: 'not an array' }) },
+    { envelope: envelope({ tasks: [], coverage: 'still not an array' }) },
+  ])
+  assert.equal(result.status, 1)
+
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1, `expected one retained failure, got ${names.join(', ')}`)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+
+  // The enumerator is the first planning role to answer, so an invalid draw there is the one
+  // that stops the run; which role it was is not the point of this case.
+  assert.equal(record.role, 'enumerator')
+  assert.equal(record.command, 'plan')
+  // `plan` writes nothing until both planning roles return, so the queue is empty here and the
+  // request is the only statement of what the run was for.
+  assert.equal(record.request, 'add a durable failure record')
+  assert.equal(record.task, null)
+  assert.equal(record.spec, null)
+})
+
 test('reviewer semantic repair budget is bounded',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })
