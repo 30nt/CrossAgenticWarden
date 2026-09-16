@@ -114,20 +114,24 @@ NEW_ITEM_COMPOSED = re.compile(
     re.IGNORECASE,
 )
 
-# Python and shell verbs that write. Paired with a mention of .caw-tasks/ in the same
-# text, they identify a script whose job is to rewrite the queue.
+# Python and shell verbs that write. Paired with a mention of .caw-tasks/ by
+# `queue_writes` below, they identify a program whose job is to rewrite the queue.
 #
-# The pairing is deliberate and it over-fires, which is the trade. Measured on one
-# install: a heredoc that READ a spec and wrote the commit message it built to a
-# path outside the queue withdrew the plan's approval, because the write verb and
-# the .caw-tasks/ path sat in one segment and nothing checks they are the same path.
-# Cost there: a review pass. Narrowing it to verb-and-path-on-one-line would miss
-#     p = Path('.caw-tasks/009.md')
-#     p.write_text(new)
-# which is exactly the script this exists to catch, so the rule stays and the cost
-# is written down instead. Two shapes that read the queue without tripping it:
-# `cat` the spec into a variable, and build a commit message in a file outside
-# .caw-tasks/ then `git commit -F` it.
+# The pairing used to be taken over the whole text, and that over-fired four times
+# across two installs, each time on a call that never wrote to the queue: a heredoc
+# that READ a spec and wrote its commit message outside the queue; a heredoc
+# appending to `.gitignore` whose payload merely NAMED the queue; one Bash call
+# carrying two unrelated heredocs, the queue named in one and `.write_text(` in the
+# other; and a heredoc rewriting a project's gate script, whose new bytes contain
+# `spec_path=".caw-tasks/${CAW_SPEC}"` because that is how a gate reads its own spec.
+# The last withdrew an approved verdict on an untouched queue and cost $6.74 to
+# re-derive; the first two cost $19.69 between them. Three predicates satisfied by
+# three different parts of one call is not a write, and `queue_writes` is the
+# narrowing.
+#
+# The last one also retires the workaround the other three left behind. "Do not put
+# the queue path in a heredoc" is unfollowable for a project whose gate must name the
+# queue to work, which is why block strings are excluded rather than merely split.
 WRITE_VERBS = [
     re.compile(r"\.write_text\s*\("),
     re.compile(r"\.write_bytes\s*\("),
@@ -170,12 +174,83 @@ RUNS_INLINE = re.compile(
 )
 
 
+# Inside a program — a heredoc body, a `-c` string, a script file — statements are
+# separated by newlines and `;`. The shell's own `|` and `&` did their separating
+# further up, on the command line.
+STATEMENT = re.compile(r"[\n;]+")
+
+# `p = Path('.caw-tasks/009.md')` binds the queue to a name and the write lands on
+# the name a line later, which is exactly the script this guard exists to catch and
+# the reason the pairing was not narrowed to one statement long ago. Binding both
+# spellings a program reaches for: Python's `name =` and PowerShell's `$name =`.
+# `==` is a comparison, not a binding.
+BINDS = re.compile(r"(?:^|[\s(\[,])\$?([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+
+
 def mentions_tasks(text: str) -> bool:
     return ".caw-tasks/" in text
 
 
 def writes(text: str) -> bool:
     return any(pattern.search(text) for pattern in WRITE_VERBS)
+
+
+# A triple-quoted block is CONTENT the program moves around, not code the program runs. The
+# distinction is load-bearing here because the one shape that reaches this branch legitimately
+# is a script rewriting another script: the queue path sits inside the bytes being written, and
+# for a gate that reads its own spec that line is obligatory — `spec_path=".caw-tasks/${CAW_SPEC}"`
+# is how such a gate works at all. Measured on one install, that withdrew an approved verdict,
+# and the advice "keep the queue path out of your heredocs" is unfollowable for that project.
+#
+# Blanked rather than dropped, and newlines are kept, so statement boundaries do not move.
+BLOCK_STRING = re.compile(r"'{3}[\s\S]*?'{3}|\"{3}[\s\S]*?\"{3}")
+
+
+def without_block_strings(text: str) -> str:
+    return BLOCK_STRING.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def queue_writes(text: str) -> "str | None":
+    """The statement whose write verb acts on the queue, or None if none does.
+
+    Both predicates over the whole text is what withdrew three approved verdicts
+    over calls that wrote nothing into the queue — see the WRITE_VERBS note. The
+    unit is a statement, so a queue path named in a comment, in prose, or in the
+    argument of a READ no longer answers for a write verb somewhere else entirely.
+
+    One hop of binding is followed, because dropping it is what the whole-text
+    pairing was buying:
+
+        p = Path('.caw-tasks/009.md')
+        p.write_text(new)
+
+    A statement naming the queue binds every name it assigns, and a later write
+    verb naming one of those is the same write. The hop is deliberately one and
+    deliberately syntactic — it over-taints, which is the direction this guard is
+    allowed to be wrong in, and it still cannot see a path composed at runtime or
+    arriving through an unexpanded shell variable. Those remain stated limits.
+
+    Triple-quoted blocks are blanked first, so a queue path inside the bytes a
+    program WRITES neither taints a name nor answers for a write. Without that, a
+    script rewriting a gate — the one shape that reaches this branch honestly —
+    fires whenever the shell it emits happens to reuse a variable name the Python
+    around it also uses. A queue path inside such a block is no longer visible to
+    this function at all, which is a deliberate hole: reaching the queue through
+    content assembled at runtime needs intent, and this guard never claimed to see
+    intent.
+    """
+    tainted: set[str] = set()
+    for statement in STATEMENT.split(without_block_strings(text)):
+        holds_queue = mentions_tasks(statement)
+        if holds_queue:
+            tainted.update(BINDS.findall(statement))
+        if not writes(statement):
+            continue
+        if holds_queue:
+            return statement
+        if any(re.search(rf"\$?\b{re.escape(name)}\b", statement) for name in tainted):
+            return statement
+    return None
 
 
 def main() -> None:
@@ -216,15 +291,10 @@ def main() -> None:
             touched = segment
 
     # A heredoc, a `-c` program or a `-Command` string carries its target inside
-    # itself, so the whole text is the unit here — there are no segments to tell
-    # apart.
-    if (
-        touched is None
-        and RUNS_INLINE.search(localized)
-        and mentions_tasks(localized)
-        and writes(localized)
-    ):
-        touched = localized
+    # itself, so the shell's segments say nothing here — `queue_writes` reads the
+    # program's own statements instead, and answers with the one that writes.
+    if touched is None and RUNS_INLINE.search(localized):
+        touched = queue_writes(localized)
 
     # A script the command runs carries it one level away, in the file.
     if touched is None:
@@ -236,8 +306,13 @@ def main() -> None:
                 text = localize(candidate.read_text(encoding="utf-8", errors="ignore"), root)
             except OSError:
                 continue
-            if mentions_tasks(text) and writes(text):
-                touched = text
+            # A gate script is the shape that made this branch matter: it reads the
+            # spec CAW_SPEC names and writes its own logs and manifests elsewhere,
+            # so over the whole file both predicates hold and neither is about the
+            # queue. The statement is the unit here for the same reason it is above.
+            hit = queue_writes(text)
+            if hit is not None:
+                touched = hit
                 break
 
     if touched is None:

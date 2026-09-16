@@ -5442,6 +5442,36 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
   }
   env.CAW_GATE_EVIDENCE_OUT = manifestPath
   env.CAW_GATE_ARTIFACTS_DIR = artifactsRoot
+  // What the manifest written to that path will be JUDGED against. The engine used to hand
+  // over the output path and nothing else, so a gate could satisfy the contract only by
+  // re-deriving it: one install ended up parsing `## Required gate checks` out of CAW_SPEC
+  // itself, which works, and is discoverable only by reading collectGateEvidence.
+  //
+  // The failure it produces is the expensive kind, because it looks like the opposite one. A
+  // gate emitting a check per test tier — MORE evidence than asked for — is refused with
+  // `not linked to a criterion or acceptance case`, since an unlinked check is tolerated only
+  // where its id was declared required. Measured on one install, that reads as a pipeline
+  // defect over a green gate rather than as a contract the gate was never shown.
+  //
+  // Two spellings, because the audiences differ. The id list is newline-separated plain text
+  // any shell loops over with no dependency, and is what a gate needs for the required-check
+  // case. The JSON carries the rest — a check that links a criterion or an acceptance case
+  // must match that row's exact id, evidence kind and selector, and none of those can be
+  // guessed. Both are always set, including empty, so a gate can tell an engine that offers
+  // the contract from one that does not.
+  env.CAW_GATE_REQUIRED_CHECKS = requiredCheckIds.join('\n')
+  const contractPath = join(evidenceScratch, 'contract.json')
+  writeFileSync(contractPath, `${JSON.stringify({
+    version: 1,
+    task,
+    kind,
+    required_check_ids: requiredCheckIds,
+    criteria: (context.criteria || []).map(({ id, section, criterion }) =>
+      ({ id, section, criterion })),
+    acceptance_cases: (context.acceptanceCases || []).map(({ id, evidence_kind, selector }) =>
+      ({ id, evidence_kind, selector })),
+  }, null, 2)}\n`, { mode: 0o600 })
+  env.CAW_GATE_CONTRACT = contractPath
   const startedAt = Date.now()
   try {
     const r = spawnSync('bash', ['-lc', cmd], {
@@ -7198,6 +7228,123 @@ function projectFullGateInputs(f, risk, knownInputs) {
   return result.output.baseline_inputs_digest || null
 }
 
+// A spec declaring `## Required gate checks` against a gate that writes no evidence manifest
+// stops with `green gate produced no evidence manifest for required task checks` — and that is
+// computed AFTER the executor has run and the gate has gone green. Measured on one install
+// updating from 0.1.0, whose gate predates the manifest entirely: $1.55 of executor work and
+// the tree it produced, thrown away over a contract nobody had told the gate about. With 985
+// tests passing, it reads as a defect in the pipeline rather than as a missing migration step.
+//
+// So the question is asked before any spend, using the only instrument that can answer it: the
+// gate itself, once, on the committed tree. The declared ids are deliberately NOT required here.
+// On a tree where no task has run yet a required check legitimately has nothing to report, and
+// the refusal this prevents is about the manifest's PRESENCE, not its contents.
+//
+// Cached on success against the exact gate command, engine and profile, so a project pays the
+// extra run once per gate change rather than once per build. A failure is never cached: it dies.
+const GATE_CONTRACT_PREFLIGHT_VERSION = 1
+const GATE_CONTRACT_PREFLIGHT_FILE_MAX = 64 * 1024
+
+function gateContractPreflightRoot() {
+  try {
+    const path = execFileSync('git', ['rev-parse', '--git-path', 'caw/gate-contract'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    return path ? resolve(path) : null
+  } catch { return null }
+}
+
+function gateContractPreflightIdentity(f) {
+  const inputs = {
+    version: GATE_CONTRACT_PREFLIGHT_VERSION,
+    gate: f.gate_fast,
+    timeout_ms: f.gate_fast_timeout_ms ?? null,
+    engine_digest: engineDigest(),
+    profile_digest: createHash('sha256').update(readFileSync('.caw/CAW.md')).digest('hex'),
+  }
+  return { key: createHash('sha256').update(stableJson(inputs)).digest('hex'), inputs }
+}
+
+function readGateContractPreflight(identity) {
+  const root = gateContractPreflightRoot()
+  if (!root || !existsSync(root)) return null
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() ||
+        stat.size > GATE_CONTRACT_PREFLIGHT_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record, ['version', 'key', 'created_at', 'inputs'], 'gate contract preflight')
+    if (record.version !== GATE_CONTRACT_PREFLIGHT_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs)) return null
+    return record
+  } catch { return null }
+}
+
+function writeGateContractPreflight(identity) {
+  const root = gateContractPreflightRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  const record = {
+    version: GATE_CONTRACT_PREFLIGHT_VERSION,
+    key: identity.key,
+    created_at: new Date().toISOString(),
+    inputs: identity.inputs,
+  }
+  const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+  if (bytes.length > GATE_CONTRACT_PREFLIGHT_FILE_MAX) return null
+  const target = join(root, `${identity.key}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, target)
+  try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  return record
+}
+
+function runGateEvidenceContractPreflight(f, specs) {
+  const declaring = specs.filter((spec) => requiredGateChecks(spec).length)
+  if (!declaring.length) return
+  if (!f.gate_fast) return
+  const identity = gateContractPreflightIdentity(f)
+  if (readGateContractPreflight(identity)) return
+
+  say(`\n· gate evidence contract — ${declaring.length} queued task(s) declare required gate` +
+      ' checks, and this gate has not been seen to emit a manifest. Asking it once, before' +
+      ' any executor runs.')
+  const probe = gate(f.gate_fast, declaring[0], undefined, f.gate_fast_timeout_ms, {
+    task: declaring[0],
+    kind: 'contract-preflight',
+    deliveryDigest: deliveryDigest(),
+    criteria: [],
+    acceptanceCases: [],
+    requiredCheckIds: [],
+  })
+  if (probe.receipt?.manifest?.present) {
+    writeGateContractPreflight(identity)
+    say('  it writes an evidence manifest; the declared ids will be judged per task.')
+    return
+  }
+  if (probe.state === 'timeout') {
+    die(`the gate evidence contract could not be checked: gate_fast exceeded ` +
+        `${formatTimeout(probe.timeoutMs)} and was killed on the committed tree.\n` +
+        `  Nothing was spent. Fix the gate or raise gate_fast_timeout_ms in .caw/CAW.md.`)
+  }
+  say(probe.out)
+  die(`${declaring.length} queued task(s) declare '## Required gate checks', and gate_fast wrote\n` +
+      `  no evidence manifest to CAW_GATE_EVIDENCE_OUT on the committed tree. Every one of those\n` +
+      `  tasks would run an executor, go green, and then be refused — which is what this refusal\n` +
+      `  costs nothing to replace.\n` +
+      `    gate: ${f.gate_fast}\n` +
+      `    it exited ${probe.status} (${probe.state})\n` +
+      `  A gate written before evidence manifests existed needs one migration step; it is the\n` +
+      `  '## Structured evidence' section of docs/gate.md, and docs/updating.md names it under\n` +
+      `  '## Updating'. The ids to emit arrive in CAW_GATE_REQUIRED_CHECKS, one per line.\n` +
+      `  If the gate is meant to emit nothing, remove '## Required gate checks' from the specs\n` +
+      `  instead — the tasks that declare it: ${declaring.join(', ')}`)
+}
+
 function runRequiredFullGateBaseline(f, risk, startHead) {
   if (!risk?.require_full_gate_baseline) return null
   const planningPolicy = projectPolicySet?.policies?.planning
@@ -7511,6 +7658,8 @@ function build(noFull) {
       '--no-full is not allowed')
   }
   const fullGateBaseline = runRequiredFullGateBaseline(f, risk, startHead)
+  // Before the first executor, because the refusal it replaces is computed after one.
+  runGateEvidenceContractPreflight(f, specs)
   // Any saved review history here is stale by construction and is dropped rather than resumed.
   // `build` refuses to start on a dirty tree and every task before this one committed, so the
   // tree a state file describes is not the tree in front of us: whatever it held was thrown

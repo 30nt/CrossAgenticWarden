@@ -91,6 +91,33 @@ API-v3 acceptance policy writes the version-1 manifest documented in
 [project policies](project-policies.md). A green fast gate must report a passed check for every
 acceptance case with the required evidence kind.
 
+### The contract the manifest is judged against
+
+A manifest is validated against a contract, and the gate is handed that contract rather than
+left to re-derive it. **More evidence than was asked for is refused exactly like none**: a check
+is allowed to carry no links only when its id was declared required, so a gate emitting one check
+per test tier is rejected with `not linked to a criterion or acceptance case`. Measured on one
+install, over a green suite, that reads as a defect in the pipeline.
+
+Two variables carry it, and both are always set, including empty — so a gate can tell an engine
+that offers the contract from one that does not:
+
+| variable | holds |
+|---|---|
+| `CAW_GATE_REQUIRED_CHECKS` | the required check ids, one per line, for a shell to loop over |
+| `CAW_GATE_CONTRACT` | a path to version-1 JSON: `required_check_ids`, `criteria`, `acceptance_cases` |
+
+The JSON is what a gate needs to link rather than declare. A check naming a criterion must use
+the engine's own stable census id, and one naming an acceptance case must match that row's exact
+`evidence_kind` and `selector` — none of which a project can guess. Emit the required ids from
+`CAW_GATE_REQUIRED_CHECKS` directly; do not parse `## Required gate checks` out of `CAW_SPEC`,
+which duplicates engine-owned identity in project code and drifts silently when it changes.
+
+```bash
+while IFS= read -r id; do [ -n "$id" ] && printf '%s\n' "$id"; done \
+  <<< "$CAW_GATE_REQUIRED_CHECKS"
+```
+
 CAW owns the resulting receipt. It records the command result, bounded output and artifact
 digests against the exact delivery digest. Manifest files are limited to 1 MiB, 128 checks and 32
 artifacts. Each artifact is at most 16 MiB and all artifacts together at most 64 MiB. Paths must

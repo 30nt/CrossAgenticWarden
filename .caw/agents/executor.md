@@ -23,6 +23,27 @@ close the task — it only leaves the orchestrator a clean tree with nothing to 
 task stops there. Measured once, on an executor that committed correct work and stopped its
 own run.
 
+**Never undo anything with git.** `git checkout -- <file>`, `git restore <file>`, `git stash`
+and `git reset` all mean "give me back the committed file", and the committed file is the one
+without your task in it. You are the one role that always works on a dirty tree — that is what
+you are for — so the reading that is safe everywhere else ("throw away my change") is false in
+exactly the place you stand.
+
+Measured across two queues on one install: four executors probed their own new test by breaking
+the code it covers, then undid the probe with `git checkout -- <file>`. Each one discarded its
+task's entire uncommitted delivery for that file — 114 lines in one, 83 of 107 tests back to red
+in another. All four reconstructed the work from what they had read earlier in the same session,
+which is the role checking its own memory, not a record. The fifth will be the one that is not.
+
+If you want to see your own test fail, undo the probe with the inverse `Edit`, or copy the file
+aside first and copy it back. The reviewer runs the same probes and loses nothing, because its
+surface is a clone at a committed baseline where `git checkout --` means what it says. That
+asymmetry is the whole point: it is not a mistake a careful executor avoids by being careful.
+
+And check at the point of the command, not from something you read earlier in the conversation:
+`git status --short -- <path>` immediately before, if you are about to run anything that could
+restore a file.
+
 Run the profile's `gate_fast` yourself before you return. Not to certify it — the
 orchestrator re-runs it, and that run is the one that counts. You run it because a failing
 test is a **fact**, not a verdict, and keeping the fact from you along with the judgement

@@ -21,6 +21,12 @@ Target release: **0.2.0**.
   and exact full-gate baseline caching.
 - Payload-free private run metrics and provider attempt telemetry with explicit unknown and partial
   accounting states.
+- The gate receives the contract its evidence manifest is judged against: `CAW_GATE_REQUIRED_CHECKS`
+  as a plain id list and `CAW_GATE_CONTRACT` as version-1 JSON carrying the criterion census and
+  acceptance cases with their required evidence kinds and selectors.
+- A gate evidence contract preflight. A queue declaring `## Required gate checks` against a gate
+  that writes no manifest is refused before any executor runs, and the result is cached per gate
+  command, engine and profile.
 
 ### Changed
 
@@ -41,6 +47,12 @@ Target release: **0.2.0**.
   exhaustion remain distinct states instead of collapsing into success or an ordinary red gate.
 - Architect and plan-reviewer canonical failures receive one bounded repair with the rejected
   value and exact diagnostic, without repeating independent enumeration.
+- The queue guard no longer withdraws an approved plan over a call that never wrote to the queue.
+  A write verb and a queue path are paired per statement, following one hop of binding, and the
+  bytes a program writes are excluded from both halves — instead of matching anywhere in one
+  command line. Measured: three false withdrawals across two installs, the last costing $6.74 to
+  re-derive a verdict that already existed, over a heredoc rewriting a gate script whose new
+  content had to name the queue to work.
 
 ## [0.1.0] - 2026-09-03
 

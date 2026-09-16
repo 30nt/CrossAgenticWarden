@@ -388,6 +388,107 @@ def test_a_shell_write_withdraws_the_approval(command: str, tmp_path: Path) -> N
     assert "approved: false" in (tasks / "PLAN.md").read_text()
 
 
+# Assembled like the three above it, so this file is not itself a queue-rewriting script
+# when the guard reads it back.
+GITIGNORE_HEREDOC = (
+    "python3 - <<'PY'\n"
+    "from pathlib import Path\n"
+    "p = Path('.gitignore')\n"
+    "p" + WRITE_CALL + "p.read_text() + 'docs/caw/\\n')\n"
+    "# the ignore list also covers " + QUEUE + " and .caw-logs/\n"
+    "PY"
+)
+TWO_HEREDOCS = (
+    "cat > docs/harness/report.md <<'EOF'\n"
+    "The approval flag is raised by review-specs over " + QUEUE + ", once it finds no holes.\n"
+    "EOF\n"
+    "python3 - <<'PY'\n"
+    "from pathlib import Path\n"
+    "Path('docs/other.md')" + WRITE_CALL + "'x')\n"
+    "PY"
+)
+# The gate this rewrites must name the queue to read its own spec, so "keep the queue path
+# out of your heredocs" is unfollowable for the project that met this.
+TRIPLE = "'" * 3
+REWRITES_A_GATE = (
+    "python3 - <<'PY'\n"
+    "import pathlib\n"
+    'p = pathlib.Path("scripts/gate_fast.sh")\n'
+    "s = p.read_text()\n"
+    "new = " + TRIPLE + "\n"
+    '  spec_path="' + QUEUE + '${CAW_SPEC}"\n'
+    + TRIPLE + "\n"
+    "p" + WRITE_CALL + "s[:start] + new + s[end:])\n"
+    "PY"
+)
+# The same, where the shell being written happens to bind the same name the Python around it
+# writes through. One hop of taint hits this; blanking block strings is what stops it.
+REWRITES_A_GATE_NAME_COLLISION = (
+    "python3 - <<'PY'\n"
+    "import pathlib\n"
+    'p = pathlib.Path("scripts/gate_fast.sh")\n'
+    "new = " + TRIPLE + "\n"
+    'p="' + QUEUE + '${CAW_SPEC}"\n'
+    + TRIPLE + "\n"
+    "p" + WRITE_CALL + "new)\n"
+    "PY"
+)
+# Both halves of the catch this guard exists for, so narrowing never quietly removes them.
+BINDS_THEN_WRITES = (
+    "python3 - <<'PY'\n"
+    "from pathlib import Path\n"
+    "p = Path('" + QUEUE + "009.md')\n"
+    "p" + WRITE_CALL + "new)\n"
+    "PY"
+)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        GITIGNORE_HEREDOC,
+        TWO_HEREDOCS,
+        REWRITES_A_GATE,
+        REWRITES_A_GATE_NAME_COLLISION,
+    ],
+)
+def test_a_call_that_never_writes_to_the_queue_keeps_the_approval(
+    command: str, tmp_path: Path
+) -> None:
+    """Three predicates satisfied by three different parts of one call is not a write.
+
+    Measured: three false withdrawals across two installs, each over a call that
+    read the queue or merely named it. Priced twice — $19.69 for the first two
+    re-judgements, and $6.74 for one re-derivation of a verdict that already
+    existed on an untouched queue. The write verb and the queue path are now
+    paired per statement, following one hop of binding, with the bytes a program
+    WRITES excluded from both halves.
+    """
+    tasks = queue_with_approved_plan(tmp_path)
+
+    decision, _ = decide("deny_tasks_bash.py", {"command": command}, project_dir=tmp_path)
+
+    assert decision == "allow"
+    assert "approved: true" in (tasks / "PLAN.md").read_text()
+
+
+@pytest.mark.parametrize("command", [INLINE_SCRIPT, HEREDOC_SCRIPT, BINDS_THEN_WRITES])
+def test_a_program_that_does_write_the_queue_still_withdraws(
+    command: str, tmp_path: Path
+) -> None:
+    """The narrowing above must not cost the catch it was narrowed around.
+
+    `BINDS_THEN_WRITES` is why the pairing was never reduced to one statement:
+    the queue is bound to a name and the write lands on the name a line later.
+    """
+    tasks = queue_with_approved_plan(tmp_path)
+
+    decision, _ = decide("deny_tasks_bash.py", {"command": command}, project_dir=tmp_path)
+
+    assert decision == "allow"
+    assert "approved: false" in (tasks / "PLAN.md").read_text()
+
+
 def test_reading_the_queue_leaves_the_approval(tmp_path: Path) -> None:
     """Inspecting the queue is not changing it, and must not cost a review round.
 
