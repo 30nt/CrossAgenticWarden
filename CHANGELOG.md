@@ -65,9 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
-- A non-met criterion whose blocking item does not quote it now names the exact text to quote.
-  The repair call hands back the rejected value, and the rule alone told a role that believed it
-  had quoted the criterion nothing it could act on; the failure survived its own repair twice.
+- A blocking item binds to a non-met criterion by listing its id in `criterion_ids`, which the
+  schema already requires on every finding; quoting the criterion text verbatim is still accepted
+  but no longer the only way. The substring rule made rejections unserializable: on one install
+  four runs ($56.64) stopped on it, two reviews produced no verdict, and the repair call — even
+  when told the exact text — broke the same rule on another criterion. Approvals were never asked.
 - The queue guard no longer withdraws an approved plan over a call that never wrote to the queue.
   A write verb and a queue path are paired per statement, following one hop of binding, and the
   bytes a program writes are excluded from both halves — instead of matching anywhere in one

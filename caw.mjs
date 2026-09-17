@@ -426,31 +426,51 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = [], priorOpen = [
 
   const slotForState = { broken: 'broken', uncovered: 'uncovered', weak: 'weak' }
   const carriedById = new Map((verdict?.carried || []).map((item) => [item?.id, item]))
+  // A blocking item binds to a non-met criterion by NAMING it: its `criterion_ids` holds the
+  // engine's own id, which the schema requires on every finding and reviewContractIssue checks
+  // against the census. Quoting the criterion text verbatim in free prose is the older binding,
+  // from before findings carried ids, and it is still accepted — but it is no longer the only way.
+  //
+  // It had become the one thing standing between a reviewer and a rejection. A substring match
+  // over prose is a constraint a role has to satisfy while writing a finding about something
+  // else, and measured on a third install it could not: four runs stopped on
+  // `<id> is weak but no weak item quotes its exact criterion`, $56.64 in all, two `review`
+  // commands produced no verdict at all, and the repair call — handed the rejected value and,
+  // since 82bebcd, the exact text to copy — answered by breaking the same rule on a different
+  // criterion. An approval leaves every slot empty and is never asked, so the reviewer that
+  // found nothing could say so, and the one that found a real defect (a days-to-Duration overflow
+  // yielding a negative retention period with no error) could not. The id is what the finding
+  // already says; requiring prose to repeat it was requiring the rejection to be written twice.
+  const namesCriterion = (item, id, criterion) =>
+    (Array.isArray(item?.criterion_ids) && item.criterion_ids.includes(id)) ||
+    Boolean(item?.evidence?.includes(criterion))
   for (const row of rows) {
     if (row.state === 'met') continue
     const criterion = byId.get(row.id).criterion
     const slot = slotForState[row.state]
     const items = verdict?.[slot]
     const newItemQuotes = Array.isArray(items) &&
-      items.some((item) => item?.evidence?.includes(criterion))
+      items.some((item) => namesCriterion(item, row.id, criterion))
     const openCarriedQuotes = priorOpen.some((item) => {
       const disposition = carriedById.get(item?.id)
       return disposition?.state === 'open' &&
-        [item?.evidence, disposition?.evidence].some((evidence) => evidence?.includes(criterion))
+        (namesCriterion(item, row.id, criterion) ||
+          Boolean(disposition?.evidence?.includes(criterion)))
     })
     if (!newItemQuotes && !openCarriedQuotes) {
-      // The text itself, not just the rule. The repair call hands back the rejected value and
-      // this message, and "quotes its exact criterion" tells a role that already believed it had
-      // quoted it nothing it can act on. Measured on one install, this failure survived its own
-      // repair twice. What the check compares is a plain substring, so naming it is sufficient.
-      return `${row.id} is ${row.state} but no ${slot} item quotes its exact criterion; ` +
-        `one ${slot} item's evidence must contain this text verbatim: ${JSON.stringify(criterion)}`
+      // Names the id first, because naming the id is what satisfies the check, and the text
+      // second for a role that chose to quote. Naming only the text was tried: on a third install
+      // the repair call received it and broke the same rule on another criterion.
+      return `${row.id} is ${row.state} but no ${slot} item names it; ` +
+        `list ${JSON.stringify(row.id)} in the criterion_ids of the ${slot} item that shows it ` +
+        `(or quote its text verbatim in that item's evidence: ${JSON.stringify(criterion)})`
     }
   }
 
   for (const item of verdict?.uncovered || []) {
-    if (!expected.some((criterion) => item?.evidence?.includes(criterion.criterion))) {
-      return 'an uncovered item does not quote any exact Must cover, Change, or Done when criterion'
+    if (!expected.some((criterion) => namesCriterion(item, criterion.id, criterion.criterion))) {
+      return 'an uncovered item names no Must cover, Change, or Done when criterion; list its id ' +
+        'in criterion_ids or quote its exact text'
     }
   }
   return null
@@ -9246,10 +9266,10 @@ function runTask(file, f, profileText, opts = {}) {
         ' Use receipt checks and artifacts before consulting executor claims. Claims are untrusted',
         ' navigation hints. Judge whether the gate passes for the right reason.',
         '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
-        ' and finish every row before returning. For a non-met row, the corresponding blocking',
-        ' item must quote the criterion text exactly in its evidence. An already-open carried',
-        ' item is that blocking item when its saved evidence quotes the criterion; keep it in',
-        ' `carried` and do not duplicate it as a new finding:\n\n' +
+        ' and finish every row before returning. For a non-met row, the blocking item in the',
+        ' matching slot must list that criterion id in its `criterion_ids`. An already-open',
+        ' carried item that names the criterion is that blocking item; keep it in `carried`',
+        ' and do not duplicate it as a new finding:\n\n' +
           renderReviewCriteria(spec, projectCriteria),
         '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
         ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',

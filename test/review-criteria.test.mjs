@@ -67,7 +67,36 @@ test('non-met criteria must bind to their exact blocking item', () => {
   assert.match(reviewCriteriaIssue(spec, rows, {
     ...emptyVerdict,
     uncovered: [{ evidence: 'Something unrelated is absent.' }],
-  }), /does not quote/)
+  }), /names no Must cover/)
+})
+
+// The finding already carries the id the schema requires; the quote was a second copy of the
+// same binding in prose, and on one install a reviewer could not produce it even when told the
+// exact text, so a rejection never serialized while an approval always did.
+test('a blocking item binds to its criterion by id, without quoting the text', () => {
+  const brokenRows = [{ ...rows[0], state: 'broken' }, ...rows.slice(1)]
+  assert.equal(reviewCriteriaIssue(spec, brokenRows, {
+    ...emptyVerdict,
+    broken: [{ criterion_ids: ['must-cover-1'], evidence: 'the language switch drops Alpha' }],
+  }), null)
+  // The id must be the row's own and the item must sit in the matching slot.
+  assert.match(reviewCriteriaIssue(spec, brokenRows, {
+    ...emptyVerdict,
+    broken: [{ criterion_ids: ['must-cover-2'], evidence: 'a different property' }],
+  }), /must-cover-1 is broken but no broken item names it/)
+  assert.match(reviewCriteriaIssue(spec, brokenRows, {
+    ...emptyVerdict,
+    weak: [{ criterion_ids: ['must-cover-1'], evidence: 'wrong slot' }],
+  }), /no broken item names it/)
+  assert.equal(reviewCriteriaIssue(spec, rows, {
+    ...emptyVerdict,
+    uncovered: [{ criterion_ids: ['done-when-2'], evidence: 'nothing checks the preserved input' }],
+  }), null)
+  const weakRows = [{ ...rows[0], state: 'weak' }, ...rows.slice(1)]
+  assert.equal(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{ id: 'r4.1', state: 'open', evidence: 'still reproduces' }],
+  }, [], [{ id: 'r4.1', criterion_ids: ['must-cover-1'], evidence: 'earlier observation' }]), null)
 })
 
 test('an open carried finding can justify a non-met criterion without duplication', () => {
