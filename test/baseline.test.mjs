@@ -5973,10 +5973,38 @@ test('a non-met criterion names the exact text its blocking item has to quote', 
 
   const issue = reviewCriteriaIssue(spec, verdictValue.criteria, verdictValue)
 
-  // Without the text, a role that believes it already quoted the criterion learns nothing from
-  // its repair call. Measured: this failure survived its own repair twice on one install.
-  assert.match(issue, /must contain this text verbatim/)
+  // The id comes first because naming it is what satisfies the check; the text stays for a role
+  // that chose to quote.
+  assert.match(issue, /list "done-when-1" in the criterion_ids of the broken item/)
   assert.ok(issue.includes('The header carries its original date.'))
+})
+
+// End to end, the shape that could not serialize on a third install: a real rejection whose
+// finding names its criterion by id and describes what was observed without restating it.
+test('a reviewer rejection that names its criterion by id is recorded as a finding',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_retention.md'),
+    'title: Retention\n\n## Done when\n- Retention converts days to a positive duration.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_retention.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken',
+        evidence: '3650 days overflowed to a negative value' }],
+      broken: [{ where: 'README.md:1', fix: 'bound the multiplication',
+        evidence: 'ran the conversion with 3650 and observed a negative period, no error' }],
+    })) },
+  ])
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.doesNotMatch(output, /invalid canonical output/)
+  assert.doesNotMatch(output, /semantic inconsistency/)
+  assert.match(output, /one round this command runs is done/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks',
+    '.round-001_retention.md.json'), 'utf8'))
+  assert.equal(saved.history.length, 1)
+  assert.deepEqual(saved.history[0].criterion_ids, ['done-when-1'])
+  assert.equal(existsSync(join(f.root, '.git', 'caw', 'contract-failures')), false)
 })
 
 test('the contract preflight is paid once per gate, not once per build', () => {
