@@ -1684,6 +1684,69 @@ test('population cache reuses exact inputs and misses after canonical authority 
     manifest.population_cache?.state === 'miss' && manifest.population_cache?.stored === true), true)
 })
 
+// The stage that dies mid-way pays again for every role that had already finished. Measured on
+// one install: enumerator $2.08 and architect $2.70 both completed, the plan-reviewer died on an
+// expired token, and the rerun started from zero — $4.78 for nothing.
+test('a plan rerun after a mid-stage death reuses the roles that already answered', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const enumeratorAnswer = { envelope: envelope(population([{
+    case: 'fixture output', source: requestSource(description),
+  }])) }
+
+  // The plan-reviewer never answers: its response is missing from the queue, exactly as a role
+  // dying mid-stage leaves it.
+  let result = run(f, ['plan', description], [
+    enumeratorAnswer,
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(result.status, 1)
+  // The plan-reviewer call is not recorded: the double has no response left for it.
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator', 'architect'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), false)
+
+  // The rerun asks neither of the two roles that already answered, and completes on the one
+  // response it was missing.
+  writeFileSync(f.calls, '')
+  result = run(f, ['plan', description], [{ envelope: envelope(planReview()) }])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  assert.match(result.stdout, /planning cache hit [0-9a-f]{12} — architect call skipped/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['plan-reviewer'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), true)
+
+  const manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  const hit = manifests.flatMap((manifest) => manifest.planning_cache || [])
+    .find((entry) => entry.state === 'hit' && entry.role === 'architect')
+  assert.ok(hit, 'the run manifest must record the architect cache hit')
+  assert.match(hit.key, /^[0-9a-f]{64}$/)
+})
+
+test('a planning cache entry misses when anything the role was asked about changes', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const responses = () => [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ]
+  let result = run(f, ['plan', description], responses())
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  rmSync(join(f.root, '.caw-tasks'), { recursive: true, force: true })
+
+  // A different request is a different question, so neither cache answers it.
+  writeFileSync(f.calls, '')
+  result = run(f, ['plan', 'Create the fixture output and an audit marker'], responses())
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.doesNotMatch(result.stdout, /planning cache hit/)
+  assert.deepEqual(calls(f).map(({ role }) => role),
+    ['enumerator', 'architect', 'plan-reviewer'])
+})
+
 test('request preflight stops after enumerator and before architect', () => {
   const f = fixture({ git: true })
   const issue = {
