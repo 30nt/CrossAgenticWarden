@@ -2581,6 +2581,9 @@ function writeRunManifest(status) {
     ...(runRecord.populationCache === undefined ? {} : {
       population_cache: runRecord.populationCache,
     }),
+    ...(runRecord.planningCache === undefined ? {} : {
+      planning_cache: runRecord.planningCache,
+    }),
     ...(runRecord.risk === undefined ? {} : { risk: runRecord.risk }),
     ...(runRecord.fullGateBaseline === undefined ? {} : {
       full_gate_baseline: runRecord.fullGateBaseline,
@@ -5367,7 +5370,134 @@ function agent(role, prompt, schema, f, spec, context = null) {
   return result.value
 }
 
+// A planning stage holds every role's answer in memory until the whole stage succeeds, and pays
+// again for all of them when one dies. Measured on one install: `plan` completed the enumerator
+// ($2.08, 109 cases) and the architect ($2.70, specs built), then lost both when the plan-reviewer
+// died on `401 OAuth access token has expired`. The queue was empty afterwards and nothing under
+// `.git/caw/` carried that run — $4.78 spent for nothing, and a token expiring mid-stage is not
+// rare: it is the third such report.
+//
+// Persisting the draft in the queue was proposed and is the wrong shape twice over. Files on disk
+// do not make the next `plan` reuse anything — it starts from zero and overwrites them, so the
+// money is spent again — and `.caw-tasks/` means "the judged queue", which unjudged specs would
+// quietly stop being true. Reuse on exact identity is the mechanism this engine already has for
+// the enumerator, and this is that mechanism for the roles beside it: same private Git store,
+// same exact key, same cache-miss behaviour when anything at all differs.
+//
+// The key is the role's whole prompt, so the population it was given, the round's revision text
+// and any carried problems are all inside it. A repaired value is cached under the original
+// prompt: what is being reused is the accepted outcome of asking that question, not a draw.
+function planningValueCacheIdentity(role, prompt, schema, f) {
+  if (!planningCacheRoot('planning-cache')) return null
+  const binding = resolvedRuntime?.value?.roles?.[role]
+  const provider = binding && resolvedRuntime.providers?.get(binding.provider)
+  if (!binding || !provider) return null
+  const inputs = {
+    version: POPULATION_CACHE_VERSION,
+    role,
+    prompt_sha256: createHash('sha256').update(prompt).digest('hex'),
+    instructions_sha256: createHash('sha256').update(
+      assembledInstructions(role, binding, provider, f.docs_language)).digest('hex'),
+    schema_sha256: createHash('sha256').update(stableJson(schema)).digest('hex'),
+    engine_sha256: createHash('sha256').update(
+      readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    repository: { head: headCommit(), delivery_digest: deliveryDigest() },
+    runtime: {
+      digest: resolvedRuntime.digest,
+      provider: binding.provider,
+      vendor: provider.adapter.vendor,
+      model: binding.model,
+      reasoning: binding.reasoning,
+      adapter_digest: provider.adapter.digest,
+      cli_version: provider.cliVersion,
+    },
+    project_policy_digest: projectPolicySnapshot()?.set_digest || null,
+  }
+  return { key: createHash('sha256').update(stableJson(inputs)).digest('hex'), inputs }
+}
+
+function readPlanningValueCache(identity, schema) {
+  const root = identity && planningCacheRoot('planning-cache')
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > POPULATION_CACHE_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record,
+      ['version', 'key', 'created_at', 'inputs', 'value_digest', 'runtime', 'value'],
+      'planning cache')
+    // Re-validated on the way out. A record written by an engine whose schema has since changed
+    // must miss rather than hand a stale shape to the caller that is about to trust it.
+    if (record.version !== POPULATION_CACHE_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs) ||
+        record.value_digest !== createHash('sha256').update(stableJson(record.value)).digest('hex') ||
+        canonicalIssue(schema, record.value, '$')) return null
+    return record
+  } catch { return null }
+}
+
+function writePlanningValueCache(identity, value, runtime) {
+  const root = identity && planningCacheRoot('planning-cache')
+  if (!root) return null
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+    const { attempt_id: _attemptId, ...cacheRuntime } = runtime || {}
+    const record = {
+      version: POPULATION_CACHE_VERSION,
+      key: identity.key,
+      created_at: new Date().toISOString(),
+      inputs: identity.inputs,
+      value_digest: createHash('sha256').update(stableJson(value)).digest('hex'),
+      runtime: cacheRuntime,
+      value,
+    }
+    const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+    if (bytes.length > POPULATION_CACHE_FILE_MAX) return null
+    const target = join(root, `${identity.key}.json`)
+    const temp = `${target}.tmp-${process.pid}`
+    writeFileSync(temp, bytes, { mode: 0o600 })
+    renameSync(temp, target)
+    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+    prunePopulationCache(root)
+    return record
+  } catch { return null }
+}
+
+function recordPlanningCache(entry) {
+  const run = beginRunRecord()
+  run.planningCache ||= []
+  run.planningCache.push(entry)
+  writeRunManifest('active')
+}
+
 function planningCanonicalCall(role, prompt, schema, f, validate = null) {
+  const cacheIdentity = planningValueCacheIdentity(role, prompt, schema, f)
+  const cached = readPlanningValueCache(cacheIdentity, schema)
+  if (cached) {
+    // Validated again here, not only against the schema on the way out: a cached value still has
+    // to satisfy the caller's semantic check, which depends on ledgers this run built.
+    try {
+      const validation = validate ? validate(cached.value) : null
+      valueRuntime.set(cached.value, cached.runtime)
+      recordPlanningCache({
+        role, state: 'hit', key: cacheIdentity.key, created_at: cached.created_at,
+      })
+      say(`  planning cache hit ${cacheIdentity.key.slice(0, 12)} — ${role} call skipped`)
+      return { value: cached.value, validation }
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError)) throw error
+      recordPlanningCache({ role, state: 'stale', key: cacheIdentity.key, detail: error.detail })
+      say(`  planning cache entry no longer satisfies this run's ledger; calling ${role}`)
+    }
+  } else if (cacheIdentity) {
+    recordPlanningCache({ role, state: 'miss', key: cacheIdentity.key })
+  }
   let problem = null
   for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
     const repairPrompt = repair === 0 ? prompt : [
@@ -5384,6 +5514,14 @@ function planningCanonicalCall(role, prompt, schema, f, validate = null) {
     try {
       value = agent(role, repairPrompt, schema, f)
       const validation = validate ? validate(value) : null
+      // Stored under the ORIGINAL prompt's key, including after a repair: the identity is the
+      // question this run asked, and the accepted answer is what a rerun would have to pay for.
+      if (cacheIdentity) {
+        const stored = writePlanningValueCache(cacheIdentity, value, runtimeIdentity(value))
+        if (stored) recordPlanningCache({
+          role, state: 'stored', key: cacheIdentity.key, created_at: stored.created_at,
+        })
+      }
       return { value, validation }
     } catch (error) {
       if (!(error instanceof CanonicalOutputError) || error.role !== role) throw error
@@ -6739,13 +6877,17 @@ function planIncomplete(description, out, history, problems, reason, population,
 // can run to tens of KB — fall behind a varying prefix too, and index_cmd starts costing full
 // rate on every call for nothing. The order is load-bearing for the mechanism, not for the
 // price. The unmeasured residual above still applies, to this role alone.
-function populationCacheRoot() {
+function planningCacheRoot(name) {
   try {
-    const path = execFileSync('git', ['rev-parse', '--git-path', 'caw/population-cache'], {
+    const path = execFileSync('git', ['rev-parse', '--git-path', `caw/${name}`], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim()
     return path ? resolve(path) : null
   } catch { return null }
+}
+
+function populationCacheRoot() {
+  return planningCacheRoot('population-cache')
 }
 
 function prunePopulationCache(root, now = Date.now()) {

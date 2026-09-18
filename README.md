@@ -94,6 +94,13 @@ selectors; CAW validates completeness and the gate evidence transport.
 and policy, canonical docs, repository state, project index, runtime, adapter, CLI, instructions,
 schema, and engine all participate in the key. Any change runs the enumerator again.
 
+The architect and plan-reviewer are cached the same way, on the whole prompt each was given. A
+planning stage that dies part-way used to be paid for twice: measured on one install, an expired
+token killed the plan-reviewer after the enumerator and the architect had both finished, and the
+rerun re-derived everything for $4.78. A rerun now reuses whatever already answered the identical
+question, and asks again for anything else. Cache entries are re-validated against the schema and
+the run's own ledgers before they are trusted; a stale one misses rather than being handed on.
+
 **Guarantees come from a live probe, not from a config file.** A binding is unavailable until a
 probe on *this machine* proves the OS write boundary holds. A changed adapter implementation, an
 expired attestation, or a red probe makes it unavailable before a pipeline call.

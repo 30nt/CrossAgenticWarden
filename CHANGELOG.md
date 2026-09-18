@@ -65,6 +65,12 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- Architect and plan-reviewer canonical values are cached on exact identity, in Git's private
+  `caw/planning-cache/`, the way the enumerator's population already was. A planning stage that
+  died part-way charged again for every role that had already answered: measured, an expired token
+  killed the plan-reviewer after the enumerator ($2.08) and the architect ($2.70) finished, and the
+  rerun started from zero. A cached value is re-validated against its schema and the run's ledgers
+  before it is used.
 - A carried entry kept `open` may list `criterion_ids` of its own, so an item can answer for a
   criterion it was not raised against. Which criterion an open item blocks changes between rounds;
   the ids it was raised with are fixed, and the reviewer is told not to duplicate it as a new
