@@ -99,6 +99,47 @@ test('a blocking item binds to its criterion by id, without quoting the text', (
   }, [], [{ id: 'r4.1', criterion_ids: ['must-cover-1'], evidence: 'earlier observation' }]), null)
 })
 
+// Which criterion an open item blocks can change between rounds: the tree moved. The ids the
+// item was RAISED with are fixed, and until the disposition could carry its own, saying so
+// needed the criterion text verbatim — the constraint df33fab removed for new findings, left
+// standing for carried ones, while the role file forbids raising a duplicate instead. Measured:
+// three consecutive rejections on a resumed task with twelve open items, $43.40, no verdict.
+test('a carried entry kept open can name a criterion it was not raised against', () => {
+  const weakRows = [{ ...rows[0], state: 'weak' }, ...rows.slice(1)]
+  const priorOpen = [{ id: 'r1.3', criterion_ids: ['done-when-2'], evidence: 'raised elsewhere' }]
+
+  assert.match(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{ id: 'r1.3', state: 'open', evidence: 'still reproduces' }],
+  }, [], priorOpen), /must-cover-1 is weak but no weak item names it/)
+
+  assert.equal(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{
+      id: 'r1.3', state: 'open', criterion_ids: ['must-cover-1'],
+      evidence: 'the switch test still passes with Alpha removed',
+    }],
+  }, [], priorOpen), null)
+
+  // A closed or withdrawn entry answers for nothing, whatever it lists.
+  assert.match(reviewCriteriaIssue(spec, weakRows, {
+    ...emptyVerdict,
+    carried: [{
+      id: 'r1.3', state: 'closed', criterion_ids: ['must-cover-1'], evidence: 'fixed now',
+    }],
+  }, [], priorOpen), /no weak item names it/)
+})
+
+test('the carried disposition schema admits criterion_ids and nothing else new', () => {
+  const carried = SCHEMA.verdict.properties.carried.items
+  assert.deepEqual(Object.keys(carried.properties).sort(),
+    ['criterion_ids', 'evidence', 'evidence_refs', 'id', 'state'])
+  // Required, like every other property of every engine schema: this project admits no optional
+  // canonical field, and an entry that needs no re-linking sends an empty array.
+  assert.deepEqual([...carried.required].sort(),
+    ['criterion_ids', 'evidence', 'evidence_refs', 'id', 'state'])
+})
+
 test('an open carried finding can justify a non-met criterion without duplication', () => {
   const criterion = criteria[0].criterion
   const weakRows = [{ ...rows[0], state: 'weak' }, ...rows.slice(1)]

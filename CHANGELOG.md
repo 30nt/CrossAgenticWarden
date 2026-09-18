@@ -65,6 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A carried entry kept `open` may list `criterion_ids` of its own, so an item can answer for a
+  criterion it was not raised against. Which criterion an open item blocks changes between rounds;
+  the ids it was raised with are fixed, and the reviewer is told not to duplicate it as a new
+  finding. Measured: three consecutive rejections on a resumed task with twelve open items,
+  $43.40, and no verdict at all.
 - A blocking item binds to a non-met criterion by listing its id in `criterion_ids`, which the
   schema already requires on every finding; quoting the criterion text verbatim is still accepted
   but no longer the only way. The substring rule made rejections unserializable: on one install
