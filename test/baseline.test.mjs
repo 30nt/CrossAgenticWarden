@@ -162,6 +162,7 @@ const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], wea
   return {
     criteria: criterionRows,
     carried: carried.map((row) => ({
+      criterion_ids: [],
       ...row, evidence_refs: row.evidence_refs || ['review-experiment:carried-check'],
     })),
     broken: broken.map((item) => decorate(item, 'broken')),

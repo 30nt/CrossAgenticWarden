@@ -453,9 +453,20 @@ function reviewCriteriaIssue(spec, rows, verdict, additional = [], priorOpen = [
       items.some((item) => namesCriterion(item, row.id, criterion))
     const openCarriedQuotes = priorOpen.some((item) => {
       const disposition = carriedById.get(item?.id)
-      return disposition?.state === 'open' &&
-        (namesCriterion(item, row.id, criterion) ||
-          Boolean(disposition?.evidence?.includes(criterion)))
+      if (disposition?.state !== 'open') return false
+      // Three ways, and the third is why this list is three long. The stored item's own ids are
+      // what it was RAISED against, and which criterion an open item blocks can change between
+      // rounds — the tree moved, and the reviewer is judging it now. Until the disposition could
+      // carry ids of its own, saying so needed the criterion's text verbatim inside the
+      // disposition's evidence: exactly the constraint df33fab removed for a new finding, left
+      // standing for a carried one, while `.caw/agents/reviewer.md` forbids raising a duplicate
+      // instead. Measured on one install, that was a closed door: three consecutive rejections
+      // on a resumed task with twelve open items, $43.40, no verdict once — seven criteria marked
+      // weak, all three blocking slots empty, and none of the twelve dispositions able to say why.
+      return namesCriterion(item, row.id, criterion) ||
+        (Array.isArray(disposition.criterion_ids) &&
+          disposition.criterion_ids.includes(row.id)) ||
+        Boolean(disposition.evidence?.includes(criterion))
     })
     if (!newItemQuotes && !openCarriedQuotes) {
       // Names the id first, because naming the id is what satisfies the check, and the text
@@ -2145,8 +2156,14 @@ const SCHEMA = closeSchema({
                 'you. Closing your own item is a claim like any other; "addressed" is not one.',
             },
             evidence_refs: { type: 'array', items: { type: 'string' } },
+            criterion_ids: {
+              type: 'array', items: { type: 'string' },
+              description: 'engine criterion ids this open item blocks NOW, beyond the ones it ' +
+                'was raised with. Empty unless this entry is the blocking item for a criterion ' +
+                'it was not raised against; meaningless on closed and withdrawn.',
+            },
           },
-          required: ['id', 'state', 'evidence', 'evidence_refs'],
+          required: ['id', 'state', 'evidence', 'evidence_refs', 'criterion_ids'],
         },
       },
       broken: {
@@ -9305,7 +9322,10 @@ function runTask(file, f, profileText, opts = {}) {
             ' question this round exists to answer, and an id you leave out stays open.' +
             ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
             ' was raised should be retracted rather than carried, and retracting your own costs' +
-            ' this task less than the executor bending the code to satisfy it.'
+            ' this task less than the executor bending the code to satisfy it.' +
+            '\n\nA carried entry you keep `open` may also list `criterion_ids`. Use it when that' +
+            ' item is now what blocks a criterion it was not raised against: the entry is then' +
+            ' that criterion\'s blocking item and you must not duplicate it as a new finding.'
           : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
       ].join('')
       const reviewContext = {

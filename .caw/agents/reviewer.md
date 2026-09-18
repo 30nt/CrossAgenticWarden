@@ -71,7 +71,9 @@ only when both establish it. Otherwise record `broken`, `uncovered`, or `weak`, 
 corresponding blocking item in that slot with the criterion's id in its `criterion_ids`. The id is
 the binding; the evidence says what you ran and saw, and it does not have to repeat the criterion.
 In a later round, an already-open item in `carried` is the blocking item when it names that
-criterion. Keep it open in `carried`; do not duplicate it as a new finding.
+criterion — through the ids it was raised with, or through `criterion_ids` on the carried entry
+itself when it now blocks a criterion it was not raised against. Keep it open in `carried`; do
+not duplicate it as a new finding.
 
 Finish the complete criterion ledger before searching for defects not stated in the contract.
 A later round is for judging fixes, not for revealing another visible line of the same spec.
