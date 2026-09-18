@@ -2943,7 +2943,8 @@ function recordWeakVerification(task, round, verification, status = 'active') {
 }
 
 function recordTaskCertification({ task, round, criteria, open, author, reviewer, reviewSurface,
-  reviewBaseline, weakVerification, gateReceipt = null, acceptanceCases = [], executorClaims = [] }) {
+  reviewBaseline, weakVerification, gateReceipt = null, acceptanceCases = [], executorClaims = [],
+  topology = null }) {
   const run = beginRunRecord()
   const population = activePopulationCertification || {
     state: 'unknown', source: 'no-plan-population-record', digest: null,
@@ -2958,7 +2959,7 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
   }
   const state = open.length ? 'rejected' : limitations.length ? 'limited' : 'approved'
   const body = {
-    version: 2,
+    version: 3,
     task,
     round,
     state,
@@ -2974,6 +2975,24 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
     executor_claims: executorClaims,
     gate_receipt: gateReceipt,
     open_item_ids: open.map((item) => item.id),
+    // The census ids were already here; the topology they belong to was not. A blocking finding
+    // must name surface and transition ids, and a transition id is a content hash derived from
+    // the spec — so the record that says what was judged could not say what those ids meant, and
+    // an install checking one afterwards had to re-derive the whole topology by lifting the
+    // engine's own hashing out of caw.mjs and replaying it over the audit's spec string. The
+    // links each open item carries travel with it for the same reason: `open_item_ids` alone
+    // cannot answer which criterion, surface or transition a finding was about.
+    topology: topology ? { surfaces: topology.surfaces, transitions: topology.transitions } : null,
+    open_items: open.map((item) => ({
+      id: item.id,
+      slot: item.slot,
+      round: item.round,
+      criterion_ids: [...(item.criterion_ids || [])],
+      surface_ids: [...(item.surface_ids || [])],
+      transition_ids: [...(item.transition_ids || [])],
+      property_key: item.property_key || null,
+      work_package_id: item.work_package_id || null,
+    })),
     review_surface: {
       surface_id: reviewSurface?.id || null,
       baseline_commit: reviewBaseline || null,
@@ -5286,14 +5305,29 @@ function agent(role, prompt, schema, f, spec, context = null) {
     const budgetExhausted = r.status === 86 &&
       /CAW_EXECUTOR_BUDGET_EXHAUSTED/.test(`${r.stderr || ''}`)
     const interrupted = Boolean(r.signal) || [130, 143].includes(r.status)
+    const failureText = provider.adapter.decodeFailure(r)
+    const expired = expiredCredentials(`${failureText}\n${r.stderr || ''}`)
     recordMissingEnumeratorPopulation(role, interrupted ? 'call was interrupted' : 'call failed')
     recordProviderFailure(role, provider, r, attempt,
-      budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted' : 'nonzero-exit')
+      budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted'
+        : expired ? 'credentials-expired' : 'nonzero-exit')
     if (budgetExhausted) {
       die(`${role} reached its configured live budget and was stopped. Its partial edits remain ` +
         `in the tree and the pre-call round state preserves recovery context.\n${r.stderr.trim()}`)
     }
-    die(`${role} exited ${r.status}\n${provider.adapter.decodeFailure(r)}`)
+    // Told apart from an ordinary failure because the answer is different and the operator
+    // cannot act on "exited 1". A credential outliving a task and not a queue is measured, not
+    // hypothetical: three installs reported it, once per queue on two of them, both times to a
+    // reviewer mid-build, and once to a plan-reviewer that took a finished enumerator and
+    // architect down with it. Nothing about the tree or the request is wrong when this fires.
+    if (expired) {
+      die(`${role} could not authenticate: the provider says its credentials are expired or ` +
+        `rejected.\n  Nothing is wrong with the tree, the spec or the request — re-authenticate ` +
+        `the ${binding.provider} CLI and run the same command again.\n` +
+        `  A planning stage reuses whatever already answered, so the roles that finished are ` +
+        `not paid for twice.\n${failureText}`)
+    }
+    die(`${role} exited ${r.status}\n${failureText}`)
   }
   let decoded, result
   try {
@@ -5476,6 +5510,71 @@ function recordPlanningCache(entry) {
   writeRunManifest('active')
 }
 
+// One repair prompt for every role that gets one. It hands back the exact validation path and
+// message, the original request, and the complete rejected value — a role cannot fix what it is
+// not shown, and a diagnostic alone leaves it guessing which part of a long answer was refused.
+// Narrow on purpose. A credentials answer given to an unrelated failure sends an operator to
+// re-authenticate over a defect in their own tree, which is worse than the generic message this
+// replaces. Every pattern here names an authentication outcome, never a bare status line.
+const EXPIRED_CREDENTIALS = [
+  /\b(?:oauth\s+)?(?:access\s+)?token\s+(?:has\s+)?expired\b/i,
+  /\bexpired\s+(?:oauth\s+)?(?:access\s+)?token\b/i,
+  /\bauthentication[_\s-]?error\b/i,
+  /\binvalid[_\s-]api[_\s-]key\b/i,
+  /\b401\b[^\n]{0,80}\b(?:unauthorized|auth|token|credential)/i,
+  /\b(?:unauthorized|credentials?)\b[^\n]{0,80}\b(?:expired|invalid|rejected)\b/i,
+  /\bplease\s+(?:re-?)?(?:run|login|log\s+in|authenticate)\b[^\n]{0,80}\blogin\b/i,
+]
+
+function expiredCredentials(text) {
+  const value = String(text || '')
+  return EXPIRED_CREDENTIALS.some((pattern) => pattern.test(value))
+}
+
+function canonicalRepairPrompt(role, prompt, problem, repair) {
+  return [
+    `Canonical repair ${repair} for ${role}.`,
+    '\n\nYour previous response failed the engine canonical validation at ',
+    `${problem.path}: ${problem.detail}.`,
+    '\nReturn one complete replacement value. Preserve everything valid in the rejected value;',
+    ' change only what is required to satisfy that exact diagnostic. Do not return a patch or',
+    ' an explanation.',
+    '\n\nOriginal request to this role:\n\n', prompt,
+    '\n\nRejected canonical value:\n\n', JSON.stringify(problem.value, null, 2),
+  ].join('')
+}
+
+// The delivery roles had no canonical repair at all: only architect and plan-reviewer did, and a
+// malformed answer from the executor or the reviewer ended the run. Measured on two installs —
+// a Codex executor stopped a task at `$.claims: ... names unknown acceptance case id(s)`, and a
+// reviewer's schema failures ended reviews outright — where the same bounded repair the planning
+// roles get would have cost one call instead of a whole round.
+//
+// `onRepair` exists because the reviewer owns an isolated surface it may have mutated before
+// answering: the retry has to start from the same baseline the first attempt did, or the second
+// answer describes a tree the first one changed.
+function canonicalRepairCall(role, prompt, schema, f, file, context, onRepair = null) {
+  let problem = null
+  for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
+    let value = null
+    try {
+      return agent(role, repair === 0 ? prompt : canonicalRepairPrompt(role, prompt, problem, repair),
+        schema, f, file, context)
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError) || error.role !== role) throw error
+      if (error.value === null) error.value = value
+      problem = error
+    }
+    recordEngineDiagnostic(role, 'canonical-validation', {
+      repair, path: problem.path, message: problem.detail,
+    }, problem.attemptId)
+    if (repair >= MAX_PLANNING_CANONICAL_REPAIRS) throw problem
+    say(`  ${role} canonical inconsistency; retrying once: ${problem.path} ${problem.detail}`)
+    if (onRepair) onRepair()
+  }
+  throw problem
+}
+
 function planningCanonicalCall(role, prompt, schema, f, validate = null) {
   const cacheIdentity = planningValueCacheIdentity(role, prompt, schema, f)
   const cached = readPlanningValueCache(cacheIdentity, schema)
@@ -5500,16 +5599,8 @@ function planningCanonicalCall(role, prompt, schema, f, validate = null) {
   }
   let problem = null
   for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
-    const repairPrompt = repair === 0 ? prompt : [
-      `Canonical repair ${repair} for ${role}.`,
-      '\n\nYour previous response failed the engine canonical validation at ',
-      `${problem.path}: ${problem.detail}.`,
-      '\nReturn one complete replacement value. Preserve every valid task, case, relation, and',
-      ' decision from the rejected value; change only what is required to satisfy that exact',
-      ' diagnostic. Do not return a patch or an explanation.',
-      '\n\nOriginal request to this role:\n\n', prompt,
-      '\n\nRejected canonical value:\n\n', JSON.stringify(problem.value, null, 2),
-    ].join('')
+    const repairPrompt = repair === 0 ? prompt
+      : canonicalRepairPrompt(role, prompt, problem, repair)
     let value = null
     try {
       value = agent(role, repairPrompt, schema, f)
@@ -9158,7 +9249,7 @@ function runTask(file, f, profileText, opts = {}) {
       // receipt and review history needed to continue it without a fresh reading.
       saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
         weakVerification, gateFact)
-      ex = agent('executor', [
+      ex = canonicalRepairCall('executor', [
         dossier.text,
         '\n\nImplement the task contract. Treat executor claims in the dossier only as prior hints.',
         '\nReturn a concise summary and notes. Claims are optional navigation metadata in meaning:',
@@ -9181,7 +9272,7 @@ function runTask(file, f, profileText, opts = {}) {
           : '',
       ].join(''), SCHEMA.delivery, f, file, {
         dossier: dossier.meta, round: round + 1, executorBudget,
-      })
+      }, null)
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
@@ -9498,7 +9589,11 @@ function runTask(file, f, profileText, opts = {}) {
             '\n\nOriginal review request:\n\n', reviewPrompt,
             '\n\nRejected canonical value:\n\n', JSON.stringify(passVerdict),
           ].join('')
-          passVerdict = agent('reviewer', prompt, SCHEMA.verdict, f, file, reviewContext)
+          // The surface is restored between canonical attempts for the same reason the semantic
+          // loop restores it: a pass that mutated its surface before answering must not have its
+          // retry describe the tree the first attempt left behind.
+          passVerdict = canonicalRepairCall('reviewer', prompt, SCHEMA.verdict, f, file,
+            reviewContext, () => resetReviewPassForSemanticRepair(reviewSurface, passBaseline))
           if (deliveryDigest() !== deliveryBaseline) {
             die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
           }
@@ -9612,6 +9707,7 @@ function runTask(file, f, profileText, opts = {}) {
       gateReceipt: g.receipt,
       acceptanceCases,
       executorClaims: ex?.claims || [],
+      topology,
     })
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
@@ -10576,6 +10672,7 @@ function acceptHumanReview(attestationPath, signaturePath) {
     gateReceipt: taskGate.receipt,
     acceptanceCases,
     executorClaims: resume?.ex?.claims || [],
+    topology,
   })
   commit(file, spec, resume?.ex || null, f, round, gateRedAttempts, 'human', [], digest, certification)
   finishReviewedTask(f, risk, fullGateBaseline)
@@ -11097,6 +11194,7 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
+  expiredCredentials,
   requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
   taskEvidenceLifecycleBlock, taskKey,
   verifyProjectPolicies, zeroAccounting,

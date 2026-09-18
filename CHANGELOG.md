@@ -65,6 +65,17 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- The task certification record carries the topology its ids belong to and the criterion, surface
+  and transition links of every open finding. `open_item_ids` alone could not say what a finding
+  was about, and one install had to re-derive the engine's own hashing over the audit's spec
+  string to read a transition id. The record is version 3.
+- Executor and reviewer answers that fail canonical validation receive one bounded repair, the
+  same one architect and plan-reviewer already had, with the exact diagnostic and the complete
+  rejected value. The reviewer's surface is restored to its pass baseline between attempts. A
+  second invalid answer still stops, with both attempts in the retained failure record.
+- An expired or rejected provider credential is reported as itself rather than as `exited 1`, and
+  says the tree, spec and request are not at fault. Measured on three installs; on two of them
+  once per queue, both times to a reviewer mid-build.
 - Architect and plan-reviewer canonical values are cached on exact identity, in Git's private
   `caw/planning-cache/`, the way the enumerator's population already was. A planning stage that
   died part-way charged again for every role that had already answered: measured, an expired token
