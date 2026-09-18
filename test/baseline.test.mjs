@@ -21,7 +21,8 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  adapterImplementationDigest, extractTaskTopology, groupFindings, mergeReviewPasses,
+  adapterImplementationDigest, expiredCredentials,
+  extractTaskTopology, groupFindings, mergeReviewPasses,
   planningLedger, populationBlock,
   providerLaunch, readProjectPolicies, resolvePopulation, reviewCriteriaIssue,
   resolvePopulationSource, retainWeakVerificationEvents, taskEvidenceLifecycleBlock,
@@ -4395,7 +4396,14 @@ function assertGateArtifactReview(repairAndChallenge = false) {
     assert.equal(existsSync(file.path), false, 'the artifact copy is cleaned up with its review surface')
   }
   assert.equal(paths.size, observations.length, 'each pass has its own artifact copies')
-  assert.equal(certification.version, 2)
+  assert.equal(certification.version, 3)
+  // The topology the ids in this record belong to, so a later reader can say what a finding's
+  // transition id MEANT without re-deriving the engine's hashing over the spec.
+  assert.deepEqual(certification.topology.surfaces.map((row) => row.id), ['settings-language'])
+  assert.equal(certification.topology.transitions.length, 1)
+  assert.match(certification.topology.transitions[0].id, /^transition-[0-9a-f]{12}$/)
+  assert.equal(certification.topology.transitions[0].surface, 'settings-language')
+  assert.deepEqual(certification.open_items, [])
   assert.deepEqual(certification.acceptance_cases.map((row) => row.id), ['ui-case'])
   assert.equal(certification.gate_receipt.owner, 'caw-engine')
   assert.equal(certification.gate_receipt.manifest.checks[0].id, 'ui-check')
@@ -6045,6 +6053,125 @@ test('a non-met criterion names the exact text its blocking item has to quote', 
 
 // End to end, the shape that could not serialize on a third install: a real rejection whose
 // finding names its criterion by id and describes what was observed without restating it.
+// The record of a rejected round must say what its findings were ABOUT. `open_item_ids` alone
+// names them and nothing else, so an install checking afterwards which transition a finding meant
+// had to re-derive the whole topology from the audit's spec string.
+// A credential outliving a task and not a queue is measured on three installs: twice to a
+// reviewer mid-build, once to a plan-reviewer that took a finished enumerator and architect down
+// with it. `exited 1` is not something an operator can act on, and the tree is not at fault.
+test('an expired credential is told apart from an ordinary provider failure', () => {
+  for (const text of [
+    'API Error: 401 {"type":"error","error":{"type":"authentication_error",' +
+      '"message":"OAuth access token has expired"}}',
+    'Error: 401 Unauthorized — token expired',
+    'invalid_api_key: the provided key was rejected',
+    'credentials rejected',
+  ]) assert.equal(expiredCredentials(text), true, text)
+
+  for (const text of [
+    'exited 1',
+    'API Error: 500 Server error mid-response',
+    'the spec mentions a 401 response code in its done_when',
+    'ENOENT: no such file or directory',
+    '',
+  ]) assert.equal(expiredCredentials(text), false, text)
+})
+
+test('a malformed executor answer is repaired once instead of ending the run', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    // A claim missing the fields the delivery schema requires: valid JSON, invalid canonical value.
+    { envelope: envelope({ summary: 'first try', notes: [], blocked: '',
+      claims: [{ id: 'check-one', summary: 'ran it' }] }) },
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /executor canonical inconsistency; retrying once: \$\.claims/)
+  // Two executor calls, not one and a dead run. The reviewer's own call is absent from this log
+  // because it runs inside its isolated surface, which cannot write here.
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor', 'executor'])
+  assert.match(result.stdout, /committed {2}[0-9a-f]{7}/)
+  const repair = calls(f)[1].input
+  assert.match(repair, /Canonical repair 1 for executor/)
+  assert.match(repair, /Rejected canonical value/)
+  assert.match(repair, /check-one/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.diagnostics.filter((row) =>
+    row.role === 'executor' && row.kind === 'canonical-validation').length, 1)
+  assert.equal(existsSync(join(f.root, '.git', 'caw', 'contract-failures')), false)
+})
+
+test('a second malformed executor answer still stops, with the failure retained', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const malformed = { envelope: envelope({ summary: 'try', notes: [], blocked: '',
+    claims: [{ id: 'check-one', summary: 'ran it' }] }) }
+  const result = run(f, ['build'], [malformed, malformed])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /executor returned invalid canonical output at \$\.claims/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor', 'executor'])
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const record = JSON.parse(readFileSync(join(root, readdirSync(root)[0]), 'utf8'))
+  assert.equal(record.role, 'executor')
+  assert.equal(record.diagnostics.length, 2)
+})
+
+test('a rejected round records its findings\' links and the topology they belong to',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_links.md'), [
+    '---', 'title: Links', '---', '',
+    '## Surfaces',
+    '- `retention-window` — the configured retention period', '',
+    '## State machines',
+    '- `retention-window`: states `days`, `duration`',
+    '  - `days` -- convert to a duration --> `duration`', '',
+    '## Done when',
+    '- Retention converts days to a positive duration.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+
+  const expected = extractTaskTopology(
+    readFileSync(join(f.root, '.caw-tasks', '001_links.md'), 'utf8'))
+  const transitionId = expected.transitions[0].id
+  const result = run(f, ['review', '001_links.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'observed a negative period' }],
+      broken: [{ where: 'README.md:1', fix: 'bound the multiplication',
+        surface_ids: ['retention-window'], transition_ids: [transitionId],
+        evidence: 'ran the conversion with 3650 and saw a negative period' }],
+    })) },
+  ])
+  assert.equal(result.status, 1)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const certName = readdirSync(join(f.root, '.caw-logs', runName))
+    .find((name) => name.startsWith('certification-'))
+  const certification = JSON.parse(
+    readFileSync(join(f.root, '.caw-logs', runName, certName), 'utf8'))
+
+  assert.equal(certification.state, 'rejected')
+  assert.equal(certification.open_items.length, 1)
+  const [item] = certification.open_items
+  assert.equal(item.id, certification.open_item_ids[0])
+  assert.equal(item.slot, 'broken')
+  assert.deepEqual(item.criterion_ids, ['done-when-1'])
+  assert.deepEqual(item.surface_ids, ['retention-window'])
+  assert.deepEqual(item.transition_ids, [transitionId])
+  assert.ok(item.property_key)
+  // And the topology those ids resolve against, so nothing has to be re-derived to read them.
+  assert.deepEqual(certification.topology.transitions.map((row) => row.id), [transitionId])
+  assert.equal(certification.topology.transitions[0].from, 'days')
+  assert.equal(certification.topology.transitions[0].to, 'duration')
+})
+
 test('a reviewer rejection that names its criterion by id is recorded as a finding',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })
