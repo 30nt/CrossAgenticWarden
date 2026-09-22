@@ -563,6 +563,35 @@ function evidenceRefIssue(ref, sources) {
   return `unsupported evidence reference kind ${kind}`
 }
 
+// The shape a property key must have, named once so the schema, the prompt, the role file and
+// the diagnostic all say the same thing. It used to live only in the regex below: the schema
+// described the field as a "stable project-independent key", the role file said "one stable
+// `property_key`", and nothing said which characters. For a word like "key" snake_case is the
+// first choice, and it was the one refused. Measured on one install: four reviewer calls in a
+// row, $12.67, each returning keys like `assertion_cannot_distinguish_value_source` and each
+// refused with `has invalid property_key` — a diagnostic that named the field and not the rule,
+// so the repair call could not fix what it was not told. $11.51 of executor work sat green in
+// the tree with nothing able to judge it.
+const PROPERTY_KEY_PATTERN = /^[a-z][a-z0-9.-]{0,127}$/
+const PROPERTY_KEY_RULE = 'lowercase letters, digits, dots and hyphens, starting with a letter, ' +
+  'at most 128 characters, e.g. `replay.refused-batch-stays-refused`'
+
+// Case, underscores and spaces are notation, not identity: `assertion_cannot_distinguish` and
+// `assertion-cannot-distinguish` name one property, and a reviewer that writes one in round 1 and
+// the other in round 2 must not split one defect into two work packages. So the key is
+// normalised rather than the pattern widened — widening would make both spellings valid and
+// different. Anything still outside the pattern after this is refused, with the rule named.
+function normalizePropertyKeys(verdict) {
+  for (const slot of SLOTS) {
+    for (const item of verdict?.[slot] || []) {
+      if (typeof item?.property_key !== 'string') continue
+      item.property_key = item.property_key.trim().toLowerCase()
+        .replace(/[_\s]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '')
+    }
+  }
+  return verdict
+}
+
 function reviewContractIssue(verdict, { criteria = [], surfaces = [], transitions = [],
   receipt = null, claims = [] } = {}) {
   const criterionIds = new Set(criteria.map((row) => row.id))
@@ -597,8 +626,9 @@ function reviewContractIssue(verdict, { criteria = [], surfaces = [], transition
   for (const slot of SLOTS) {
     for (const [index, item] of (verdict[slot] || []).entries()) {
       const label = `${slot}[${index}]`
-      if (!/^[a-z][a-z0-9.-]{0,127}$/.test(item.property_key)) {
-        return `${label} has invalid property_key`
+      if (!PROPERTY_KEY_PATTERN.test(item.property_key)) {
+        return `${label} has invalid property_key ${JSON.stringify(item.property_key)}; ` +
+          `use ${PROPERTY_KEY_RULE}`
       }
       for (const [name, values] of Object.entries({
         criterion_ids: item.criterion_ids,
@@ -1919,7 +1949,9 @@ const REVIEW_ITEM = {
     },
     property_key: {
       type: 'string',
-      description: 'stable project-independent key for the violated property; not prose similarity',
+      description: 'stable project-independent key for the violated property; not prose ' +
+        'similarity. Lowercase letters, digits, dots and hyphens, starting with a letter, e.g. ' +
+        'replay.refused-batch-stays-refused',
     },
     evidence: {
       type: 'string',
@@ -9665,7 +9697,8 @@ function runTask(file, f, profileText, opts = {}) {
         ' `gate-artifact:<id>`, `executor-claim:<id>`, `repository:<path>` or',
         ' `review-experiment:<id>`. A met criterion cannot rely only on executor claims.',
         ' Every new finding must also name criterion_ids, surface_ids, transition_ids and one',
-        ' stable property_key. Use empty surface/transition arrays only when the contract has no',
+        ` stable property_key: ${PROPERTY_KEY_RULE}.`,
+        ' Use empty surface/transition arrays only when the contract has no',
         ' applicable topology. Repeated symptoms share a work package only when all these stable',
         ' links and property_key match; similar prose or a shared file is not enough.',
         '\n\nThe engine-owned surface and transition ids, which are the only values those two',
@@ -9751,6 +9784,7 @@ function runTask(file, f, profileText, opts = {}) {
             spec, passVerdict.criteria, passVerdict, projectCriteria, open)
           if (!carriedProblem && !criteriaProblem) {
             bindFindingCriteria(passVerdict, [...coreCriteria, ...projectCriteria])
+            normalizePropertyKeys(passVerdict)
           }
           const contractProblem = carriedProblem || criteriaProblem ? null : reviewContractIssue(
             passVerdict, {
@@ -10838,6 +10872,7 @@ function acceptHumanReview(attestationPath, signaturePath) {
     }
   }
   const criteriaIssue = reviewCriteriaIssue(spec, a.criteria, verdict, projectCriteria)
+  normalizePropertyKeys(verdict)
   const contractIssue = criteriaIssue ? null : reviewContractIssue(verdict, {
     criteria: [...coreCriteria, ...projectCriteria], surfaces: topology.surfaces,
     transitions: topology.transitions, receipt: taskGate.receipt,
@@ -11388,7 +11423,7 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
-  boundedUtf8HeadTail, expiredCredentials, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
+  boundedUtf8HeadTail, expiredCredentials, normalizePropertyKeys, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
   requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
   taskEvidenceLifecycleBlock, taskKey,
   verifyProjectPolicies, zeroAccounting,

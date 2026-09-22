@@ -6336,6 +6336,31 @@ test('a rejected round records its findings\' links and the topology they belong
   assert.equal(certification.topology.transitions[0].to, 'duration')
 })
 
+// The shape one install hit four times running: a finding keyed in snake_case, refused each time.
+test('a reviewer finding keyed in snake_case is recorded, with the key normalised',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_keys.md'),
+    'title: Keys\n\n## Done when\n- The handler propagates the failing step error.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_keys.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'a later consequence is reported' }],
+      broken: [{ where: 'README.md:1', fix: 'propagate the first error',
+        property_key: 'handler_propagates_failing_step_error_rather_than_later_consequence',
+        evidence: 'forced the first step to fail and saw the second step error instead' }],
+    })) },
+  ])
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.doesNotMatch(output, /invalid property_key/)
+  assert.doesNotMatch(output, /invalid canonical output/)
+  assert.match(output, /one round this command runs is done/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.round-001_keys.md.json'), 'utf8'))
+  assert.equal(saved.history[0].property_key,
+    'handler-propagates-failing-step-error-rather-than-later-consequence')
+})
+
 test('a reviewer rejection that names its criterion by id is recorded as a finding',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })

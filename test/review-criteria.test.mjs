@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { SCHEMA, extractReviewCriteria, reviewCriteriaIssue } from '../caw.mjs'
+import {
+  SCHEMA, extractReviewCriteria, normalizePropertyKeys, reviewContractIssue,
+  reviewCriteriaIssue,
+} from '../caw.mjs'
 
 const spec = `---
 id: 001
@@ -158,4 +161,41 @@ test('reviewer schema requires the complete criterion ledger', () => {
   assert.ok(SCHEMA.verdict.required.includes('criteria'))
   assert.deepEqual(SCHEMA.verdict.properties.criteria.items.properties.state.enum,
     ['met', 'broken', 'uncovered', 'weak'])
+})
+
+// The key's shape lived only in a regex. Measured on one install: four reviewer calls in a row,
+// $12.67, returned snake_case keys and were refused with a diagnostic that named the field and
+// not the rule, so no repair could fix it.
+test('a snake_case property key is normalised rather than refused', () => {
+  const verdict = {
+    criteria: [], carried: [], uncovered: [], broken: [],
+    weak: [{
+      property_key: 'Assertion_Cannot_Distinguish  value_source',
+      criterion_ids: ['must-cover-1'], surface_ids: [], transition_ids: [],
+      evidence_refs: ['repository:src/a.js'],
+    }],
+  }
+  normalizePropertyKeys(verdict)
+  assert.equal(verdict.weak[0].property_key, 'assertion-cannot-distinguish-value-source')
+  assert.equal(reviewContractIssue(verdict, { criteria: [{ id: 'must-cover-1' }] }), null)
+})
+
+test('a property key still outside the rule is refused with the rule named', () => {
+  const verdict = {
+    criteria: [], carried: [], uncovered: [], broken: [],
+    weak: [{
+      property_key: '9-starts-with-a-digit',
+      criterion_ids: ['must-cover-1'], surface_ids: [], transition_ids: [],
+      evidence_refs: ['repository:src/a.js'],
+    }],
+  }
+  normalizePropertyKeys(verdict)
+  const issue = reviewContractIssue(verdict, { criteria: [{ id: 'must-cover-1' }] })
+  assert.match(issue, /has invalid property_key "9-starts-with-a-digit"/)
+  assert.match(issue, /lowercase letters, digits, dots and hyphens, starting with a letter/)
+})
+
+test('the reviewer schema names the property key rule', () => {
+  const described = JSON.stringify(SCHEMA.verdict)
+  assert.match(described, /Lowercase letters, digits, dots and hyphens, starting with a letter/)
 })

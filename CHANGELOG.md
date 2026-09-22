@@ -65,6 +65,12 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A finding's `property_key` has its rule named — in the schema, the prompt, the reviewer role
+  file and the refusal — and case, underscores and spaces are normalised to it rather than refused.
+  The rule lived only in a regex, and snake_case, the first choice for a "key", was the one it
+  refused: measured, four reviewer calls in a row ($12.67) refused with `has invalid property_key`,
+  a diagnostic naming the field and not the rule, while $11.51 of executor work sat unjudged.
+  Normalising instead of widening keeps `a_b` and `a-b` one work package.
 - Gate output keeps its end. The executor's dossier bounded the serialized receipt from the head,
   and a gate prints its failure last: measured, a red gate wrote 78,908 bytes with its compile
   error at byte 78,601, the dossier kept the first 24 KB, and two executor variants spent 3 and 9
