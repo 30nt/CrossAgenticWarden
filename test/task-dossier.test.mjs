@@ -78,6 +78,31 @@ test('task dossier bounds every section and records every truncation', () => {
   assert.match(dossier.text, /repository reads remain available/)
 })
 
+// Measured on one install: a red gate wrote 78,908 bytes with its compile error at byte 78,601,
+// the executor's dossier kept the first 24 KB of the serialized receipt, and two executor
+// variants spent 3 and 9 retries against a failure they were never shown.
+test('an executor dossier shows the end of a red gate output, where the failure is', () => {
+  const failure = 'AnswersSortDefaultTests.swift:284:63: error: cannot force unwrap value'
+  const output = `${'build warning: noise\n'.repeat(3800)}FAIL unit-bundle\n${failure}\n`
+  assert.ok(Buffer.byteLength(output) > 78_000)
+  const receipt = {
+    version: 1, owner: 'caw-engine', task: '001.md', kind: 'fast', command: 'gate_fast.sh',
+    state: 'red', status: 1, receipt_id: 'r'.repeat(64),
+    output: { bytes: Buffer.byteLength(output), retained: output, truncated: false },
+    manifest: { present: false, checks: [], error: null }, artifacts: [],
+  }
+  const dossier = buildTaskDossier({ spec, gateEvidence: receipt })
+  const section = dossier.meta.sections.find((row) => row.name === 'gate_evidence')
+
+  assert.ok(dossier.text.includes(failure), 'the failure line must reach the executor')
+  assert.ok(dossier.text.includes('FAIL unit-bundle'))
+  assert.match(dossier.text, /bytes elided from the middle/)
+  // The receipt stays identifiable, and the section still honours its cap.
+  assert.ok(dossier.text.includes('r'.repeat(64)))
+  assert.equal(section.truncated, true)
+  assert.ok(section.included_bytes <= 24 * 1024)
+})
+
 test('task delivery diff includes tracked edits and new untracked files', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'caw-task-diff-test-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))

@@ -141,7 +141,7 @@ test('engine receipt is bound to its delivery digest and bounds retained output'
   const input = {
     command: 'npm test', task: '001.md', kind: 'fast', state: 'green', commandState: 'green',
     status: 0, commandStatus: 0, durationMs: 12, timeoutMs: 1000,
-    rawOutput: 'x'.repeat(1024 * 1024 + 200),
+    rawOutput: `${'x'.repeat(1024 * 1024 + 200)}\nFAIL: the one line anyone needed\n`,
     evidence: { present: false, checks: [], artifacts: [] },
   }
   const first = retainGateEvidence({ ...input, deliveryDigest: 'a'.repeat(64) })
@@ -150,6 +150,9 @@ test('engine receipt is bound to its delivery digest and bounds retained output'
   assert.equal(first.delivery_digest, 'a'.repeat(64))
   assert.notEqual(first.receipt_id, second.receipt_id)
   assert.equal(first.output.truncated, true)
-  assert.equal(first.output.retained_bytes, 1024 * 1024)
-  assert.equal(first.output.bytes, 1024 * 1024 + 200)
+  assert.ok(first.output.retained_bytes <= 1024 * 1024)
+  assert.equal(first.output.bytes, Buffer.byteLength(input.rawOutput))
+  // A gate prints its failure last. A head-only bound kept everything but it.
+  assert.match(first.output.retained, /FAIL: the one line anyone needed\n$/)
+  assert.match(first.output.retained, /bytes elided from the middle/)
 })
