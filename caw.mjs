@@ -9981,6 +9981,59 @@ function resumeTask(cmd, arg) {
 // The third is the one worth having. Before it, the only way out of a task the loop could not
 // approve was `done`, which removes a spec from the queue with no judgement of the work at all
 // — so the tasks most likely to need a review were exactly the ones guaranteed not to get one.
+// What the public commit says the change IS. It used to be the executor's summary, and an
+// executor's summary describes its own round: after a review round sends it back, the summary it
+// writes is about closing those findings. The commit carries the whole task, so the two agree
+// only when there was exactly one round — and there almost never is. Measured on one install:
+// three commits of four, each +377 to +1565 lines, whose bodies described the test hardening that
+// closed the last round's findings and said nothing of the work — one of them a batch-acceptance
+// path over three lookup places, of which the body mentioned none. The round reports are kept in
+// full in the private audit record, where they belong; the public body is what a reader with
+// `git log` and no `.git/caw/` will have in six months.
+//
+// One executor round: its summary does describe the whole delivery, so it stays. Otherwise the
+// body is built from what the task was judged against — its `## Change` bullets, the same census
+// the reviewer filled — and the shape of the staged delivery, both true of the whole task.
+const COMMIT_BODY_FILES_MAX = 30
+
+function taskCommitBody(spec, ex, round, how) {
+  // The staged delivery: every file this commit carries, with its own line counts.
+  let stat = []
+  try {
+    stat = git('diff', '--cached', '--numstat').trim().split('\n').filter(Boolean)
+      .map((line) => line.split('\t'))
+      .map(([added, removed, ...path]) => ({ added, removed, path: path.join('\t') }))
+  } catch { /* the body still says what the task was, without the file list */ }
+  const count = (value) => (value === '-' ? 0 : Number(value) || 0)
+  const added = stat.reduce((sum, row) => sum + count(row.added), 0)
+  const removed = stat.reduce((sum, row) => sum + count(row.removed), 0)
+  const files = stat.length ? [
+    `${stat.length} file${stat.length === 1 ? '' : 's'}, +${added} -${removed}:`,
+    ...stat.slice(0, COMMIT_BODY_FILES_MAX).map((row) =>
+      row.added === '-' ? `  ${row.path} (binary)` : `  ${row.path} (+${row.added} -${row.removed})`),
+    ...(stat.length > COMMIT_BODY_FILES_MAX
+      ? [`  … and ${stat.length - COMMIT_BODY_FILES_MAX} more`] : []),
+  ] : []
+
+  const change = extractReviewCriteria(spec).filter((row) => row.section === 'Change')
+    .map((row) => `- ${row.criterion}`)
+  const singleRound = round === 1 && how !== 'hand' && ex?.summary
+
+  let description
+  if (singleRound) description = [ex.summary]
+  else if (change.length) description = ['Change:', ...change]
+  else if (how === 'hand' || !ex?.summary) {
+    // Stated rather than filled in: `review` approves a tree no executor produced under its eye,
+    // and this script cannot tell a hand-finished tree from a round killed after its executor.
+    description = ['No executor round recorded for this task — the tree was finished outside the' +
+      ' pipeline and approved by `review`.']
+  } else {
+    description = [`Delivered over ${round} review rounds. The spec has no \`## Change\` section,` +
+      ' so the contract and each round\'s report are only in the audit record below.']
+  }
+  return [...description, ...(files.length ? ['', ...files] : [])]
+}
+
 function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [],
   reviewedDigest = null, certification = null) {
   requireTaskBranch(f)
@@ -10066,15 +10119,7 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   // here takes it back.
   git('commit', '-q', '--cleanup=verbatim', '-m', [
     subject, '',
-    // The summary line is what a later reader sees first, so it says only what this script
-    // actually knows. `review` approves a tree no executor produced under its eye, and until the
-    // round was saved before the gate there was only one way to arrive there: a human had
-    // written it. There are two now — a round killed after its executor leaves exactly the same
-    // shape — and this script cannot tell them apart, so it stopped claiming to. It says who
-    // approved and how; the summary describes the last delivery anyone recorded, and the absence
-    // of one is itself stated rather than filled in.
-    ex?.summary || 'No executor round recorded for this task — the tree was finished outside the'
-      + ' pipeline and approved by `review`.', '',
+    ...taskCommitBody(spec, ex, round, how), '',
     `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.` +
       ` Not run: ${f.gate_full || '(none configured)'}.`,
     `Review: ${certification?.state === 'limited' ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${

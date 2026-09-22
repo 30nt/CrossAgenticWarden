@@ -65,6 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A task commit's body describes the whole delivery. It was the executor's summary of its last
+  round, which after a review sends it back is about closing findings: measured, three commits of
+  four (+377 to +1565 lines) described only the last round's test hardening. One round keeps the
+  summary; more build the body from the spec's `## Change` bullets and the staged file list. Every
+  round's report stays in the private audit record.
 - A `## Canonical docs` entry written as a markdown link is read relative to `.caw/`, where the
   profile is clicked from, so `[x](../docs/x.md)` is `docs/x.md` — the path every role is told to
   cite. The target used to enter the authority set verbatim, and an enumerator citing a canonical
