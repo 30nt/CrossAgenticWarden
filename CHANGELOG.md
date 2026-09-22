@@ -65,6 +65,13 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A `## Canonical docs` entry written as a markdown link is read relative to `.caw/`, where the
+  profile is clicked from, so `[x](../docs/x.md)` is `docs/x.md` — the path every role is told to
+  cite. The target used to enter the authority set verbatim, and an enumerator citing a canonical
+  document by its real path was refused. Root-relative link targets keep working.
+- A refused enumerator answer is retained with its value and a diagnostic. The request-issue check
+  threw with neither, so the retained record read `"rejected_value": "null"` over an answer that
+  held two real defects in the project's normative document.
 - The task certification record carries the topology its ids belong to and the criterion, surface
   and transition links of every open finding. `open_item_ids` alone could not say what a finding
   was about, and one install had to re-derive the engine's own hashing over the audit's spec

@@ -43,6 +43,18 @@ Text
   assert.deepEqual([...paths], ['.caw/CAW.md', 'docs/product.md', 'docs/stack.md'])
 })
 
+test('a link target is read relative to .caw/, where the profile is clicked from', () => {
+  const paths = canonicalAuthorityPaths(`## Canonical docs
+
+- [Handler](../docs/center/sync-handler.md) — relative to the profile
+- [Rooted](/docs/rooted.md)
+- [Anchored](../docs/anchored.md#section)
+- [Escapes](../../outside.md)
+`)
+  assert.deepEqual([...paths], ['.caw/CAW.md', 'docs/center/sync-handler.md',
+    'docs/rooted.md', 'docs/anchored.md'])
+})
+
 const relatedPlan = () => ({
   tasks: [{
     slug: 'preserve-state',
