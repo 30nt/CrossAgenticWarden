@@ -68,6 +68,11 @@ An id it leaves out stays open: silence closes nothing. Without this, a reviewer
 every round and never converges — measured on one install as three round-2 items naming test code
 no round-1 fix had touched.
 
+The plan reviewer is bound the same way. The holes a plan review raised are handed to the next
+one by id — between `plan` rounds, into `review-specs` from `PLAN.md`'s `## Unclosed`, and between
+its fix rounds — and each must be answered before the queue can be approved. Without it, a second
+sample that found nothing approved byte-identical specs whose real holes the first had named.
+
 **A gate result never passes through an agent.** Green or red is an exit code. A test-runner
 specialist was deleted after measurement: 4 spawns, 256k tokens, 13% of a lane, 0 usable verdicts.
 
