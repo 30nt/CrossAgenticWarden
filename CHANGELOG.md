@@ -65,6 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- Concurrent CAW processes no longer break each other's temp sweeps. An entry vanishing between
+  readdir and lstat threw ENOENT out of whatever command had started; and a directory swept inside
+  its creator's window between mkdtemp and writing its manifest was removed as abandoned — for an
+  adapter transport, a directory holding a copied credential mid-call. Manifest-less entries
+  younger than a minute are left alone; older ones are removed as before.
 - A task commit's body describes the whole delivery. It was the executor's summary of its last
   round, which after a review sends it back is about closing findings: measured, three commits of
   four (+377 to +1565 lines) described only the last round's test hardening. One round keeps the

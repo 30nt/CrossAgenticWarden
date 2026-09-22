@@ -3893,18 +3893,42 @@ function removeReviewSurface(surface) {
   try { removeTree(surface.parent) } catch { /* retained by the OS */ }
 }
 
+// Three sweeps share one temp parent each with every other CAW process on the machine, and each
+// used to assume it was alone. Two assumptions broke. An entry can VANISH between readdir and
+// lstat — another process pruned or finished it — and the sweep threw ENOENT out of whatever
+// command had started, before that command did anything: measured as a flaky failure of the
+// engine's own suite, whose test files run as parallel processes. And an entry can be YOUNG: a
+// creator makes the directory first and writes its manifest a moment later, and a sweep landing
+// in that window read "missing manifest" and removed a live sibling's directory — for an adapter
+// transport, one holding a copied credential mid-call. One owner running builds on several
+// projects at once is the configuration that meets both.
+const PRUNE_CREATION_GRACE_MS = 60 * 1000
+
+function pruneEntryStat(path) {
+  try { return lstatSync(path) }
+  catch (error) {
+    if (error?.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function youngEntry(stat, now = Date.now()) {
+  return Boolean(stat) && now - stat.mtimeMs < PRUNE_CREATION_GRACE_MS
+}
+
 function pruneInvocationScratch() {
   mkdirSync(INVOCATION_SCRATCH_PARENT, { recursive: true, mode: 0o700 })
   try { chmodSync(INVOCATION_SCRATCH_PARENT, 0o700) } catch { /* no POSIX modes */ }
   for (const name of readdirSync(INVOCATION_SCRATCH_PARENT)) {
     if (!name.startsWith('scratch-')) continue
     const parent = join(INVOCATION_SCRATCH_PARENT, name)
+    const stat = pruneEntryStat(parent)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try {
-      const stat = lstatSync(parent)
-      if (!stat.isDirectory() || stat.isSymbolicLink()) continue
       manifest = JSON.parse(readFileSync(join(parent, 'manifest.json'), 'utf8'))
     } catch {
+      if (youngEntry(stat)) continue
       removeTree(parent)
       continue
     }
@@ -4002,8 +4026,8 @@ function pruneAdapterTransports(now = Date.now()) {
   for (const name of readdirSync(ADAPTER_TRANSPORT_PARENT)) {
     const root = adapterTransportPath(name)
     if (!root) continue
-    const stat = lstatSync(root)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+    const stat = pruneEntryStat(root)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try {
       const manifestStat = lstatSync(join(root, 'manifest.json'))
@@ -4018,6 +4042,7 @@ function pruneAdapterTransports(now = Date.now()) {
         throw new Error('invalid manifest fields')
       }
     } catch {
+      if (youngEntry(stat, now)) continue
       removeAdapterTransport(root)
       say(`  pruned adapter transport ${name}: missing or malformed manifest`)
       continue
@@ -4091,11 +4116,14 @@ function pruneReviewSurfaces(now = Date.now()) {
   const retained = []
   for (const name of readdirSync(REVIEW_SURFACE_PARENT)) {
     const parent = join(REVIEW_SURFACE_PARENT, name)
-    const stat = lstatSync(parent)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+    const stat = pruneEntryStat(parent)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try { manifest = JSON.parse(readFileSync(join(parent, 'manifest.json'), 'utf8')) }
-    catch { manifest = { state: 'failure', created_at: new Date(stat.mtimeMs).toISOString() } }
+    catch {
+      if (youngEntry(stat, now)) continue
+      manifest = { state: 'failure', created_at: new Date(stat.mtimeMs).toISOString() }
+    }
     if (manifest.state === 'active') {
       let alive = false
       try { process.kill(manifest.pid, 0); alive = true } catch { /* dead creator */ }
@@ -4113,7 +4141,12 @@ function pruneReviewSurfaces(now = Date.now()) {
       : index >= 3 ? 'outside newest 3 failed surfaces'
       : null
     if (!reason) return
-    const canonical = realpathSync(entry.parent)
+    let canonical
+    try { canonical = realpathSync(entry.parent) }
+    catch (error) {
+      if (error?.code === 'ENOENT') return
+      throw error
+    }
     if (!inside(realpathSync(REVIEW_SURFACE_PARENT), canonical)) return
     removeTree(canonical)
     say(`  pruned review surface ${entry.name}: ${reason}`)
@@ -11304,7 +11337,7 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
-  expiredCredentials,
+  expiredCredentials, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
   requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
   taskEvidenceLifecycleBlock, taskKey,
   verifyProjectPolicies, zeroAccounting,
