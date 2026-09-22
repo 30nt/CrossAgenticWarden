@@ -5796,6 +5796,68 @@ test('a real executor stop is retained outside rotation and offers review before
 // observations every round because they were never shown back. Measured on one install: two of
 // four tasks stopped at the round ceiling with one open item each, $94.07 of a $187.11 build,
 // and one stale-comment note appeared seven times in a single task's log.
+// The commit carries the whole task; the executor's summary describes its own round. After a
+// review sends it back, that summary is about closing findings. Measured on one install: three
+// commits of four, +377 to +1565 lines each, whose bodies described the last round's test
+// hardening and said nothing about the work.
+test('a multi-round commit body describes the task, not the round that closed it', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_accept.md'), [
+    '---', 'title: Accept what the node sent', '---', '',
+    '## Change',
+    '- Look the batch up in three places, the exact fingerprint first.',
+    '- Record a refusal under a key other than the one that caused it.', '',
+    '## Must cover',
+    '- A replayed refused batch stays refused.', '',
+  ].join('\n'))
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/accept.go': 'package accept\n', 'src/accept_test.go': 'package accept\n' },
+      envelope: envelope(delivery('implemented batch acceptance over three lookup places')) },
+    { envelope: envelope(verdict({
+      criteria: [
+        { id: 'must-cover-1', state: 'broken', evidence: 'the replay test reads the seam' },
+        { id: 'change-1', state: 'met', evidence: 'three lookups, fingerprint first' },
+        { id: 'change-2', state: 'met', evidence: 'refusal keyed apart from its cause' },
+      ],
+      broken: [{ where: 'src/accept_test.go:1', fix: 'assert on the answer', evidence: 'seam read' }],
+    })) },
+    { writeFiles: { 'src/accept_test.go': 'package accept\n// asserts the answer\n' },
+      envelope: envelope(delivery('tightened the replay subtest to read the function answer')) },
+    { envelope: envelope(verdict({
+      criteria: [
+        { id: 'must-cover-1', state: 'met', evidence: 'dropping the fingerprint fails it' },
+        { id: 'change-1', state: 'met', evidence: 'three lookups, fingerprint first' },
+        { id: 'change-2', state: 'met', evidence: 'refusal keyed apart from its cause' },
+      ],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the subtest reads the answer now' }],
+    })) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+
+  // The contract the task was judged against, not the last round's report.
+  assert.match(message, /^Accept what the node sent\n/)
+  assert.match(message, /Change:\n- Look the batch up in three places, the exact fingerprint first\./)
+  assert.match(message, /- Record a refusal under a key other than the one that caused it\./)
+  assert.doesNotMatch(message, /tightened the replay subtest/)
+  // And the shape of the whole delivery, both files, not only the one the last round touched.
+  assert.match(message, /2 files, \+\d+ -\d+:/)
+  assert.match(message, /src\/accept\.go \(\+1 -0\)/)
+  assert.match(message, /src\/accept_test\.go \(\+2 -0\)/)
+  // The last round's report is still kept, where the full record lives.
+  assert.equal(latestTaskAudit(f).delivery.summary,
+    'tightened the replay subtest to read the function answer')
+})
+
+test('a single-round commit body keeps the executor summary, which is the whole task', () => {
+  const f = fixture({ git: true })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /\n\ndid it\n\n1 file, \+1 -0:\n {2}src\/output\.txt \(\+1 -0\)/)
+})
+
 test('the reviewer is asked for surviving mutations in round 1 and shown earlier notes after', () => {
   const f = fixture({ git: true })
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })

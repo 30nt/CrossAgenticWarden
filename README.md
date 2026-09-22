@@ -170,7 +170,7 @@ node caw.mjs artifacts list          # retained run/recovery/probe/transport art
 ```
 
 A run stopped by a role returning invalid canonical output never reaches a commit, so nothing
-that normally carries a task — the public commit with its spec verbatim, the private audit —
+that normally carries a task — the public commit, the private audit with its spec verbatim —
 is written. That failure is retained on its own under Git's private `caw/contract-failures/`,
 with the spec or request, the rejected value, the repair attempts and the exact runtime, and it
 is not swept by the rotation that keeps the newest twenty run records. An executor that stops on
