@@ -72,6 +72,10 @@ Target release: **0.2.0**.
 - A refused enumerator answer is retained with its value and a diagnostic. The request-issue check
   threw with neither, so the retained record read `"rejected_value": "null"` over an answer that
   held two real defects in the project's normative document.
+- The reviewer is told to try to break every `Must cover` it would record `met`, and to record a
+  surviving mutation as `weak` in the same round, and later rounds are shown what earlier rounds
+  already `noted`. Measured: two of four tasks stopped at the round ceiling with one open item each
+  after rounds raising 6, 1, 1, 1 ($94.07 of $187.11), and one note was re-derived seven times.
 - The task certification record carries the topology its ids belong to and the criterion, surface
   and transition links of every open finding. `open_item_ids` alone could not say what a finding
   was about, and one install had to re-derive the engine's own hashing over the audit's spec

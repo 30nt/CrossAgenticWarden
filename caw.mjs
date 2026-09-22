@@ -2453,6 +2453,7 @@ const ENGINE_DIAGNOSTIC_MAX = 16 * 1024
 // but make a pathological queue bounded and say how much evidence was not retained.
 const WEAK_VERIFICATION_EVENTS_RETAINED = 32
 const ROUND_STATE_MAX = 8 * 1024 * 1024
+const REVIEW_PRIOR_NOTED_MAX = 12 * 1024
 const BLOCKED_PATCH_MAX = 64 * 1024 * 1024
 const DIVERGED_SPEC_MAX = 1024 * 1024
 const REVIEW_SURFACE_MAX = 2 * 1024 * 1024 * 1024
@@ -9561,7 +9562,19 @@ function runTask(file, f, profileText, opts = {}) {
         ' and finish every row before returning. For a non-met row, the blocking item in the',
         ' matching slot must list that criterion id in its `criterion_ids`. An already-open',
         ' carried item that names the criterion is that blocking item; keep it in `carried`',
-        ' and do not duplicate it as a new finding:\n\n' +
+        ' and do not duplicate it as a new finding.',
+        // Not "look harder". A `met` row used to need only a consumer and a verification, and a
+        // reviewer could record one without ever asking what the verification misses — so the
+        // missed half surfaced one item per round. Measured on one install: two tasks of four
+        // hit the round ceiling at one open item each after rounds that went new 6, 1, 1, 1,
+        // $94.07 of a $187.11 build, and both last items were about the quality of a check
+        // (a hash call-site count blind to an aliased import; an isolation test reading the
+        // seam's error instead of the function's answer). Both were visible in round 1 to
+        // anyone who had tried to break the code.
+        ' For every `Must cover` row you record `met`, its evidence must name one concrete',
+        ' mutation of the shipped code and the check that fails on it. If you can name a',
+        ' mutation the current verification would NOT catch, the row is `weak` now, in this',
+        ' round, with that mutation as its evidence — not a finding held for a later round:\n\n' +
           renderReviewCriteria(spec, projectCriteria),
         '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
         ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',
@@ -9602,6 +9615,16 @@ function runTask(file, f, profileText, opts = {}) {
             ' item is now what blocks a criterion it was not raised against: the entry is then' +
             ' that criterion\'s blocking item and you must not duplicate it as a new finding.'
           : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
+        // What earlier rounds already said. `noted` accumulates in the task's round state and was
+        // never shown back, so every round re-derived the same observations from the tree and
+        // paid for them again: on one install one stale-comment note appeared seven times in a
+        // single task's log and another four, both verbatim.
+        // `noted` holds only earlier rounds here: this round's are merged after its passes.
+        noted.length
+          ? '\n\nAlready recorded as `noted` in earlier rounds of this task. Do not restate these;' +
+            ' add a `noted` item only for something new:\n\n' +
+            boundedUtf8(noted.map((n) => `- ${n}`).join('\n'), REVIEW_PRIOR_NOTED_MAX).text
+          : '',
       ].join('')
       const reviewContext = {
         workingRoot: reviewSurface.workingRoot,

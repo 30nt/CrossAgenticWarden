@@ -78,6 +78,18 @@ not duplicate it as a new finding.
 Finish the complete criterion ledger before searching for defects not stated in the contract.
 A later round is for judging fixes, not for revealing another visible line of the same spec.
 
+**A `met` row on a `Must cover` names the mutation it would catch.** For every one, before you
+record `met`, try to break the shipped code in a way the current verification would miss — an
+aliased import a call-site count cannot see, a function that swallows a failure and answers
+with a plausible value, a test that reads an error from the seam instead of the answer from the
+function. If one survives, the row is `weak` in this round, with that mutation as its evidence.
+Measured on one install: two tasks of four hit the round ceiling at one open item each, after
+rounds that raised 6, then 1, 1, 1 — $94.07 of a $187.11 build — and both last items were
+visible in round 1 to anyone who had tried. Finding them one per round is the expensive way to
+find them all.
+
+Later rounds show you what earlier rounds already `noted`. Do not restate those.
+
 **Three slots block, and every item in them carries `evidence`.**
 
 - `broken` — the delivery does not do what it says, or does it wrongly.
