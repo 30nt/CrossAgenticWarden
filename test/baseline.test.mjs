@@ -141,7 +141,7 @@ const planReview = (subject = plan()) => ({
   relations: planningLedger(subject).relations.map(({ id }) => ({
     id, state: 'covered', evidence: 'the linked final-tree criterion establishes the case',
   })),
-  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [],
+  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [], carried: [],
 })
 const delivery = (summary, claims = []) => ({ summary, notes: [], claims, blocked: '' })
 const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) => {
@@ -1746,6 +1746,113 @@ test('a planning cache entry misses when anything the role was asked about chang
   assert.doesNotMatch(result.stdout, /planning cache hit/)
   assert.deepEqual(calls(f).map(({ role }) => role),
     ['enumerator', 'architect', 'plan-reviewer'])
+})
+
+// A plan reviewer is one sample. Without its predecessor's holes, a second sample that found
+// nothing approved the same unchanged specs. Measured on one install, twice in a day: `plan`
+// reported 1 and then 5 holes, each with a real one, and `review-specs` approved byte-identical
+// specs without the architect ever running.
+const withUnclosedHole = (f, hole) => {
+  const plan = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+    .replace(/^approved:\s*true\s*$/m, 'approved: false')
+  writeFileSync(join(f.root, '.caw-tasks', 'PLAN.md'),
+    `${plan.replace(/\n+$/, '')}\n\n## Unclosed — this plan was NOT approved\n\n- ${hole}\n`)
+}
+const HOLE = 'uncovered — the question repository is driven through a stub but has no init(client:)'
+const plannedQueue = (f, description) => {
+  const result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+}
+
+test('review-specs hands the earlier holes to the plan reviewer and approves only when settled', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'task 001 now declares init(client:) in its Change',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /carrying 1 earlier hole\(s\)/)
+  assert.match(result.stdout, /earlier holes settled: h1 closed/)
+  const reviewer = calls(f).find((call) => call.role === 'plan-reviewer')
+  assert.ok(reviewer.input.includes(`- h1: ${HOLE}`), 'the hole must reach the re-judge by id')
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: true$/m)
+})
+
+test('a re-judge that says nothing about an earlier hole does not approve the queue', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  // Silence twice: the answer and its one repair both leave `carried` empty.
+  const result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(planReview()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /\$\.carried: missing carried hole id\(s\): h1/)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: false$/m)
+})
+
+test('an earlier hole still open stops the review and stays written for the next one', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  const result = run(f, ['review-specs', '--no-fix', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'open', evidence: 'no spec declares init(client:) for the question repository',
+    }] }) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /still open \[h1\]/)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.match(planText, /^approved: false$/m)
+  // Written down, so the next review-specs carries it instead of starting blind.
+  assert.match(planText, /## Unclosed — this plan was NOT approved\n\n- still open \[h1\]/)
+})
+
+test('a plan round hands the previous round\'s holes to the next plan reviewer', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope({ ...planReview(), uncovered: ['the fixture output has no failure path'] }) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'the revised task covers the failure path',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const reviewers = calls(f).filter((call) => call.role === 'plan-reviewer')
+  assert.equal(reviewers.length, 2)
+  assert.ok(!reviewers[0].input.includes('Earlier holes, carried by id'))
+  assert.ok(reviewers[1].input.includes('- h1: uncovered — the fixture output has no failure path'))
 })
 
 test('request preflight stops after enumerator and before architect', () => {

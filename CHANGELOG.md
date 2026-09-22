@@ -65,6 +65,12 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A plan review's holes are carried to the next plan review by id and must each be answered
+  `closed`, `open` or `withdrawn` with evidence; one left out stays open. This holds between `plan`
+  rounds, from `PLAN.md`'s `## Unclosed` into `review-specs`, and between its fix rounds, and a
+  `review-specs` that stops now writes its holes back to `## Unclosed`. Measured: `plan` reported 1
+  and then 5 holes, each with a real one, and `review-specs` approved byte-identical specs without
+  the architect running, because the second sample was never shown what the first had found.
 - A task commit no longer says its full gate was `Not run`. The full gate is queue-final and runs
   after every task commit by design, so the line was in every commit and history kept it after
   the gate went green. A `Review:` line is written only when it carries something a reader acts on

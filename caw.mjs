@@ -2143,8 +2143,30 @@ const SCHEMA = closeSchema({
           'This goes to the human, not to another round. List every one you can see: the run ' +
           'ends on the first anyway, so a question left out costs the human a whole run to find.',
       },
+      carried: {
+        type: 'array',
+        description: 'exactly one row for every earlier hole the engine hands you by id; empty ' +
+          'when it hands you none',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned id of the earlier hole' },
+            state: {
+              type: 'string', enum: ['closed', 'open', 'withdrawn'],
+              description: 'closed — the specs now close it. open — they do not. withdrawn — it ' +
+                'was wrong when raised, and you are retracting it.',
+            },
+            evidence: {
+              type: 'string',
+              description: 'what in the specs in front of you decides THIS state; "fixed" is not one',
+            },
+          },
+          required: ['id', 'state', 'evidence'],
+        },
+      },
     },
-    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable'],
+    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable',
+      'carried'],
   },
 
   // A source is an address the engine can resolve, not a model's assertion that it looked
@@ -7641,6 +7663,9 @@ function plan(description) {
         `provider budget stopped planning before plan-reviewer: ${reviewerBudgetIssue}`,
         population, planProvenance, risk)
     }
+    // The previous round's holes are exactly what the architect just revised against, so the
+    // re-judge answers them by id before it can call the revision clean.
+    const planHoles = (problems || []).map((hole, index) => ({ id: `h${index + 1}`, hole }))
     const planReviewPrompt = [
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
@@ -7657,6 +7682,7 @@ function plan(description) {
       '\n\n' + JSON.stringify(ledger.relations, null, 2),
       populationBlock(population),
       collisionBlock(collided),
+      carriedHolesBlock(planHoles),
       '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
       ' dimension.',
     ].join('')
@@ -7664,6 +7690,8 @@ function plan(description) {
       'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
         const issue = planRelationIssue(ledger, value.relations)
         if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+        const carriedIssue = carriedHolesIssue(value.carried, planHoles)
+        if (carriedIssue) schemaFailure('plan-reviewer', '$.carried', carriedIssue, value)
       })
     planProvenance.push({ round, role: 'plan-reviewer', ...runtimeIdentity(r) })
 
@@ -7700,6 +7728,10 @@ function plan(description) {
       ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
       ...(r.misordered || []).map((x) => `misordered — ${x}`),
       ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+      ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
+        const hole = planHoles.find((h) => h.id === row.id)?.hole || row.id
+        return `still open [${row.id}] — ${hole} — ${row.evidence}`
+      }),
     ]
 
     if (r.undecidable?.length) {
@@ -10415,8 +10447,12 @@ function reviewSpecs(description, noFix) {
     syncPlanRisk(null)
   }
 
+  // Round 1 carries what the last plan or review left in PLAN.md; each later round carries what
+  // the round before it raised, because fixSpecs has just edited the specs to close exactly those.
+  let holes = unclosedHoles(existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : '')
+  if (holes.length) say(`  carrying ${holes.length} earlier hole(s) from ${PLAN} into this review`)
   for (let round = 1; round <= FIX_ROUNDS; round++) {
-    const verdict = judgeSpecs(description, f, text, population)
+    const verdict = judgeSpecs(description, f, text, population, holes)
     if (!verdict.problems.length) {
       return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
     }
@@ -10430,6 +10466,7 @@ function reviewSpecs(description, noFix) {
     }
 
     fixSpecs(description, f, text, verdict.specs, verdict.problems, round)
+    holes = verdict.problems.map((hole, index) => ({ id: `h${index + 1}`, hole }))
   }
 }
 
@@ -10476,6 +10513,23 @@ function fixSpecs(description, f, text, specs, problems, round) {
 }
 
 function stopWithHoles(problems, specs, why) {
+  // Written down, not only printed. A stop used to leave PLAN.md holding whatever the PREVIOUS
+  // plan said, so the next review-specs carried stale holes or none — the same silence the
+  // carried list exists to end, one run later. A queue with no PLAN.md is left without one:
+  // creating it here would invent a plan artifact for hand-written specs.
+  if (existsSync(PLAN)) {
+    const plan = readFileSync(PLAN, 'utf8')
+    const kept = plan.replace(/\n## Unclosed[\s\S]*?(?=\n## |$)/, '')
+      .replace(/^approved:\s*true\s*$/m, 'approved: false')
+    writeFileSync(PLAN, [
+      kept.replace(/\n+$/, ''), '',
+      '## Unclosed — this plan was NOT approved', '',
+      ...problems.map((p) => `- ${String(p).replace(/\n+/g, ' ')}`), '',
+      'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
+      '`approved:` above. `build` refuses until it does.', '',
+    ].join('\n'))
+    say(`  ${PLAN}: ## Unclosed now lists these ${problems.length}; the next review-specs carries them`)
+  }
   say(`\n${problems.length} hole(s) in ${specs.length} spec(s) — ${why}.`)
   say(`  spent ${formatAccounting(accounting)}`)
   process.exit(1)
@@ -10515,7 +10569,61 @@ function specsPlanningLedger(specs) {
 // population, and they were written by whoever wrote the specs. Measured on one project: both
 // specs for a ticket were written by hand and the ticket behind them understated its own
 // population by four sites.
-function judgeSpecs(description, f, text, population) {
+// The holes a plan review already found, handed to the next one by id. A plan reviewer is one
+// sample of a model, and without its predecessor's list a second sample that finds nothing
+// approved the same unchanged specs: silence closed what the first one raised. Measured on one
+// install, twice in a day, both one-task queues: `plan` reported 1 and then 5 holes — a real
+// one in each, among them a repository driven through a URLProtocol stub that the spec gave no
+// `init(client:)` — and `review-specs` ran enumerator and plan reviewer, got "no holes", and
+// approved byte-identical specs without the architect ever running. The first cost a red fast
+// gate and an extra executor round; the second was covered by luck. The task reviewer has had
+// this rule since round 2 existed — an id left out stays open — and this is that rule, one level
+// up.
+function unclosedHoles(planText) {
+  if (!planText) return []
+  const section = planText.match(/^## Unclosed[^\n]*\n([\s\S]*?)(?=^## |(?![\s\S]))/m)?.[1] || ''
+  const holes = []
+  for (const line of section.split('\n')) {
+    if (line.startsWith('- ')) holes.push(line.slice(2).trim())
+    else if (holes.length && line.startsWith('  ') && line.trim()) {
+      holes[holes.length - 1] += ` ${line.trim()}`
+    } else if (holes.length && !line.trim()) break
+  }
+  return holes.filter(Boolean).map((hole, index) => ({ id: `h${index + 1}`, hole }))
+}
+
+function carriedHolesIssue(carried, holes) {
+  if (!Array.isArray(carried)) return 'carried must be an array'
+  const known = new Set(holes.map((row) => row.id))
+  const seen = new Set()
+  for (const row of carried) {
+    if (!known.has(row?.id)) return `unknown carried hole id ${JSON.stringify(row?.id)}`
+    if (seen.has(row.id)) return `duplicate carried hole id ${JSON.stringify(row.id)}`
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) return `${row.id} has empty evidence`
+    seen.add(row.id)
+  }
+  const missing = holes.map((row) => row.id).filter((id) => !seen.has(id))
+  // Silence closes nothing: a hole left out is a hole still open, and the answer is refused
+  // rather than read as approval.
+  if (missing.length) return `missing carried hole id(s): ${missing.join(', ')}`
+  return null
+}
+
+function carriedHolesBlock(holes) {
+  if (!holes.length) {
+    return '\n\nNo earlier hole is carried into this review, so `carried` is empty.'
+  }
+  return [
+    '\n\nEarlier holes, carried by id. An earlier review of this queue raised each one. Fill',
+    ' `carried` with exactly one row per id BEFORE looking for anything new: whether the specs',
+    ' now close what was already raised is the question this review exists to answer, and an id',
+    ' you leave out stays open. `withdrawn` is there, and using it is not a defeat: a hole that',
+    ' was wrong when raised should be retracted, not carried.\n\n',
+    holes.map((row) => `- ${row.id}: ${row.hole}`).join('\n'),
+  ].join('')
+}
+
+function judgeSpecs(description, f, text, population, holes = []) {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to review')
 
@@ -10546,6 +10654,7 @@ function judgeSpecs(description, f, text, population) {
     '\n\n' + JSON.stringify(ledger.relations, null, 2),
     populationBlock(population),
     collisionBlock(collided),
+    carriedHolesBlock(holes),
     '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
     ' dimension.',
   ].join('')
@@ -10553,6 +10662,8 @@ function judgeSpecs(description, f, text, population) {
     'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
       const issue = planRelationIssue(ledger, value.relations)
       if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+      const carriedIssue = carriedHolesIssue(value.carried, holes)
+      if (carriedIssue) schemaFailure('plan-reviewer', '$.carried', carriedIssue, value)
     })
 
   // The four other slots are built BEFORE the question is raised, so a verdict that stopped
@@ -10567,7 +10678,16 @@ function judgeSpecs(description, f, text, population) {
     ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
     ...(r.misordered || []).map((x) => `misordered — ${x}`),
     ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+    // An earlier hole still open is a hole, whatever else this review found or did not.
+    ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
+      const hole = holes.find((h) => h.id === row.id)?.hole || row.id
+      return `still open [${row.id}] — ${hole} — ${row.evidence}`
+    }),
   ]
+  const settled = (r.carried || []).filter((row) => row.state !== 'open')
+  if (settled.length) {
+    say(`  earlier holes settled: ${settled.map((row) => `${row.id} ${row.state}`).join(', ')}`)
+  }
 
   if (r.undecidable?.length) {
     die(`the request itself does not settle:\n\n  - ${r.undecidable.join('\n  - ')}\n\n` +
