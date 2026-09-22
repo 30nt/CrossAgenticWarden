@@ -123,8 +123,9 @@ Use the exact references supplied by the dossier: `gate-receipt:<id>`, `gate-che
 `review-experiment:<id>`.
 
 Every new blocking item links to `criterion_ids`, `surface_ids` and `transition_ids`, and
-names one stable `property_key`. Repeated observations form one work package only when those
-links and the property key are identical. Similar wording, a shared file or a shared screen is
+names one stable `property_key`: lowercase letters, digits, dots and hyphens, starting with a
+letter, e.g. `replay.refused-batch-stays-refused`. Repeated observations form one work package
+only when those links and the property key are identical. Similar wording, a shared file or a shared screen is
 not enough. Keep distinct properties distinct, and preserve each member's evidence.
 
 ## Rounds after the first
