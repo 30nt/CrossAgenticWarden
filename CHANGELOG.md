@@ -65,6 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- Gate output keeps its end. The executor's dossier bounded the serialized receipt from the head,
+  and a gate prints its failure last: measured, a red gate wrote 78,908 bytes with its compile
+  error at byte 78,601, the dossier kept the first 24 KB, and two executor variants spent 3 and 9
+  retries against a cause they were never shown. The dossier renders receipt metadata, then the
+  output's head and tail with an explicit elision marker; receipts over 1 MiB keep head and tail too.
 - Concurrent CAW processes no longer break each other's temp sweeps. An entry vanishing between
   readdir and lstat threw ENOENT out of whatever command had started; and a directory swept inside
   its creator's window between mkdtemp and writing its manifest was removed as abandoned — for an
