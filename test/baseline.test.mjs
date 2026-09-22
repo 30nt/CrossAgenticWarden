@@ -5791,6 +5791,50 @@ test('a real executor stop is retained outside rotation and offers review before
   assert.match(listed.stdout, new RegExp(`executor-stops/${names[0]}`))
 })
 
+// Two installs' worth of the same shape: a reviewer that could record `met` without trying to
+// break the code found the missed half one item per round, and re-derived the same `noted`
+// observations every round because they were never shown back. Measured on one install: two of
+// four tasks stopped at the round ceiling with one open item each, $94.07 of a $187.11 build,
+// and one stale-comment note appeared seven times in a single task's log.
+test('the reviewer is asked for surviving mutations in round 1 and shown earlier notes after', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- Isolation between nodes holds.\n')
+  const staleNote = 'the header comment still says four data tables'
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'first\n' }, envelope: envelope(delivery('first')) },
+    {
+      echoPromptMatch: 'name one concrete\\s+mutation|Already recorded as `noted`|four data tables',
+      envelope: envelope(verdict({
+        criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'isolation leaks' }],
+        broken: [{ where: 'src/output.txt:1', fix: 'isolate', evidence: 'isolation leaks' }],
+        noted: [staleNote],
+      })),
+    },
+    { writeFiles: { 'src/output.txt': 'fixed\n' }, envelope: envelope(delivery('fixed')) },
+    {
+      echoPromptMatch: 'name one concrete\\s+mutation|Already recorded as `noted`|four data tables',
+      envelope: envelope(verdict({
+        criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'dropping the node key fails the test' }],
+        carried: [{ id: 'r1.1', state: 'closed', evidence: 'isolation holds now' }],
+      })),
+    },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.equal(echoes.length, 2, 'one echo per round')
+  const [round1, round2] = echoes
+  // Round 1 is told to try to break every Must cover it would record met.
+  assert.ok(round1.some((hit) => /name one concrete\s+mutation/.test(hit)))
+  assert.ok(!round1.includes('Already recorded as `noted`'), 'nothing is noted before round 1')
+  // Round 2 is shown what round 1 already noted, instead of re-deriving it.
+  assert.ok(round2.includes('Already recorded as `noted`'))
+  assert.ok(round2.includes('four data tables'))
+})
+
 test('build wakes an executor only after the same delivery makes the gate red twice', () => {
   const gateFast = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');const ok=f.readFileSync('src/output.txt','utf8').includes('fixed');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
