@@ -65,6 +65,11 @@ Target release: **0.2.0**.
   REJECTION could fail on them: an approval leaves the blocking slots empty and is never asked.
   Measured on one install, a correct finding about a real defect ended a run as an engine
   diagnostic instead of a verdict.
+- A task commit no longer says its full gate was `Not run`. The full gate is queue-final and runs
+  after every task commit by design, so the line was in every commit and history kept it after
+  the gate went green. A `Review:` line is written only when it carries something a reader acts on
+  — LIMITED certification, a hand-finished tree, a human attestation, rounds past the cap. The
+  README now states that `CAW-Audit` resolves only in the clone that made the commit.
 - A finding's `property_key` has its rule named — in the schema, the prompt, the reviewer role
   file and the refusal — and case, underscores and spaces are normalised to it rather than refused.
   The rule lived only in a regex, and snake_case, the first choice for a "key", was the one it

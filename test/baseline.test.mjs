@@ -4640,9 +4640,34 @@ test('a planned task retains an approved certification with population and crite
   assert.deepEqual(certification.criteria.map(({ id }) => id),
     ['must-cover-1', 'change-1', 'done-when-1'])
   assert.match(certification.review_surface.baseline_commit, /^[0-9a-f]{40}$/)
-  assert.match(execFileSync('git', ['log', '-1', '--pretty=%B'], {
-    cwd: f.root, encoding: 'utf8',
-  }), /Review: approved, round 1/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  // A plain approval is the pipeline working, not something a reader of `git log` acts on.
+  assert.doesNotMatch(message, /^Review:/m)
+  // And the full gate is queue-final: at task-commit time it has not run BY DESIGN, so the
+  // commit no longer carries a "Not run" that history would keep after it went green.
+  assert.match(message, /^Gate: .* — green\.$/m)
+  assert.doesNotMatch(message, /Not run:/)
+  assert.match(message, /^CAW-Audit: sha256:[0-9a-f]{64}$/m)
+})
+
+// The Review line stays where it carries something: here, a tree no executor produced under the
+// pipeline's eye, approved by `review`.
+test('a hand-finished approval still says so in its commit', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_hand.md'),
+    '---\ntitle: Hand\n---\n\n## Done when\n- The output exists.\n')
+  writeFileSync(join(f.root, 'README.md'), '# finished by hand\n')
+  const result = run(f, ['review', '001_hand.md'], [
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the output',
+      evidence_refs: ['repository:README.md'],
+    }] })) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /^Review: .*, round 1 — approved by `review`: no executor ran/m)
+  assert.doesNotMatch(message, /Not run:/)
 })
 
 test('project gate policy can stop a green core gate before reviewer', () => {
