@@ -179,7 +179,10 @@ is not swept by the rotation that keeps the newest twenty run records. An execut
 `ls .caw-tasks/` is the queue. A task commit stays public and compact; its `CAW-Audit` digest
 points to the complete private record under Git's `caw/audit/` path. That record keeps the spec,
 notes, certification, policy identity, reviewed delivery digest and staged tree after the queue
-file is deleted. Every command prints the resolved matrix and runtime digest before mutation or
+file is deleted. It lives inside `.git/`, which a push does not carry, so the digest resolves only
+in the clone that made the commit — anyone else sees the reference without its record. A
+`Review:` line appears only when there is something to act on: a LIMITED certification, a
+hand-finished tree, a signed human attestation, or rounds authorised past the cap. Every command prints the resolved matrix and runtime digest before mutation or
 spend.
 
 Each provider call creates an immutable `attempt-*.json` before the child process starts. The run

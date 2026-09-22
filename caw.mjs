@@ -10114,6 +10114,18 @@ function resumeTask(cmd, arg) {
 // the reviewer filled — and the shape of the staged delivery, both true of the whole task.
 const COMMIT_BODY_FILES_MAX = 30
 
+function reviewLine(certification, round, how) {
+  const limited = certification?.state === 'limited'
+  if (!limited && !['hand', 'human', 'resumed'].includes(how)) return null
+  const detail = how === 'hand'
+    ? ' — approved by `review`: no executor ran in the approving round, so the code above it was' +
+      ' written by a hand or by an earlier round this pipeline did not get to judge'
+    : how === 'human' ? ' — approved by a signed human attestation'
+    : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
+    : ''
+  return `Review: ${limited ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${detail}.`
+}
+
 function taskCommitBody(spec, ex, round, how) {
   // The staged delivery: every file this commit carries, with its own line counts.
   let stat = []
@@ -10238,15 +10250,18 @@ function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [
   git('commit', '-q', '--cleanup=verbatim', '-m', [
     subject, '',
     ...taskCommitBody(spec, ex, round, how), '',
-    `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.` +
-      ` Not run: ${f.gate_full || '(none configured)'}.`,
-    `Review: ${certification?.state === 'limited' ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${
-      how === 'hand' ? " — approved by `review`: no executor ran in the approving round, so the"
-                       + ' code above it was written by a hand or by an earlier round this'
-                       + ' pipeline did not get to judge'
-      : how === 'human' ? ' — approved by a signed human attestation'
-      : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
-      : ''}.`,
+    // What the public history keeps is what stays true about this commit. `Not run: <gate_full>`
+    // did not: the full gate is queue-final by design and runs AFTER every task commit, so the
+    // line was written into every commit — including ones whose full gate went green minutes
+    // later — and history kept "not run" about code that had been checked. Its state belongs to
+    // the run record and the audit, which know how it ended. One install stripped these lines
+    // from every commit before pushing, for the reason that a closed pull request keeps its
+    // commits forever.
+    `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.`,
+    // Only when it says something a reader would act on. A plain approval in round N is the
+    // pipeline working; a LIMITED certification, a hand-finished tree, a signed human attestation
+    // or rounds authorised past the cap are what someone reading `git log` needs to see.
+    ...(reviewLine(certification, round, how) ? [reviewLine(certification, round, how)] : []),
     // Notes and the exact spec live in the audit record above. Keeping them out of the public
     // commit is the separation this method enforces: the commit is a useful project history,
     // while the local private record is the complete operational history.
