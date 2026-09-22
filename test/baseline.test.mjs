@@ -1771,6 +1771,64 @@ test('request preflight stops after enumerator and before architect', () => {
   assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
 })
 
+// A link in `.caw/CAW.md` is written to be clicked from that file, so `../docs/x.md` means
+// `docs/x.md`. Measured on one install: an enumerator cited a canonical document by its real path
+// and was refused because the authority set held the link target verbatim, `../docs/...`.
+test('a canonical doc written as a link from .caw/ is cited by its repository path', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, 'docs', 'center'), { recursive: true })
+  writeFileSync(join(f.root, 'docs', 'center', 'sync-handler.md'),
+    '# Sync handler\n\nA refused message is journalled under the key that refused it.\n')
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, `${readFileSync(profilePath, 'utf8')}\n## Canonical docs\n\n` +
+    '- [docs/center/sync-handler.md](../docs/center/sync-handler.md) — the handler contract\n')
+  execFileSync('git', ['add', '-A'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'link the canonical handler doc'], { cwd: f.root })
+
+  const issue = {
+    issue: 'The handler journals a refusal under the key that caused it.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: 'docs/center/sync-handler.md', occurrence: 1,
+      excerpt: 'A refused message is journalled under the key that refused it.',
+    }],
+  }
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+  // The preflight stops as designed, on the issue — not on the path of its source.
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stderr, /invalid canonical output/)
+  assert.match(result.stdout, /request preflight stopped before architect; 1 issue/)
+  assert.match(result.stdout, /docs\/center\/sync-handler\.md/)
+})
+
+// validateRequestIssues judged one field and threw with no value, so the record retained for a
+// refused answer held `"rejected_value": "null"` — on one install the refused answer carried two
+// real defects in the project's normative document.
+test('a refused enumerator answer is retained with its value and diagnostic', () => {
+  const f = fixture({ git: true })
+  const issue = {
+    issue: 'A finding the operator will want to read later.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: 'docs/not-listed.md', occurrence: 1, excerpt: 'anything',
+    }],
+  }
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /is not \.caw\/CAW\.md or listed under ## Canonical docs/)
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const record = JSON.parse(readFileSync(join(root, readdirSync(root)[0]), 'utf8'))
+  assert.equal(record.role, 'enumerator')
+  assert.notEqual(record.rejected_value, 'null')
+  assert.match(record.rejected_value, /A finding the operator will want to read later/)
+  assert.equal(record.diagnostics.length, 1)
+  assert.equal(record.diagnostics[0].kind, 'request-issue-validation')
+})
+
 test('project planning policy can stop or add instructions before provider calls', () => {
   const stopped = fixture({ git: true })
   configureProjectPolicies(stopped, projectPolicySource)

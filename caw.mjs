@@ -24,7 +24,7 @@ import {
   symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -224,10 +224,37 @@ function canonicalAuthorityPaths(profileText) {
   const paths = new Set(['.caw/CAW.md'])
   for (const line of section.split('\n')) {
     const match = line.match(/^\s*-\s+(?:`([^`]+)`|\[[^\]]+\]\(([^)]+)\)|(\S+))/)
-    const path = match && (match[1] || match[2] || match[3])
-    if (path && !/^[a-z]+:\/\//i.test(path)) paths.add(path)
+    if (!match) continue
+    const raw = match[1] || match[2] || match[3]
+    if (!raw || /^[a-z]+:\/\//i.test(raw)) continue
+    const path = match[2] ? linkTargetPath(raw) : raw
+    if (path) paths.add(path)
   }
   return paths
+}
+
+// A markdown link in `.caw/CAW.md` is written to be clicked from that file, so its target is
+// relative to `.caw/` — `[x](../docs/x.md)` means `docs/x.md`. Every role addresses the
+// repository from its root, as `.caw/agents/enumerator.md` tells it to. Taking the target
+// verbatim put `../docs/x.md` in the authority set, and a role quoting the same document by its
+// real path died on the schema. Measured on one install: an enumerator ($1.76) found two real
+// defects in the project's normative document, cited it correctly, and was refused
+// `"docs/center/sync-handler.md" is not .caw/CAW.md or listed under ## Canonical docs`.
+//
+// Both spellings survive, because both exist. A target that climbs out of `.caw/` can only have
+// meant `.caw/`-relative. Otherwise the root-relative reading wins, which is what every list
+// written before this read as and what the engine's own test fixed — unless only the
+// `.caw/`-relative file exists, which is the one case where the verbatim reading names nothing.
+function linkTargetPath(target) {
+  let value = String(target).trim().replace(/^<(.*)>$/, '$1').replace(/[?#].*$/, '')
+  if (!value) return null
+  if (value.startsWith('/')) value = value.replace(/^\/+/, '')
+  const literal = posix.normalize(value)
+  const fromProfile = posix.normalize(posix.join('.caw', value))
+  if (fromProfile.startsWith('../') || fromProfile === '..') return null
+  if (literal.startsWith('../') || literal === '..') return fromProfile
+  if (existsSync(fromProfile) && !existsSync(literal)) return fromProfile
+  return literal
 }
 
 const REVIEW_CRITERION_SECTIONS = new Map([
@@ -7145,7 +7172,22 @@ function enumerate(description, text, f, suppliedIndex = null) {
     workingRoot: process.cwd(),
     profileText: text,
   }
-  validateRequestIssues(p.request_issues, context)
+  // The whole enumerator answer rides on the failure. validateRequestIssues judges one field of
+  // it and throws with no value, so the retained contract-failure record read
+  // `"rejected_value": "null"` and `"diagnostics": []` — on one install the refused answer held
+  // two real defects in the project's normative document, and they were recoverable only by
+  // knowing to open the run record's call file before rotation took it.
+  try { validateRequestIssues(p.request_issues, context) }
+  catch (error) {
+    if (!(error instanceof CanonicalOutputError)) throw error
+    if (error.value === null) error.value = p
+    if (!error.attemptId) error.attemptId = runtimeIdentity(p)?.attempt_id || null
+    try {
+      recordEngineDiagnostic('enumerator', 'request-issue-validation',
+        { path: error.path, message: error.detail }, error.attemptId)
+    } catch { /* the failure must still reach the operator */ }
+    throw error
+  }
   const resolved = resolvePopulation(p.cases, context)
   recordPopulationResolution(resolved, runtimeIdentity(p)?.attempt_id || null)
   const cases = resolved.cases
