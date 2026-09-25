@@ -5,7 +5,7 @@
 // fixture files as an executor would, and returns the requested envelope. It never uses a network.
 
 import { appendFileSync, chmodSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -132,6 +132,28 @@ for (const [path, body] of Object.entries(next.writeFiles || {})) {
 }
 
 if (next.commitOwnWork) commitOwnWork(String(next.commitOwnWork))
+
+// An executor asking the engine's gate broker for a gate run, as a shell call would. Each result
+// travels back in the delivery's notes, because that is what the test can read afterwards.
+for (const probe of next.gateProbes || []) {
+  const value = next.envelope?.structured_output ?? next.structured_output
+  const command = process.env.CAW_GATE_PROBE
+  // A shell call the role gave up on: the request is filed and nobody waits for the answer.
+  if (probe.abandon) {
+    spawn(command, [], { detached: true, stdio: 'ignore' }).unref()
+    const pause = new Int32Array(new SharedArrayBuffer(4))
+    Atomics.wait(pause, 0, 0, probe.abandon)
+    continue
+  }
+  const result = command
+    ? spawnSync(command, probe.mutation ? ['--mutation', '-'] : [], {
+      input: probe.mutation ? JSON.stringify(probe.mutation) : '', encoding: 'utf8',
+    })
+    : { status: null, stdout: '', stderr: 'CAW_GATE_PROBE is not set' }
+  value.notes = [...(value.notes || []), `fake-gate-probe:${JSON.stringify({
+    status: result.status, last: `${result.stdout}${result.stderr}`.trim().split('\n').pop(),
+  })}`]
+}
 
 const canonical = next.envelope?.structured_output ?? next.structured_output
 if (role === 'reviewer' && Array.isArray(canonical?.weak)) {

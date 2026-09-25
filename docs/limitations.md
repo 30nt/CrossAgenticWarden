@@ -137,6 +137,23 @@ in the same session, each verified by the role against a `git diff --stat` it ha
 that is a role checking its own memory, not an independent record. No fourth party saw the
 original bytes. The fifth will be the one that is not recovered.
 
+### The gate probe runs the executor's code outside its boundary, during its turn
+
+The executor's write boundary cannot hold a gate whose toolchain starts its own sandbox: SwiftPM
+compiles package manifests under seatbelt, and macOS refuses a sandbox inside the executor's
+(`sandbox_apply: Operation not permitted`) whatever paths are writable. Measured on one iOS
+install, 51 tasks: no executor ever reached a gate verdict, and its red-making mutations stayed
+"unmeasured" until a reviewer round found the survivor.
+
+The gate probe answers that by running the profile's fast gate for the executor, on a disposable
+copy of its tree, outside the boundary. The command is the profile's and cannot be chosen, but
+the code it runs is the executor's, including any edit it made to the gate script. That is not a
+new kind of reach — the deciding gate runs the same code outside the boundary the moment the
+executor returns — but it is a new timing: the executor can iterate on what that run does. The
+probe is capped at six runs per call and each is recorded as a `gate-probe` diagnostic; nothing
+else limits it. Because it runs on a copy, it also removes the reason an executor had to mutate
+and then restore its own tree.
+
 ## Limits that are not hazards
 
 - **The request is the only input nothing checks.** The engine refuses a case the enumerator

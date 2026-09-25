@@ -49,6 +49,14 @@ orchestrator re-runs it, and that run is the one that counts. You run it because
 test is a **fact**, not a verdict, and keeping the fact from you along with the judgement
 costs a whole round to surface something visible in seconds.
 
+When the prompt names a gate probe (`$CAW_GATE_PROBE`), use it: it runs the same gate on a
+copy of your tree outside your write boundary, and `--mutation -` runs it with one mutation of
+the shipped code applied, so you can watch your own test go red. On a host whose toolchain cannot
+run inside the boundary at all — Xcode with Swift packages is one, because SwiftPM starts its own
+sandbox and macOS refuses a sandbox inside yours — the probe is the only gate you can reach, and
+trying the gate directly first only spends your budget. The probe is limited per call; spend it
+on the check whose answer would change what you do next.
+
 You must make that attempt, but inability to run the gate is never `blocked`: put the exact
 failure in `notes` and continue, because the orchestrator runs the deciding gate outside your
 write boundary. In particular, denied writes to a per-user cache or temporary directory outside

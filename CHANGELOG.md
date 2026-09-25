@@ -32,6 +32,11 @@ Target release: **0.2.0**.
   on each one, on a disposable copy and outside the executor's boundary. A surviving mutation
   sends the delivery back to the executor before any reviewer is paid, at most twice per review
   round. A caught one is trusted review evidence as `executor-mutation:<id>`.
+- Executor gate probe. Beside every executor call the engine starts a broker outside the
+  executor's boundary and names a `caw-gate` command (`$CAW_GATE_PROBE`) in the prompt. It runs the
+  profile's fast gate on a disposable copy of the executor's current tree, optionally with one
+  `--mutation` applied, at most six times per call. Each use is recorded as a `gate-probe` run
+  diagnostic; it certifies nothing.
 
 ### Changed
 

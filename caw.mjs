@@ -5421,6 +5421,12 @@ function agent(role, prompt, schema, f, spec, context = null) {
   if (executorBudget?.event_bytes) {
     env.CAW_EXECUTOR_MAX_EVENT_BYTES = String(executorBudget.event_bytes)
   }
+  const gateProbe = role === 'executor' && context?.gateProbe
+    ? startGateProbe(f, spec, scratchRoot) : null
+  if (gateProbe) {
+    env.CAW_GATE_PROBE = gateProbe.command
+    prompt += gateProbeInstructions(gateProbe, f)
+  }
   const instructions = assembledInstructions(role, binding, provider, f.docs_language)
   const providerVector = providerLaunch(provider.executable, process.platform, binding.provider)
   let invocation
@@ -5475,6 +5481,16 @@ function agent(role, prompt, schema, f, spec, context = null) {
       env: invocation.env, cwd: invocation.cwd, timeout: AGENT_TIMEOUT_MS, killSignal: 'SIGKILL' })
   } finally {
     hold?.kill()
+    const probes = stopGateProbe(gateProbe)
+    if (probes?.length) {
+      try {
+        recordEngineDiagnostic(role, 'gate-probe', {
+          task: spec || null, requests: probes.length,
+          results: probes.slice(0, 32).map(({ state, status, duration_ms: duration, mutated, reason }) =>
+            ({ state, status, duration_ms: duration ?? null, mutated: Boolean(mutated), reason: reason || null })),
+        })
+      } catch { /* the executor's answer still has to be read */ }
+    }
   }
   // A timeout arrives as `r.error` as well, and answering it as a missing provider executable
   // would send the reader to fix a binary that ran fine and simply did not finish.
@@ -9237,6 +9253,180 @@ const renderMutationRow = (row) => `${row.id} (${row.path}) — ${row.state}` +
       ? `: the gate went red (status ${row.gate_status})` : '') +
   (row.breaks ? `. It was meant to break: ${row.breaks}` : '')
 
+// The gate probe: the same fact, inside the executor's own turn.
+//
+// The measurement above reaches the executor one delivery later. The probe lets it ask while it
+// is still working: the engine starts a broker process beside the executor call, outside the
+// executor's boundary, and hands the executor a command that files a request into its scratch
+// directory and waits. The broker copies the delivery tree as it stands onto a disposable
+// surface, optionally applies one mutation, and runs the profile's fast gate there.
+//
+// What the executor controls is the tree and at most one mutation, never the command: the gate
+// is the profile's. That code already runs outside the boundary once the executor returns — the
+// deciding gate runs it — so the probe gives the executor no new kind of reach, only an earlier
+// look. It is bounded per call, and it certifies nothing; only the orchestrator's gate does.
+const GATE_PROBE_REQUESTS_MAX = 6
+const GATE_PROBE_REQUEST_ID = /^[a-z0-9-]{1,64}$/
+const GATE_PROBE_POLL_MS = 200
+
+const GATE_PROBE_CLIENT = `import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+const dir = process.argv[2]
+const args = process.argv.slice(3)
+let mutation = null
+if (args[0] === '--mutation') {
+  const source = args[1] === '-' || !args[1] ? readFileSync(0, 'utf8') : readFileSync(args[1], 'utf8')
+  mutation = JSON.parse(source)
+} else if (args.length) {
+  process.stderr.write('usage: caw-gate [--mutation <file>|-]\\n')
+  process.exit(64)
+}
+const id = randomBytes(8).toString('hex')
+const request = join(dir, 'requests', id + '.json')
+writeFileSync(request + '.tmp', JSON.stringify({ id, mutation }))
+renameSync(request + '.tmp', request)
+const response = join(dir, 'responses', id + '.json')
+const deadline = Date.now() + Number(process.env.CAW_GATE_PROBE_WAIT_MS || 3600000)
+const pause = new Int32Array(new SharedArrayBuffer(4))
+const brokerAlive = () => {
+  let pid
+  try { pid = Number(readFileSync(join(dir, 'broker.pid'), 'utf8')) } catch { return true }
+  try { process.kill(pid, 0); return true } catch (error) { return error.code !== 'ESRCH' }
+}
+while (!existsSync(response)) {
+  if (Date.now() > deadline || !brokerAlive()) {
+    if (existsSync(response)) break
+    process.stderr.write('caw-gate: no answer from the engine; its gate broker is not running\\n')
+    process.exit(2)
+  }
+  Atomics.wait(pause, 0, 0, 250)
+}
+const answer = JSON.parse(readFileSync(response, 'utf8'))
+if (answer.output) process.stdout.write(answer.output.endsWith('\\n') ? answer.output : answer.output + '\\n')
+process.stdout.write('caw-gate: ' + answer.state + (answer.status === null || answer.status === undefined
+  ? '' : ' (status ' + answer.status + ')') + (answer.reason ? ': ' + answer.reason : '') + '\\n')
+process.exit(answer.state === 'green' ? 0 : answer.state === 'red' ? 1 : 2)
+`
+
+function startGateProbe(f, spec, scratchRoot) {
+  if (!f.gate_fast) return null
+  const dir = scratchRoot
+    ? join(scratchRoot, 'caw-gate-probe')
+    : mkdtempSync(join(tmpdir(), 'caw-gate-probe-'))
+  mkdirSync(join(dir, 'requests'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'responses'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(dir, 'client.mjs'), GATE_PROBE_CLIENT, { mode: 0o600 })
+  const command = join(dir, 'caw-gate')
+  writeFileSync(command, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ` +
+    `${JSON.stringify(join(dir, 'client.mjs'))} ${JSON.stringify(dir)} "$@"\n`, { mode: 0o700 })
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__gate-broker', dir], {
+    // Its own process group, so stopping it also stops a gate it is still running. The executor
+    // can return while a probe is in flight, and an orphaned build writing into a shared
+    // derived-data directory would race the deciding gate that runs next.
+    cwd: process.cwd(), stdio: 'ignore', detached: process.platform !== 'win32',
+    env: { ...process.env, CAW_GATE_BROKER_SPEC: spec || '', CAW_GATE_BROKER_PARENT: String(process.pid) },
+  })
+  child.on('error', () => {})
+  return { dir, command, child, owned: !scratchRoot }
+}
+
+function stopGateProbe(probe) {
+  if (!probe) return null
+  try {
+    if (process.platform !== 'win32' && probe.child.pid) process.kill(-probe.child.pid, 'SIGTERM')
+    else probe.child.kill('SIGTERM')
+  } catch { /* already gone */ }
+  let answers = []
+  try {
+    answers = readdirSync(join(probe.dir, 'responses')).filter((name) => name.endsWith('.json'))
+      .map((name) => { try { return JSON.parse(readFileSync(join(probe.dir, 'responses', name), 'utf8')) } catch { return null } })
+      .filter(Boolean)
+  } catch { /* nothing was asked */ }
+  if (probe.owned) { try { removeTree(probe.dir) } catch { /* next prune */ } }
+  return answers
+}
+
+const gateProbeInstructions = (probe, f) => [
+  '\n\nGate probe. Your write boundary may keep the gate from running where you are. The command',
+  ` ${JSON.stringify(probe.command)} (also in $CAW_GATE_PROBE) runs the profile's fast gate`,
+  ` \`${f.gate_fast}\` on a disposable copy of your tree as it stands, outside that boundary, and`,
+  ' prints its output and `caw-gate: green|red` (exit 0 when green). With `--mutation -` it first',
+  ' applies one mutation of the shipped code read from stdin as JSON {"path","find","replace"}',
+  ' (`find` exactly once in `path`) — use it to watch your test go red. Each run takes as long',
+  ' as the gate, so give that shell call a long timeout',
+  f.gate_fast_timeout_ms ? ` (the gate's limit is ${f.gate_fast_timeout_ms} ms)` : '',
+  `. At most ${GATE_PROBE_REQUESTS_MAX} runs in this call. It is a fact for you, not the verdict:`,
+  ' the orchestrator still runs the deciding gate after you return.',
+].join('')
+
+// The broker side: a separate `caw.mjs` process, because the engine is blocked in `spawnSync` for
+// the whole executor call and cannot answer anything itself.
+function runGateBroker(dir) {
+  const { f } = profile(false)
+  const spec = process.env.CAW_GATE_BROKER_SPEC || null
+  const parent = Number(process.env.CAW_GATE_BROKER_PARENT || 0)
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  const seen = new Set()
+  let served = 0
+  writeFileSync(join(dir, 'broker.pid'), String(process.pid))
+  const answer = (id, body) => {
+    const target = join(dir, 'responses', `${id}.json`)
+    writeFileSync(`${target}.tmp`, JSON.stringify({ id, ...body }))
+    renameSync(`${target}.tmp`, target)
+  }
+  for (;;) {
+    if (parent) { try { process.kill(parent, 0) } catch { return } }
+    let names = []
+    try { names = readdirSync(join(dir, 'requests')).filter((name) => name.endsWith('.json')).sort() }
+    catch { return }
+    for (const name of names) {
+      const id = name.slice(0, -'.json'.length)
+      if (seen.has(id)) continue
+      seen.add(id)
+      if (!GATE_PROBE_REQUEST_ID.test(id)) continue
+      const path = join(dir, 'requests', name)
+      let request
+      try {
+        if (!lstatSync(path).isFile()) continue
+        request = JSON.parse(readFileSync(path, 'utf8'))
+      } catch (error) {
+        answer(id, { state: 'unavailable', status: null, reason: `unreadable request: ${error?.message || error}` })
+        continue
+      }
+      if (served >= GATE_PROBE_REQUESTS_MAX) {
+        answer(id, { state: 'refused', status: null,
+          reason: `this call's ${GATE_PROBE_REQUESTS_MAX} gate probes are spent` })
+        continue
+      }
+      served += 1
+      const mutation = request?.mutation || null
+      let surface = null
+      try {
+        if (mutation && (typeof mutation.path !== 'string' || typeof mutation.find !== 'string' ||
+            typeof mutation.replace !== 'string' || !mutation.find || mutation.find === mutation.replace)) {
+          throw new Error('a mutation needs string path, a non-empty find, and a different replace')
+        }
+        surface = createReviewSurface(f)
+        if (mutation) applyExecutorMutation(mutation, surface)
+        const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
+          task: spec, kind: 'executor-probe', collectEvidence: false,
+        })
+        answer(id, {
+          state: result.state, status: result.status ?? null, duration_ms: result.durationMs,
+          mutated: Boolean(mutation), output: boundedUtf8HeadTail(result.out, 12 * 1024).text,
+        })
+      } catch (error) {
+        answer(id, { state: 'unavailable', status: null, mutated: Boolean(mutation),
+          reason: (error?.message || String(error)).split('\n')[0] })
+      } finally {
+        if (surface) { try { removeReviewSurface(surface) } catch { /* pruned later */ } }
+      }
+    }
+    Atomics.wait(pause, 0, 0, GATE_PROBE_POLL_MS)
+  }
+}
+
 function recordExecutorMutations(file, round, measurement) {
   const tail = (text, max) => typeof text === 'string' ? text.slice(-max) : ''
   const keep = Math.floor(ENGINE_DIAGNOSTIC_MAX / (measurement.results.length + 2) / 2)
@@ -9638,7 +9828,7 @@ function runTask(file, f, profileText, opts = {}) {
             ' behaviour it breaks is not something the contract requires.'
           : '',
       ].join(''), SCHEMA.delivery, f, file, {
-        dossier: dossier.meta, round: round + 1, executorBudget,
+        dossier: dossier.meta, round: round + 1, executorBudget, gateProbe: true,
       }, null)
       mutationFact = null
       measureMutations = (ex.mutations || []).length > 0
@@ -11635,6 +11825,8 @@ const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done
   'verify-project', 'artifacts']
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { say(USAGE); return }
 if (cmd === '--version' || cmd === '-v') { say(VERSION); return }
+// Internal: the executor's gate broker, started by the engine itself beside an executor call.
+if (cmd === '__gate-broker') { runGateBroker(rest[0]); return }
 if (!KNOWN.includes(cmd)) die(`unknown command: ${cmd}\n\n${USAGE}`)
 
 // Recovery precedes every refusal. These sweeps need neither a usable runtime nor role guarantees,

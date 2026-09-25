@@ -6137,6 +6137,78 @@ test('an executor mutation that cannot be applied is unavailable and never stops
   assert.equal(existsSync(join(f.parent, 'escape.txt')), false)
 })
 
+test('an executor asks the engine to run the gate, and to run it on a mutation, mid-turn', () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' },
+      gateProbes: [
+        {},
+        { mutation: { path: 'src/output.txt', find: 'value=42', replace: 'value=41' } },
+        { mutation: { path: 'src/output.txt', find: 'absent', replace: 'x' } },
+      ],
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: join(f.parent, 'gate-calls.log') })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const executor = calls(f)[0]
+  assert.match(executor.input, /Gate probe\. Your write boundary may keep the gate from running/)
+  const probes = latestTaskAudit(f).delivery.executor_notes
+    .filter((note) => note.startsWith('fake-gate-probe:'))
+    .map((note) => JSON.parse(note.slice('fake-gate-probe:'.length)))
+  assert.deepEqual(probes.map(({ status }) => status), [0, 1, 2])
+  assert.equal(probes[0].last, 'caw-gate: green (status 0)')
+  assert.equal(probes[1].last, 'caw-gate: red (status 1)')
+  assert.match(probes[2].last, /caw-gate: unavailable: `find` occurs 0 times in src\/output.txt/)
+  // Probes ran on copies: the delivery the executor left is what was committed.
+  assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'value=42\n')
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const probeRecord = manifest.diagnostics.find((row) => row.kind === 'gate-probe')
+  assert.ok(probeRecord, 'the probes are recorded in the run')
+  const body = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, probeRecord.file), 'utf8'))
+  assert.equal(body.requests, 3)
+})
+
+test('the gate broker answers at most its per-call limit and refuses the rest', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, gateProbes: Array.from({ length: 7 }, () => ({})),
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const probes = latestTaskAudit(f).delivery.executor_notes
+    .filter((note) => note.startsWith('fake-gate-probe:'))
+    .map((note) => JSON.parse(note.slice('fake-gate-probe:'.length)))
+  assert.deepEqual(probes.map(({ status }) => status), [0, 0, 0, 0, 0, 0, 2])
+  assert.match(probes[6].last, /caw-gate: refused: this call's 6 gate probes are spent/)
+})
+
+test('a gate probe still running when the executor returns is stopped with its broker', () => {
+  // The probe copy lives under the review-surface parent; the deciding gate runs in the delivery.
+  // Only the probe's gate lingers, and it leaves a mark if it outlives the executor call.
+  const gateFast = `node -e "const f=require('fs');if(process.cwd().includes('caw-review-surfaces'))` +
+    `{setTimeout(()=>f.appendFileSync(process.env.CAW_GATE_LOG,'orphan\\n'),3000)}"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, gateProbes: [{ abandon: 1500 }],
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  Atomics.wait(pause, 0, 0, 4000)
+  assert.equal(existsSync(gateLog), false, 'the abandoned probe gate kept running after the call')
+})
+
 test('confirmed red receipt is persisted before an executor retry starts', () => {
   const f = fixture({
     git: true,
