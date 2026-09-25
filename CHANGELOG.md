@@ -27,6 +27,11 @@ Target release: **0.2.0**.
 - A gate evidence contract preflight. A queue declaring `## Required gate checks` against a gate
   that writes no manifest is refused before any executor runs, and the result is cached per gate
   command, engine and profile.
+- Executor mutations. A delivery may name up to eight `mutations` of the shipped code (`path`,
+  an exactly-once `find`, `replace`, `breaks`). After a green gate the engine runs the fast gate
+  on each one, on a disposable copy and outside the executor's boundary. A surviving mutation
+  sends the delivery back to the executor before any reviewer is paid, at most twice per review
+  round. A caught one is trusted review evidence as `executor-mutation:<id>`.
 
 ### Changed
 

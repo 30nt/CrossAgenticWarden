@@ -151,6 +151,12 @@ const MAX_REVIEW_CHALLENGER_PASSES = 2
 const MAX_REVIEW_SEMANTIC_REPAIRS = 1
 const MAX_PLANNING_CANONICAL_REPAIRS = 1
 const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
+// An executor that names a mutation its tests should catch gets it measured by the engine, which
+// runs the gate outside the executor's boundary. Each mutation costs one gate run, so the list is
+// capped; a surviving one buys an executor retry before any reviewer is paid, at most this many
+// times per review round.
+const EXECUTOR_MUTATIONS_MAX = 8
+const MAX_MUTATION_RETRIES = 2
 const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
 const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
 const EXECUTOR_BUDGET_CLASSES = Object.freeze(['small', 'normal', 'large'])
@@ -545,6 +551,7 @@ function evidenceRefIssue(ref, sources) {
     'gate-check': sources.checks,
     'gate-artifact': sources.artifacts,
     'executor-claim': sources.claims,
+    'executor-mutation': sources.mutations || new Set(),
   }
   if (known[kind]) {
     if (!known[kind].has(value)) return `unknown ${kind} evidence reference ${value}`
@@ -593,7 +600,7 @@ function normalizePropertyKeys(verdict) {
 }
 
 function reviewContractIssue(verdict, { criteria = [], surfaces = [], transitions = [],
-  receipt = null, claims = [] } = {}) {
+  receipt = null, claims = [], mutations = [] } = {}) {
   const criterionIds = new Set(criteria.map((row) => row.id))
   const surfaceIds = new Set(surfaces.map((row) => row.id))
   const transitionById = new Map(transitions.map((row) => [row.id, row]))
@@ -602,6 +609,9 @@ function reviewContractIssue(verdict, { criteria = [], surfaces = [], transition
     checks: new Set((receipt?.manifest?.checks || []).map((row) => row.id)),
     artifacts: new Set((receipt?.artifacts || []).map((row) => row.id)),
     claims: new Set(claims.map((row) => row.id)),
+    // Only a mutation the engine itself ran and saw turn the gate red. Unlike a claim it is
+    // trusted evidence: the executor proposed it, but the measurement is the engine's.
+    mutations: new Set(mutations.filter((row) => row.state === 'caught').map((row) => row.id)),
   }
   const checkRefs = (refs, label, requireTrusted = false) => {
     if (!Array.isArray(refs) || !refs.length) return `${label} has no evidence_refs`
@@ -2366,6 +2376,26 @@ const SCHEMA = closeSchema({
             'result', 'summary', 'artifact_refs'],
         },
       },
+      mutations: {
+        type: 'array',
+        description: 'mutations of the shipped code your tests must catch. The engine applies ' +
+          'each one to a disposable copy of your delivery, runs the fast gate outside your ' +
+          'write boundary and reports it caught (gate red) or survived (gate green). `find` ' +
+          'must occur exactly once in `path`; it is replaced by `replace`. A survived mutation ' +
+          `comes back to you before any reviewer sees the delivery. At most ${EXECUTOR_MUTATIONS_MAX}.`,
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            criterion_ids: { type: 'array', items: { type: 'string' } },
+            path: { type: 'string' },
+            find: { type: 'string' },
+            replace: { type: 'string' },
+            breaks: { type: 'string' },
+          },
+          required: ['id', 'criterion_ids', 'path', 'find', 'replace', 'breaks'],
+        },
+      },
       blocked: {
         type: 'string',
         description: 'THE EMPTY STRING when you did the task. Fill it only to name what ' +
@@ -2373,7 +2403,7 @@ const SCHEMA = closeSchema({
           'placeholder: anything here stops the run.',
       },
     },
-    required: ['summary', 'notes', 'claims', 'blocked'],
+    required: ['summary', 'notes', 'claims', 'mutations', 'blocked'],
   },
 })
 
@@ -9088,6 +9118,141 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
   return { accepted, events, noted, verification }
 }
 
+// The executor's own mutations, measured by the engine before any reviewer is paid.
+//
+// The executor is told to run the gate itself and cannot, on every install whose gate needs a
+// toolchain cache outside the delivery tree. Measured on one iOS install, 51 tasks: every
+// executor note says the gate "could not reach a verdict", and every test the executor wrote came
+// with red-making mutations it could only call "unmeasured". The reviewer then found the one that
+// survived and a whole round went on it — one task went six rounds, each closing on exactly that.
+// Widening the boundary does not help there: SwiftPM compiles package manifests under its own
+// seatbelt, and macOS refuses a sandbox inside the executor's (`sandbox_apply: Operation not
+// permitted`), whatever paths are writable.
+//
+// So the engine runs them, on the same reusable replay surface the reviewer's weak findings use,
+// with the same patch-path checks. What differs is what a bad mutation costs: the executor's
+// delivery is not its words, so a mutation that cannot be applied is `unavailable` with its
+// reason, never a refusal of the delivery.
+function executorMutationProblem(mutation, seen) {
+  if (!/^[a-z][a-z0-9.-]{0,63}$/.test(mutation.id || '')) return 'id must match [a-z][a-z0-9.-]{0,63}'
+  if (seen.has(mutation.id)) return `duplicate id ${mutation.id}`
+  if (!mutation.find) return '`find` is empty'
+  if (mutation.find === mutation.replace) return '`replace` equals `find`, so nothing is mutated'
+  return null
+}
+
+function applyExecutorMutation(mutation, surface) {
+  const path = weakExpectedPath({ where: mutation.path }, surface)
+  if (!path) throw new Error(`${mutation.path} is not a regular file in the delivery`)
+  const target = join(surface.workingRoot, path)
+  const text = readFileSync(target, 'utf8')
+  const count = text.split(mutation.find).length - 1
+  if (count !== 1) throw new Error(`\`find\` occurs ${count} times in ${path}; it must occur exactly once`)
+  writeFileSync(target, text.replace(mutation.find, () => mutation.replace))
+  return path
+}
+
+function measureExecutorMutations(mutations, f, spec, expectedDigest) {
+  const results = []
+  const runnable = []
+  const seen = new Set()
+  for (const mutation of mutations || []) {
+    const row = {
+      id: mutation.id, criterion_ids: mutation.criterion_ids, path: mutation.path,
+      breaks: mutation.breaks,
+    }
+    const problem = executorMutationProblem(mutation, seen)
+      || (runnable.length >= EXECUTOR_MUTATIONS_MAX
+        ? `beyond the ${EXECUTOR_MUTATIONS_MAX}-mutation limit` : null)
+    seen.add(mutation.id)
+    results.push(problem ? { ...row, state: 'unavailable', reason: problem } : row)
+    if (!problem) runnable.push({ mutation, row: results.at(-1) })
+  }
+  const measurement = { delivery_digest: expectedDigest, state: 'complete', baseline: null, results }
+  if (!runnable.length) return measurement
+  say(`  executor mutations: one replay surface, ${runnable.length} mutation gate(s)`)
+  const session = runWeakReplaySession(runnable, {
+    createSurface: () => createReviewSurface(f),
+    prepareSurface: (surface) => prepareWeakCapture(surface),
+    restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
+    runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
+    runMutation: ({ mutation }, surface, baseline) => {
+      try {
+        const path = applyExecutorMutation(mutation, surface)
+        const patch = execFileSync('git', ['diff', '--binary', baseline, '--'], {
+          cwd: surface.workingRoot, maxBuffer: REVIEW_PATCH_MAX,
+        }).toString('utf8')
+        restoreWeakReplaySurface(surface, baseline)
+        return { event: replayWeakMutation({ where: path, mutation: { patch } }, f, spec,
+          expectedDigest, surface) }
+      } catch (error) {
+        if (error instanceof WeakMutationInvariantError) throw error
+        const detail = (error?.stderr?.toString() || error?.message || String(error))
+          .trim().split('\n').filter(Boolean).pop() || 'mutation unavailable'
+        return { error: detail }
+      }
+    },
+    finishSurface: (surface, outcome) => {
+      if (outcome.state === 'error') {
+        retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
+      } else removeReviewSurface(surface)
+    },
+  })
+  measurement.baseline = {
+    state: session.baseline.state, gate_status: session.baseline.gate_status,
+    gate_output: session.baseline.gate_output,
+  }
+  if (session.baseline.state !== 'green') {
+    measurement.state = 'baseline-unavailable'
+    for (const { row } of runnable) {
+      Object.assign(row, { state: 'unavailable',
+        reason: `the unmutated copy's gate was ${session.baseline.state} ` +
+          `(status ${session.baseline.gate_status})` })
+    }
+    return measurement
+  }
+  for (const [index, { row }] of runnable.entries()) {
+    const result = session.mutations[index]
+    const event = result?.event
+    if (!event) {
+      Object.assign(row, { state: 'unavailable', reason: result?.error || 'mutation unavailable' })
+      continue
+    }
+    Object.assign(row, {
+      state: event.state === 'mutation-caught' ? 'caught'
+        : event.state === 'confirmed-weak' ? 'survived' : 'unavailable',
+      ...(event.state === 'unverified-timeout' ? { reason: 'the mutated gate timed out' } : {}),
+      ...(event.state === 'unverified-refused' ? { reason: 'the mutated gate refused to run' } : {}),
+      patch_sha256: event.patch_sha256,
+      gate_status: event.gate_status,
+      gate_output: event.gate_output,
+    })
+  }
+  return measurement
+}
+
+const renderMutationRow = (row) => `${row.id} (${row.path}) — ${row.state}` +
+  (row.reason ? `: ${row.reason}` : row.state === 'survived'
+    ? ': the gate stayed green with it applied' : row.state === 'caught'
+      ? `: the gate went red (status ${row.gate_status})` : '') +
+  (row.breaks ? `. It was meant to break: ${row.breaks}` : '')
+
+function recordExecutorMutations(file, round, measurement) {
+  const tail = (text, max) => typeof text === 'string' ? text.slice(-max) : ''
+  const keep = Math.floor(ENGINE_DIAGNOSTIC_MAX / (measurement.results.length + 2) / 2)
+  try {
+    recordEngineDiagnostic('executor', 'mutation-measurement', {
+      task: file, round, delivery_digest: measurement.delivery_digest, state: measurement.state,
+      baseline: measurement.baseline
+        ? { ...measurement.baseline, gate_output: tail(measurement.baseline.gate_output, keep) }
+        : null,
+      results: measurement.results.map((row) => ({
+        ...row, breaks: tail(row.breaks, 256), gate_output: tail(row.gate_output, keep),
+      })),
+    })
+  } catch { /* the measurement still reaches the executor and the reviewer */ }
+}
+
 // Flatten a verdict's blocking slots into the history. `state` is the only mutable field on an
 // item, and it moves only when a reviewer says so — the script never infers a closure.
 function ingest(history, rv, round, weakEvents = [], originRuntime = null) {
@@ -9378,6 +9543,9 @@ function runTask(file, f, profileText, opts = {}) {
   let ex = resume?.ex || null
   let gateFact = resume?.gate_fact || null // last confirmed red, handed to the next executor
   let weakVerification = resume?.weak_verification || null
+  let mutationFact = null // the engine's measurement of the last executor's own mutations
+  let measureMutations = false // set by an executor delivery that named mutations
+  let mutationRetries = 0 // executor retries bought by a surviving mutation this review round
   // The reviewer's non-blocking sightings, kept per task so the commit can carry them. The
   // global `notes` array cannot serve here: it spans every task in the run and is printed once
   // at the end, so a commit built from it would attribute one task's observations to another.
@@ -9461,9 +9629,19 @@ function runTask(file, f, profileText, opts = {}) {
               ? ' Older ids have survived at least one attempted fix; use their checked evidence.'
               : '')
           : '',
+        mutationFact
+          ? '\n\nThe engine ran the fast gate outside your write boundary on each mutation you' +
+            ' returned last time, one at a time on a disposable copy of your delivery:\n\n  - ' +
+            mutationFact.results.map(renderMutationRow).join('\n  - ') +
+            '\n\nA survived mutation means your tests do not catch it. Make each one go red,' +
+            ' then return it again so the engine measures it again. Drop one only if the' +
+            ' behaviour it breaks is not something the contract requires.'
+          : '',
       ].join(''), SCHEMA.delivery, f, file, {
         dossier: dossier.meta, round: round + 1, executorBudget,
       }, null)
+      mutationFact = null
+      measureMutations = (ex.mutations || []).length > 0
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
@@ -9641,8 +9819,25 @@ function runTask(file, f, profileText, opts = {}) {
       die(`${file} — gate is green but nothing changed. Read the spec yourself.`)
     }
 
+    if (measureMutations && !gateUnavailable) {
+      measureMutations = false
+      try { mutationFact = measureExecutorMutations(ex.mutations, f, file, deliveryDigest()) }
+      catch (error) { die(`${file} — executor mutations: ${error?.message || error}`) }
+      recordExecutorMutations(file, round + 1, mutationFact)
+      for (const row of mutationFact.results) say(`    ${renderMutationRow(row)}`)
+      const survived = mutationFact.results.filter((row) => row.state === 'survived')
+      if (survived.length && mutationRetries < MAX_MUTATION_RETRIES) {
+        mutationRetries += 1
+        say(`  ${survived.length} executor mutation(s) survived the gate — back to the executor` +
+          ` before review (mutation retry ${mutationRetries}/${MAX_MUTATION_RETRIES})`)
+        continue
+      }
+    }
+
     const open = openItems(history)
     const deliveryBaseline = deliveryDigest()
+    const measuredMutations = mutationFact?.delivery_digest === deliveryBaseline
+      ? mutationFact.results : []
     const reviewPolicy = runProjectPolicy('review', { spec, files, criteria: coreCriteria })
     const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
       ...item,
@@ -9704,6 +9899,13 @@ function runTask(file, f, profileText, opts = {}) {
           ? ` Its engine-owned receipt is ${g.receipt.receipt_id}. This is one advisory pass:` +
             ' inspect the delivery and record blockers, but do not claim unavailable checks passed.'
           : ` Its engine-owned receipt is ${g.receipt.receipt_id}. Whether it passes is settled.`,
+        measuredMutations.length
+          ? '\n\nThe executor named mutations its tests should catch, and the engine ran the' +
+            ' gate on each against this exact delivery:\n\n  - ' +
+            measuredMutations.map(renderMutationRow).join('\n  - ') +
+            '\n\nA caught one is engine evidence you may cite as `executor-mutation:<id>`; it' +
+            ' does not settle a criterion by itself. Look for the mutation the executor did not name.'
+          : '',
         ' Use receipt checks and artifacts before consulting executor claims. Claims are untrusted',
         ' navigation hints. Judge whether the gate passes for the right reason.',
         '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
@@ -9726,7 +9928,7 @@ function runTask(file, f, profileText, opts = {}) {
           renderReviewCriteria(spec, projectCriteria),
         '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
         ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',
-        ' `gate-artifact:<id>`, `executor-claim:<id>`, `repository:<path>` or',
+        ' `gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `repository:<path>` or',
         ' `review-experiment:<id>`. A met criterion cannot rely only on executor claims.',
         ' Every new finding must also name criterion_ids, surface_ids, transition_ids and one',
         ` stable property_key: ${PROPERTY_KEY_RULE}.`,
@@ -9825,6 +10027,7 @@ function runTask(file, f, profileText, opts = {}) {
               transitions: topology.transitions,
               receipt: g.receipt,
               claims: ex?.claims || [],
+              mutations: measuredMutations,
             })
           semanticProblem = carriedProblem
             ? { path: '$.carried', message: carriedProblem }
@@ -9901,6 +10104,7 @@ function runTask(file, f, profileText, opts = {}) {
 
     const adj = adjudicate(history, rv.carried)
     round++
+    mutationRetries = 0
     recordWeakVerification(file, round, weakVerification)
     const added = ingest(history, rv, round, weakEvents, reviewerRuntime)
     const nowOpen = openItems(history)

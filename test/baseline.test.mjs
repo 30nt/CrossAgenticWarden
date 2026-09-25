@@ -143,7 +143,7 @@ const planReview = (subject = plan()) => ({
   })),
   uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [], carried: [],
 })
-const delivery = (summary, claims = []) => ({ summary, notes: [], claims, blocked: '' })
+const delivery = (summary, claims = [], mutations = []) => ({ summary, notes: [], claims, mutations, blocked: '' })
 const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) => {
   const criterionRows = criteria.map((row) => ({
     ...row, evidence_refs: row.evidence_refs || ['repository:README.md'],
@@ -6052,6 +6052,91 @@ test('build wakes an executor only after the same delivery makes the gate red tw
   assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
 })
 
+// The gate reads the delivery the way a test suite would: `value=42` is always checked, the label
+// only once the executor has added the check for it. So of the two mutations the executor names,
+// one is caught from the start and the other survives until the executor strengthens its test.
+const mutationGate = `node -e "const f=require('fs');const t=f.readFileSync('src/output.txt','utf8');` +
+  `f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');` +
+  `process.exit(t.includes('value=42')&&(!f.existsSync('src/check-label')||t.includes('label=x'))?0:1)"`
+const executorMutations = [
+  { id: 'm-value', criterion_ids: ['must-cover-1'], path: 'src/output.txt',
+    find: 'value=42', replace: 'value=41', breaks: 'the stored value' },
+  { id: 'm-label', criterion_ids: ['must-cover-1'], path: 'src/output.txt',
+    find: 'label=x', replace: 'label=y', breaks: 'the label' },
+]
+
+test('a surviving executor mutation goes back to the executor before any reviewer is paid',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value and the label are kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\nlabel=x\n' },
+      envelope: envelope(delivery('first', [], executorMutations)) },
+    { writeFiles: { 'src/check-label': 'checked\n' },
+      envelope: envelope(delivery('label checked', [], executorMutations)) },
+    {
+      echoPromptMatch: 'm-value \\(src/output.txt\\) — caught|m-label \\(src/output.txt\\) — caught',
+      envelope: envelope(verdict({ criteria: [{
+        id: 'must-cover-1', state: 'met', evidence: 'changing the value or the label turns the gate red',
+        evidence_refs: ['executor-mutation:m-value', 'executor-mutation:m-label'],
+      }] })),
+    },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.match(result.stdout, /m-label \(src\/output.txt\) — survived/)
+  assert.match(result.stdout, /1 executor mutation\(s\) survived the gate — back to the executor/)
+  assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
+  // The second executor is told which of its own mutations the gate did not catch.
+  const retry = calls(f)[1].input
+  assert.match(retry, /m-label \(src\/output.txt\) — survived: the gate stayed green/)
+  assert.match(retry, /m-value \(src\/output.txt\) — caught: the gate went red/)
+  // The reviewer sees the engine's measurement of the delivery it judges, and may cite it.
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.equal(echoes.length, 1)
+  assert.equal(echoes[0].length, 2)
+  // Two deliveries, each: its own gate, one unmutated copy, two mutated copies.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 8)
+  // Every mutation ran on a copy; the committed delivery is what the executor wrote.
+  assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'value=42\nlabel=x\n')
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.diagnostics.filter((row) => row.kind === 'mutation-measurement').length, 2)
+})
+
+test('an executor mutation that cannot be applied is unavailable and never stops the delivery',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('done', [], [
+      { id: 'm-absent', criterion_ids: [], path: 'src/output.txt', find: 'nowhere',
+        replace: 'x', breaks: 'nothing' },
+      { id: 'm-outside', criterion_ids: [], path: '../escape.txt', find: 'a', replace: 'b',
+        breaks: 'nothing' },
+      { id: 'm-value', criterion_ids: [], path: 'src/output.txt', find: 'value=42',
+        replace: 'value=41', breaks: 'the stored value' },
+    ])) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /m-absent \(src\/output.txt\) — unavailable: `find` occurs 0 times/)
+  assert.match(result.stdout, /m-outside \(\.\.\/escape.txt\) — unavailable: \.\.\/escape.txt is not a regular file/)
+  assert.match(result.stdout, /m-value \(src\/output.txt\) — caught/)
+  assert.doesNotMatch(result.stdout, /back to the executor/)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor'])
+  assert.equal(existsSync(join(f.parent, 'escape.txt')), false)
+})
+
 test('confirmed red receipt is persisted before an executor retry starts', () => {
   const f = fixture({
     git: true,
@@ -6379,7 +6464,7 @@ test('a malformed executor answer is repaired once instead of ending the run', (
   writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
   const result = run(f, ['build'], [
     // A claim missing the fields the delivery schema requires: valid JSON, invalid canonical value.
-    { envelope: envelope({ summary: 'first try', notes: [], blocked: '',
+    { envelope: envelope({ summary: 'first try', notes: [], mutations: [], blocked: '',
       claims: [{ id: 'check-one', summary: 'ran it' }] }) },
     { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
     { envelope: envelope(verdict()) },
@@ -6406,7 +6491,7 @@ test('a second malformed executor answer still stops, with the failure retained'
   const f = fixture({ git: true })
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
   writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
-  const malformed = { envelope: envelope({ summary: 'try', notes: [], blocked: '',
+  const malformed = { envelope: envelope({ summary: 'try', notes: [], mutations: [], blocked: '',
     claims: [{ id: 'check-one', summary: 'ran it' }] }) }
   const result = run(f, ['build'], [malformed, malformed])
   assert.equal(result.status, 1)

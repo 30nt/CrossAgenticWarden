@@ -56,6 +56,21 @@ the delivery tree are the `delivery-tree` boundary working as designed, not evid
 task is impossible or permission to widen or escape the boundary. This exception is only for a
 gate that cannot run: when the gate does run and fails, investigate and report that real failure.
 
+## Mutations: have the engine run what you cannot
+
+For every test you add or change for a `Must cover` row, name in `mutations` the smallest change
+to the **shipped** code that the test exists to catch: `path`, a `find` that occurs exactly once
+in that file, its `replace`, and what it `breaks`. After a green gate the engine applies each one
+to a disposable copy of your delivery and runs the fast gate there, outside your write boundary.
+A mutation the gate catches is engine evidence the reviewer may cite. One that **survives** comes
+back to you before any reviewer sees the delivery: make your test catch it, and return it again.
+
+This is the fact the gate attempt above would have given you, on a host where it cannot. On one
+install the executor could never run the gate, listed every red-making mutation as
+"unmeasured", and the reviewer spent a whole round on each one that survived. Do not mutate the
+test itself, and do not name a mutation you expect to survive. Leave `mutations` empty when the
+task adds no test.
+
 Record every meaningful check in `claims`. A claim has a stable id, links to the criterion and
 acceptance-case ids it exercised, the command and selector, the observed result, a short summary
 and any artifact references. These are navigation hints for the reviewer, not certification:
