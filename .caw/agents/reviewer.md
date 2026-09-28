@@ -113,6 +113,11 @@ Later rounds show you what earlier rounds already `noted`. Do not restate those.
   the human once and carried in the commit, and nothing acts on it. Everything you would
   otherwise be tempted to block on *while you are here* goes here.
 
+Before you return, read each `noted` of yours against `## Must cover`, `## Change`, and
+`## Done when`. One that names a line of them the tree does not meet is `uncovered`: move it,
+and quote the line. Measured on one install: a reviewer noted that a test never taps the
+answer-card block while `## Change` required updating it, and the item blocked one round later.
+
 That last slot is why the three above can be strict. A finding with nowhere to land becomes a
 blocker, and a task that took two rounds over a correct assertion with a misleading name paid
 a full executor round for a rename.
