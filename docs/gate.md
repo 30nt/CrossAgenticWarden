@@ -83,6 +83,10 @@ digest for external inputs. Without the project digest, or on any mismatch, the 
    plan-reviewer never see it.
    Unset — a hand run, or the full gate — means the whole directory is the right subject.
    (Without it a gate reds a plan's early tasks over a debt only its last task settles.)
+   It is also unset for the evidence-contract preflight `build` runs once before any executor,
+   whose `CAW_GATE_CONTRACT` carries `"kind": "contract-preflight"`. That run only asks whether the
+   gate writes a manifest: a red or refused run without one leaves the question open and the
+   build going, and only a green run without one refuses the queue.
 
 ## Structured evidence
 

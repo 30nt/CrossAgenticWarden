@@ -8093,8 +8093,17 @@ function runGateEvidenceContractPreflight(f, specs) {
   say(`\n· gate evidence contract — ${declaring.length} queued task(s) declare required gate` +
       ' checks, and this gate has not been seen to emit a manifest. Asking it once, before' +
       ' any executor runs.')
-  const probe = gate(f.gate_fast, declaring[0], undefined, f.gate_fast_timeout_ms, {
-    task: declaring[0],
+  // Asked of no task. The question is whether this gate writes a manifest, and a spec whose
+  // delivery does not exist yet cannot be green: measured on one iOS install, a project rule that a task
+  // must close its own backlog block made the preflight — run as the queue's first task, on the
+  // committed tree — red on every engine update whose first task closes one, and `build` refused
+  // an approved queue before any executor had run. Asking no task does not settle that install
+  // by itself: its gate, as docs/gate.md prescribes, judges the whole queue when CAW_SPEC is
+  // unset, and is red there too. What settles it is the rule below, that red proves nothing; a
+  // project that wants the answer cached skips its delivery checks on `kind: contract-preflight`,
+  // which stays visible in CAW_GATE_CONTRACT.
+  const probe = gate(f.gate_fast, null, undefined, f.gate_fast_timeout_ms, {
+    task: null,
     kind: 'contract-preflight',
     deliveryDigest: deliveryDigest(),
     criteria: [],
@@ -8104,6 +8113,16 @@ function runGateEvidenceContractPreflight(f, specs) {
   if (probe.receipt?.manifest?.present) {
     writeGateContractPreflight(identity)
     say('  it writes an evidence manifest; the declared ids will be judged per task.')
+    return
+  }
+  // Only a GREEN gate without a manifest proves the gate emits none. A gate that writes its manifest
+  // only when it passes — the common shape — says nothing on a red or refused run, and a docs-
+  // conforming gate run without CAW_SPEC judges the whole queue, which nothing has delivered yet.
+  // So that answer is left unsettled rather than refused: nothing is cached, and each task's own
+  // green gate is still refused without the checks it declares, exactly as before.
+  if (probe.state === 'red' || probe.state === 'refused') {
+    say(`  it was ${probe.state} on the committed tree (status ${probe.status}) and wrote no manifest,` +
+      ' which does not settle whether it can; each task\'s green gate will be judged on its own.')
     return
   }
   if (probe.state === 'timeout') {

@@ -56,6 +56,10 @@ Target release: **0.2.0**.
 
 ### Fixed
 
+- The gate evidence-contract preflight no longer runs as the queue's first task and no longer
+  refuses a queue over a red run: it is asked of no task (`CAW_SPEC` unset, `kind:
+  contract-preflight`), and only a green gate without a manifest refuses. A red or refused one
+  leaves the question unsettled and uncached, and each task's green gate is judged as before.
 - Conservative review merging now retains disagreement, stable finding provenance, and exact
   baseline identity across retries and provider changes.
 - Gate timeouts, unavailable verification, stale evidence, interrupted calls, and executor budget

@@ -6863,6 +6863,78 @@ test('a reviewer rejection that names its criterion by id is recorded as a findi
   assert.equal(existsSync(join(f.root, '.git', 'caw', 'contract-failures')), false)
 })
 
+// Measured on one iOS install: a task-bound project rule ("a task closes its own backlog block") made the
+// preflight red when it was asked as the queue's first task on the committed tree, and `build`
+// refused an approved queue before any executor ran. The manifest is written only on green.
+// Two shapes of such a gate: one that drops its delivery checks when CAW_SPEC is unset, and one
+// that then judges the whole queue, as docs/gate.md prescribes (`queue`) — the install that measured it has the second.
+const deliveryBoundGate = `
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
+appendFileSync(process.env.CAW_GATE_RUN_LOG, (process.env.CAW_SPEC || '-') + '\\n')
+const delivered = existsSync('src/output-1.txt')
+if (process.env.CAW_GATE_RED_WITHOUT_DELIVERY === 'queue' && !delivered) process.exit(1)
+if (process.env.CAW_SPEC && !delivered) process.exit(1)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`
+const requiredCheckSpec = `---
+title: Task 1
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`
+const requiredCheckResponses = [
+  { writeFiles: { 'src/output-1.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+  { envelope: envelope(verdict({ criteria: [{
+    id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+    evidence_refs: ['gate-check:focused-output'],
+  }] })) },
+]
+
+test('the contract preflight asks the gate about no task, so a delivery-bound rule cannot refuse the queue', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), deliveryBoundGate)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add delivery-bound gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '012_first.md'), requiredCheckSpec)
+
+  const result = run(f, ['build'], requiredCheckResponses, { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /it writes an evidence manifest/)
+  // The preflight ran with no CAW_SPEC; the task's own gate ran with its spec.
+  assert.deepEqual(readFileSync(runLog, 'utf8').trim().split('\n'), ['-', '012_first.md'])
+})
+
+test('a gate red on the undelivered queue leaves the contract unsettled and the build going', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), deliveryBoundGate)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add queue-bound gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '012_first.md'), requiredCheckSpec)
+
+  const env = { CAW_GATE_RUN_LOG: runLog, CAW_GATE_RED_WITHOUT_DELIVERY: 'queue' }
+  const result = run(f, ['build'], requiredCheckResponses, env)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /it was red on the committed tree \(status 1\) and wrote no manifest/)
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /wrote\n\s+no evidence manifest/)
+  // Unsettled is not cached: the next build asks again.
+  writeFileSync(join(f.root, '.caw-tasks', '013_second.md'), requiredCheckSpec.replace('Task 1', 'Task 2'))
+  const again = run(f, ['build'], [], env)
+  assert.match(again.stdout, /gate evidence contract/)
+})
+
 test('the contract preflight is paid once per gate, not once per build', () => {
   const f = fixture({ git: true, gateFast: 'node gate.mjs' })
   writeFileSync(join(f.root, 'gate.mjs'), `
