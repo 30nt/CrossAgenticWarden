@@ -552,6 +552,7 @@ function evidenceRefIssue(ref, sources) {
     'gate-artifact': sources.artifacts,
     'executor-claim': sources.claims,
     'executor-mutation': sources.mutations || new Set(),
+    'review-mutation': sources.reviewMutations || new Set(),
   }
   if (known[kind]) {
     if (!known[kind].has(value)) return `unknown ${kind} evidence reference ${value}`
@@ -611,8 +612,14 @@ function reviewContractIssue(verdict, { criteria = [], surfaces = [], transition
     claims: new Set(claims.map((row) => row.id)),
     // Only a mutation the engine itself ran and saw turn the gate red. Unlike a claim it is
     // trusted evidence: the executor proposed it, but the measurement is the engine's.
-    mutations: new Set(mutations.filter((row) => row.state === 'caught').map((row) => row.id)),
+    mutations: new Set(mutations.filter((row) => row.source !== 'reviewer' && row.state === 'caught')
+      .map((row) => row.id)),
+    // The same, for a reviewer's own captured mutation replayed against the new delivery.
+    reviewMutations: new Set(mutations.filter((row) => row.source === 'reviewer' &&
+      row.state === 'caught').map((row) => row.id)),
   }
+  const survivedReview = new Set(mutations.filter((row) => row.source === 'reviewer' &&
+    row.state === 'survived').map((row) => row.id))
   const checkRefs = (refs, label, requireTrusted = false) => {
     if (!Array.isArray(refs) || !refs.length) return `${label} has no evidence_refs`
     if (new Set(refs).size !== refs.length) return `${label} has duplicate evidence_refs`
@@ -632,6 +639,12 @@ function reviewContractIssue(verdict, { criteria = [], surfaces = [], transition
   for (const row of verdict.carried || []) {
     const issue = checkRefs(row.evidence_refs, `carried finding ${row.id}`)
     if (issue) return issue
+    // The finding's own experiment, replayed by the engine on this delivery, still passes the
+    // gate. A closure would contradict the one measurement that bears on it directly.
+    if (row.state === 'closed' && survivedReview.has(row.id)) {
+      return `carried finding ${row.id} cannot be closed: the engine replayed its mutation on this` +
+        ' delivery and the gate stayed green'
+    }
   }
   for (const slot of SLOTS) {
     for (const [index, item] of (verdict[slot] || []).entries()) {
@@ -3069,6 +3082,9 @@ function recordWeakVerification(task, round, verification, status = 'active') {
     writePrivateFile(join(run.path, name), Buffer.from(patch), REVIEW_PATCH_MAX)
     delete entry.patch
     entry.patch_file = name
+    // The run it lives in. An open weak finding keeps this event, and the engine replays the
+    // patch against later deliveries, possibly from another invocation and so another run.
+    entry.patch_run = run.id
     entry.patch_bytes = Buffer.byteLength(patch)
     entry.patch_sha256 = createHash('sha256').update(patch).digest('hex')
     return entry
@@ -9219,14 +9235,59 @@ function applyExecutorMutation(mutation, surface) {
   return path
 }
 
-function measureExecutorMutations(mutations, f, spec, expectedDigest) {
+// The open `weak` findings whose captured mutation the engine can replay. A finding carries the
+// reviewer's exact patch from the round it was verified in, so whether a later delivery closes
+// it is, first of all, whether that patch now turns the gate red.
+// The patch itself is moved out of the event into the run record when the round is recorded, so
+// it is read back from there and trusted only if it still hashes to what the event says. An event
+// recorded before `patch_run` existed names only the file, so every run is searched for it.
+function reviewFindingPatch(item) {
+  const event = item?.mutation_event
+  if (typeof event?.patch === 'string' && event.patch.length) return event.patch
+  if (typeof event?.patch_file !== 'string' || !/^[0-9a-f]{64}$/.test(event.patch_sha256 || '')) {
+    return null
+  }
+  const safe = (name) => typeof name === 'string' && name.length > 0 && !name.includes('/') &&
+    !name.includes('\\') && name !== '.' && name !== '..'
+  if (!safe(event.patch_file)) return null
+  let runs = []
+  if (safe(event.patch_run)) runs = [event.patch_run]
+  else {
+    try { runs = readdirSync(LOG_DIR).filter((name) => name.startsWith('run-')).sort().reverse() }
+    catch { return null }
+  }
+  for (const run of runs) {
+    try {
+      const bytes = readFileSync(join(LOG_DIR, run, event.patch_file))
+      if (createHash('sha256').update(bytes).digest('hex') === event.patch_sha256) {
+        return bytes.toString('utf8')
+      }
+    } catch { /* not in this run */ }
+  }
+  return null
+}
+
+const replayableReviewFindings = (history) => openItems(history)
+  .filter((item) => item.slot === 'weak')
+  .map((item) => ({ item, patch: reviewFindingPatch(item) }))
+  .filter(({ patch }) => patch)
+  .map(({ item, patch }) => ({ ...item, replay_patch: patch }))
+
+// Measured on one iOS install: 71% of reviewer findings were test gaps, and in tasks 009 and 010 the
+// executor answered a `weak` finding without ever running the reviewer's mutation — its own
+// mutations moved a static helper while the reviewer's broke the screen, so "all caught" was
+// true and closed nothing. The reviewer's patch is replayed here with the executor's, on the
+// same surface after the same unmutated gate, so it costs one gate per open finding and no
+// extra baseline. A patch the new delivery no longer applies to is `unavailable`: the finding
+// goes to the reviewer as before, and nothing is passed off as proof.
+function measureExecutorMutations(mutations, f, spec, expectedDigest, reviewFindings = []) {
   const results = []
   const runnable = []
   const seen = new Set()
   for (const mutation of mutations || []) {
     const row = {
-      id: mutation.id, criterion_ids: mutation.criterion_ids, path: mutation.path,
-      breaks: mutation.breaks,
+      id: mutation.id, source: 'executor', criterion_ids: mutation.criterion_ids,
+      path: mutation.path, breaks: mutation.breaks,
     }
     const problem = executorMutationProblem(mutation, seen)
       || (runnable.length >= EXECUTOR_MUTATIONS_MAX
@@ -9235,16 +9296,29 @@ function measureExecutorMutations(mutations, f, spec, expectedDigest) {
     results.push(problem ? { ...row, state: 'unavailable', reason: problem } : row)
     if (!problem) runnable.push({ mutation, row: results.at(-1) })
   }
+  for (const finding of reviewFindings) {
+    const row = {
+      id: finding.id, source: 'reviewer', criterion_ids: finding.criterion_ids,
+      path: finding.where, breaks: finding.fix,
+    }
+    results.push(row)
+    runnable.push({ finding, row })
+  }
   const measurement = { delivery_digest: expectedDigest, state: 'complete', baseline: null, results }
   if (!runnable.length) return measurement
-  say(`  executor mutations: one replay surface, ${runnable.length} mutation gate(s)`)
+  say(`  mutations: one replay surface, ${runnable.length} mutation gate(s)` +
+    (reviewFindings.length ? `, ${reviewFindings.length} of them the reviewer's` : ''))
   const session = runWeakReplaySession(runnable, {
     createSurface: () => createReviewSurface(f),
     prepareSurface: (surface) => prepareWeakCapture(surface),
     restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
     runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
-    runMutation: ({ mutation }, surface, baseline) => {
+    runMutation: ({ mutation, finding }, surface, baseline) => {
       try {
+        if (finding) {
+          return { event: replayWeakMutation({ where: finding.where,
+            mutation: { patch: finding.replay_patch } }, f, spec, expectedDigest, surface) }
+        }
         const path = applyExecutorMutation(mutation, surface)
         const patch = execFileSync('git', ['diff', '--binary', baseline, '--'], {
           cwd: surface.workingRoot, maxBuffer: REVIEW_PATCH_MAX,
@@ -9302,7 +9376,10 @@ const renderMutationRow = (row) => `${row.id} (${row.path}) — ${row.state}` +
   (row.reason ? `: ${row.reason}` : row.state === 'survived'
     ? ': the gate stayed green with it applied' : row.state === 'caught'
       ? `: the gate went red (status ${row.gate_status})` : '') +
-  (row.breaks ? `. It was meant to break: ${row.breaks}` : '')
+  (row.breaks ? row.source === 'reviewer' ? `. The finding: ${row.breaks}`
+    : `. It was meant to break: ${row.breaks}` : '')
+const executorMutationRows = (rows) => rows.filter((row) => row.source !== 'reviewer')
+const reviewMutationRows = (rows) => rows.filter((row) => row.source === 'reviewer')
 
 // The gate probe: the same fact, inside the executor's own turn.
 //
@@ -9872,13 +9949,22 @@ function runTask(file, f, profileText, opts = {}) {
               ? ' Older ids have survived at least one attempted fix; use their checked evidence.'
               : '')
           : '',
-        mutationFact
+        mutationFact && executorMutationRows(mutationFact.results).length
           ? '\n\nThe engine ran the fast gate outside your write boundary on each mutation you' +
             ' returned last time, one at a time on a disposable copy of your delivery:\n\n  - ' +
-            mutationFact.results.map(renderMutationRow).join('\n  - ') +
+            executorMutationRows(mutationFact.results).map(renderMutationRow).join('\n  - ') +
             '\n\nA survived mutation means your tests do not catch it. Make each one go red,' +
             ' then return it again so the engine measures it again. Drop one only if the' +
             ' behaviour it breaks is not something the contract requires.'
+          : '',
+        mutationFact && reviewMutationRows(mutationFact.results).length
+          ? '\n\nThe engine also replayed the reviewer\'s own mutation for each open weak finding' +
+            ' against your last delivery, the same way:\n\n  - ' +
+            reviewMutationRows(mutationFact.results).map(renderMutationRow).join('\n  - ') +
+            '\n\nA survived one is that finding still open by the reviewer\'s own experiment: the' +
+            ' dossier has its evidence. Make a test go red on exactly that mutation, observed where' +
+            ' the finding names it, not in a helper beside it. The engine replays it again on your' +
+            ' next delivery.'
           : '',
         unchangedFact
           ? '\n\nYou returned the tree the reviewer rejected, byte for byte. That tree cannot close' +
@@ -9891,7 +9977,8 @@ function runTask(file, f, profileText, opts = {}) {
       }, null)
       mutationFact = null
       unchangedFact = null
-      measureMutations = (ex.mutations || []).length > 0
+      measureMutations = (ex.mutations || []).length > 0 ||
+        replayableReviewFindings(history).length > 0
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
@@ -10095,14 +10182,15 @@ function runTask(file, f, profileText, opts = {}) {
 
     if (measureMutations && !gateUnavailable) {
       measureMutations = false
-      try { mutationFact = measureExecutorMutations(ex.mutations, f, file, deliveryDigest()) }
+      try { mutationFact = measureExecutorMutations(ex.mutations, f, file, deliveryDigest(),
+        replayableReviewFindings(history)) }
       catch (error) { die(`${file} — executor mutations: ${error?.message || error}`) }
       recordExecutorMutations(file, round + 1, mutationFact)
       for (const row of mutationFact.results) say(`    ${renderMutationRow(row)}`)
       const survived = mutationFact.results.filter((row) => row.state === 'survived')
       if (survived.length && mutationRetries < MAX_MUTATION_RETRIES) {
         mutationRetries += 1
-        say(`  ${survived.length} executor mutation(s) survived the gate — back to the executor` +
+        say(`  ${survived.length} mutation(s) survived the gate — back to the executor` +
           ` before review (mutation retry ${mutationRetries}/${MAX_MUTATION_RETRIES})`)
         continue
       }
@@ -10178,12 +10266,21 @@ function runTask(file, f, profileText, opts = {}) {
           ? ` Its engine-owned receipt is ${g.receipt.receipt_id}. This is one advisory pass:` +
             ' inspect the delivery and record blockers, but do not claim unavailable checks passed.'
           : ` Its engine-owned receipt is ${g.receipt.receipt_id}. Whether it passes is settled.`,
-        measuredMutations.length
+        executorMutationRows(measuredMutations).length
           ? '\n\nThe executor named mutations its tests should catch, and the engine ran the' +
             ' gate on each against this exact delivery:\n\n  - ' +
-            measuredMutations.map(renderMutationRow).join('\n  - ') +
+            executorMutationRows(measuredMutations).map(renderMutationRow).join('\n  - ') +
             '\n\nA caught one is engine evidence you may cite as `executor-mutation:<id>`; it' +
             ' does not settle a criterion by itself. Look for the mutation the executor did not name.'
+          : '',
+        reviewMutationRows(measuredMutations).length
+          ? '\n\nFor each open weak finding the engine replayed the mutation a reviewer captured' +
+            ' for it, against this exact delivery:\n\n  - ' +
+            reviewMutationRows(measuredMutations).map(renderMutationRow).join('\n  - ') +
+            '\n\nA caught one is engine evidence you may cite as `review-mutation:<id>` when you' +
+            ' close that finding; it shows the tests now catch that one mutation, not that the' +
+            ' finding\'s property is covered. A survived one cannot be closed on this delivery;' +
+            ' an unavailable one is judged as before.'
           : '',
         ' Use receipt checks and artifacts before consulting executor claims. Claims are untrusted',
         ' navigation hints. Judge whether the gate passes for the right reason.',
@@ -10207,7 +10304,8 @@ function runTask(file, f, profileText, opts = {}) {
           renderReviewCriteria(spec, projectCriteria),
         '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
         ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',
-        ' `gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `repository:<path>` or',
+        ' `gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `review-mutation:<id>`,',
+        ' `repository:<path>` or',
         ' `review-experiment:<id>`. A met criterion cannot rely only on executor claims.',
         ' Every new finding must also name criterion_ids, surface_ids, transition_ids and one',
         ` stable property_key: ${PROPERTY_KEY_RULE}.`,

@@ -5048,7 +5048,10 @@ title: Baseline task
 
 test('a committed task retains its confirmed weak verification in the run record',
   { skip: claudeOuterProfileSkip() }, () => {
-  const f = fixture({ git: true })
+  // Round two must really close the finding: the engine replays the reviewer's heading mutation
+  // on it, and a delivery its gate does not watch the heading on goes back to the executor.
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
   mkdirSync(join(f.root, '.caw-tasks'))
   writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
 
@@ -5059,11 +5062,12 @@ test('a committed task retains its confirmed weak verification in the run record
       evidence: 'mutated the heading in the isolated surface',
       mutation: { patch: readmeMutation('confirmed'), breaks: 'the fixture heading' },
     }] })) },
-    { writeFiles: { 'delivery.txt': 'round two\n' }, envelope: envelope(delivery('fixed weakness')) },
+    { writeFiles: { 'delivery.txt': 'round two\n', 'src/heading-check': 'on\n' },
+      envelope: envelope(delivery('fixed weakness')) },
     { envelope: envelope(verdict({ carried: [{
       id: 'r1.1', state: 'closed', evidence: 'the delivery now observes the heading',
     }] })) },
-  ])
+  ], { CAW_GATE_LOG: gateLog })
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), false)
@@ -6089,7 +6093,7 @@ test('a surviving executor mutation goes back to the executor before any reviewe
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
   assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
   assert.match(result.stdout, /m-label \(src\/output.txt\) — survived/)
-  assert.match(result.stdout, /1 executor mutation\(s\) survived the gate — back to the executor/)
+  assert.match(result.stdout, /1 mutation\(s\) survived the gate — back to the executor/)
   assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
   // The second executor is told which of its own mutations the gate did not catch.
   const retry = calls(f)[1].input
@@ -6143,6 +6147,95 @@ test('an executor after a rejecting review is not shown the measurement that rev
   assert.match(second, /Close every open finding in the dossier/)
   assert.doesNotMatch(second, /m-value \(src\/output.txt\) — caught/)
   assert.doesNotMatch(second, /on each mutation you returned last time/)
+})
+
+// The gate watches the heading only once `src/heading-check` exists, so the reviewer's heading
+// mutation survives until the executor adds that check — and survives an unrelated edit.
+const headingGate = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');` +
+  `process.exit(f.existsSync('src/heading-check')&&!f.readFileSync('README.md','utf8').startsWith('# fixture\\n')?1:0)"`
+
+// Measured on one iOS install, on two tasks: the executor answered a weak finding without running
+// the reviewer's mutation, and a whole review round went on learning that it still survived.
+test('an open weak finding is replayed on the next delivery and goes back before any reviewer while it survives',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Done when\n- The heading is checked.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'delivery\n' }, envelope: envelope(delivery('first')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'weak', evidence: 'the heading can change unseen' }],
+      weak: [{
+        where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+        evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+        mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+      }],
+    })) },
+    { writeFiles: { 'src/unrelated.txt': 'beside the point\n' },
+      envelope: envelope(delivery('strengthened a helper')) },
+    { writeFiles: { 'src/heading-check': 'on\n' }, envelope: envelope(delivery('heading checked')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'met', evidence: 'the heading mutation turns the gate red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the engine replay went red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — survived: the gate stayed green with it applied/)
+  assert.match(result.stdout, /1 mutation\(s\) survived the gate — back to the executor/)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — caught: the gate went red/)
+  assert.match(calls(f)[2].input,
+    /replayed the reviewer's own mutation for each open weak finding[\s\S]*r1\.1 \(README\.md:1\) — survived/)
+  assert.doesNotMatch(calls(f)[1].input, /replayed the reviewer's own mutation/)
+  // Round 1: gate, weak baseline, weak mutation. Then per delivery: gate, unmutated copy, r1.1.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 9)
+})
+
+// A finding recorded before `patch_run` existed names only its patch file. The installs already
+// hold such findings open, and the first resumed round on them is where the replay pays.
+test('an open weak finding recorded without its run is still replayed on a resumed round',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Done when\n- The heading is checked.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  const first = run(f, ['review', '001_task.md'], [{ envelope: envelope(verdict({
+    criteria: [{ id: 'done-when-1', state: 'weak', evidence: 'the heading can change unseen' }],
+    weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+      evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+      mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+    }],
+  })) }], { CAW_GATE_LOG: gateLog })
+  assert.equal(first.status, 1, `${first.stdout}\n${first.stderr}`)
+  const statePath = join(f.root, '.caw-tasks', '.round-001_task.md.json')
+  const state = JSON.parse(readFileSync(statePath, 'utf8'))
+  assert.match(state.history[0].mutation_event.patch_run, /^run-/)
+  delete state.history[0].mutation_event.patch_run
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`)
+
+  const result = run(f, ['round', '001_task.md'], [
+    { writeFiles: { 'src/unrelated.txt': 'beside the point\n' },
+      envelope: envelope(delivery('strengthened a helper')) },
+    { writeFiles: { 'src/heading-check': 'on\n' }, envelope: envelope(delivery('heading checked')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'met', evidence: 'the heading mutation turns the gate red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the engine replay went red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — survived/)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — caught/)
 })
 
 const loggingGate = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'gate\\n')"`

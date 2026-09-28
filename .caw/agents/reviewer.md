@@ -113,19 +113,24 @@ Later rounds show you what earlier rounds already `noted`. Do not restate those.
   the human once and carried in the commit, and nothing acts on it. Everything you would
   otherwise be tempted to block on *while you are here* goes here.
 
+That last slot is why the three above can be strict. A finding with nowhere to land becomes a
+blocker, and a task that took two rounds over a correct assertion with a misleading name paid
+a full executor round for a rename.
+
 Before you return, read each `noted` of yours against `## Must cover`, `## Change`, and
 `## Done when`. One that names a line of them the tree does not meet is `uncovered`: move it,
 and quote the line. Measured on one install: a reviewer noted that a test never taps the
 answer-card block while `## Change` required updating it, and the item blocked one round later.
 
-That last slot is why the three above can be strict. A finding with nowhere to land becomes a
-blocker, and a task that took two rounds over a correct assertion with a misleading name paid
-a full executor round for a rename.
-
 Every criterion disposition, carried decision and blocking item also carries `evidence_refs`.
 Use the exact references supplied by the dossier: `gate-receipt:<id>`, `gate-check:<id>`,
-`gate-artifact:<id>`, `executor-claim:<id>`, `repository:<path>` or
-`review-experiment:<id>`.
+`gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `review-mutation:<id>`,
+`repository:<path>` or `review-experiment:<id>`.
+
+For each open `weak` finding the engine replays the mutation captured for it against the new
+delivery before you are called, and tells you the result. A caught replay is `review-mutation:<id>`
+evidence for closing that finding. A survived one means the finding cannot be `closed` on this
+delivery; the engine refuses that disposition.
 
 Every new blocking item links to `criterion_ids`, `surface_ids` and `transition_ids`, and
 names one stable `property_key`: lowercase letters, digits, dots and hyphens, starting with a

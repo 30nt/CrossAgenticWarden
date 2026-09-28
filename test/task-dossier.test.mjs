@@ -202,3 +202,29 @@ test('review evidence distinguishes engine receipts from untrusted claims', () =
     }],
   }, context), /unsafe repository evidence reference/)
 })
+
+test('a reviewer mutation the engine replayed is evidence when caught and blocks closure when it survived', () => {
+  const topology = extractTaskTopology(spec)
+  const closing = (refs) => ({
+    criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'the heading check is in place',
+      evidence_refs: ['gate-receipt:receipt-1'],
+    }],
+    carried: [{ id: 'r1.1', state: 'closed', evidence: 'the test now fails on it', evidence_refs: refs }],
+    broken: [], uncovered: [], weak: [], noted: [],
+  })
+  const context = (state) => ({
+    ...topology,
+    receipt: { receipt_id: 'receipt-1', manifest: { checks: [] }, artifacts: [] },
+    mutations: [{ id: 'r1.1', source: 'reviewer', state }],
+  })
+
+  assert.equal(reviewContractIssue(closing(['review-mutation:r1.1']), context('caught')), null)
+  // A reviewer's caught replay is not executor evidence, and an executor id is not a reviewer's.
+  assert.match(reviewContractIssue(closing(['executor-mutation:r1.1']), context('caught')),
+    /unknown executor-mutation evidence reference r1\.1/)
+  assert.match(reviewContractIssue(closing(['gate-receipt:receipt-1']), context('survived')),
+    /r1\.1 cannot be closed: the engine replayed its mutation on this delivery and the gate stayed green/)
+  assert.match(reviewContractIssue(closing(['review-mutation:r1.1']), context('survived')),
+    /unknown review-mutation evidence reference r1\.1/)
+})

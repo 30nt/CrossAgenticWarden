@@ -37,6 +37,11 @@ Target release: **0.2.0**.
   profile's fast gate on a disposable copy of the executor's current tree, optionally with one
   `--mutation` applied, at most six times per call. Each use is recorded as a `gate-probe` run
   diagnostic; it certifies nothing.
+- Reviewer mutation replay. Every open `weak` finding keeps the reviewer's captured patch, and
+  after each green executor delivery the engine replays it on the same surface as the executor's
+  mutations, after the same unmutated gate. A survived one sends the delivery back to the
+  executor before any reviewer is paid; a caught one is trusted evidence as
+  `review-mutation:<id>`, and a finding whose replay survived cannot be closed on that delivery.
 
 ### Changed
 
