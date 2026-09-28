@@ -9787,6 +9787,8 @@ function runTask(file, f, profileText, opts = {}) {
   let mutationFact = null // the engine's measurement of the last executor's own mutations
   let measureMutations = false // set by an executor delivery that named mutations
   let mutationRetries = 0 // executor retries bought by a surviving mutation this review round
+  let unchangedReturns = 0 // executor returns of the tree the last reviewer rejected, this round
+  let unchangedFact = null // the open ids such a return could not close, for the next executor
   // The reviewer's non-blocking sightings, kept per task so the commit can carry them. The
   // global `notes` array cannot serve here: it spans every task in the run and is printed once
   // at the end, so a commit built from it would attribute one task's observations to another.
@@ -9878,10 +9880,17 @@ function runTask(file, f, profileText, opts = {}) {
             ' then return it again so the engine measures it again. Drop one only if the' +
             ' behaviour it breaks is not something the contract requires.'
           : '',
+        unchangedFact
+          ? '\n\nYou returned the tree the reviewer rejected, byte for byte. That tree cannot close' +
+            ` ${unchangedFact.join(', ')}: the reviewer has already judged it and left them open.` +
+            ' Change the delivery so each is closed, or return `blocked` naming why no change can' +
+            ' close it. Returning the same tree again stops the task for a human.'
+          : '',
       ].join(''), SCHEMA.delivery, f, file, {
         dossier: dossier.meta, round: round + 1, executorBudget, gateProbe: true,
       }, null)
       mutationFact = null
+      unchangedFact = null
       measureMutations = (ex.mutations || []).length > 0
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
@@ -9923,6 +9932,30 @@ function runTask(file, f, profileText, opts = {}) {
         const line = `${file}: ${n}`
         if (!notes.includes(line)) notes.push(line)
       })
+      // An unchanged tree cannot close what a reviewer left open on it, so judging it again buys
+      // nothing: the fast gate, every weak replay and the review passes would all be paid to
+      // establish that the digest is the one already rejected. Measured on one iOS install twice in a day
+      // (tasks 007 and 010): each such round ended `closed 0, new 0`, and 010 stopped for a human.
+      // The `nothing changed` guard below cannot see it from round 2 on, because the tree still
+      // holds round 1's work. The reviewer's baseline digest is persisted with its runtime, so
+      // this holds across a resumed invocation too.
+      const stillOpen = openItems(history)
+      const rejectedDigest = [...runtimeHistory].reverse()
+        .find((entry) => entry.role === 'reviewer')?.baseline_digest
+      if (stillOpen.length && rejectedDigest && deliveryDigest() === rejectedDigest) {
+        const ids = stillOpen.map((item) => item.id)
+        if (unchangedReturns >= 1) {
+          stop(file, spec, ex, history, round, how, noted,
+            `${file} — the executor returned the tree the reviewer rejected, unchanged, twice.` +
+              ` Nothing it can deliver unchanged closes ${ids.join(', ')}; no gate or reviewer ran on it.`,
+            taskAccounting(), runtimeHistory, weakVerification)
+        }
+        unchangedReturns += 1
+        unchangedFact = ids
+        say(`  executor returned the tree the reviewer rejected, unchanged — back to the executor;` +
+          ` no gate or reviewer paid`)
+        continue
+      }
       // Before the gate, because the gate is the next thing that can take minutes and the
       // delivery is already real: the files are written and this is the earliest moment at
       // which losing the process would lose something that cost money.
@@ -10079,6 +10112,11 @@ function runTask(file, f, profileText, opts = {}) {
     const deliveryBaseline = deliveryDigest()
     const measuredMutations = mutationFact?.delivery_digest === deliveryBaseline
       ? mutationFact.results : []
+    // The measurement is the reviewer's now, and only the reviewer's. Carried to the next
+    // executor it arrived after a rejecting verdict, as "m1 caught, m2 caught, m3 caught" beside
+    // "Close every open finding"; measured on one iOS install twice, the executor read the first as the
+    // answer to the second and returned the tree the reviewer had just rejected.
+    mutationFact = null
     const reviewPolicy = runProjectPolicy('review', { spec, files, criteria: coreCriteria })
     const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
       ...item,
@@ -10346,6 +10384,7 @@ function runTask(file, f, profileText, opts = {}) {
     const adj = adjudicate(history, rv.carried)
     round++
     mutationRetries = 0
+    unchangedReturns = 0
     recordWeakVerification(file, round, weakVerification)
     const added = ingest(history, rv, round, weakEvents, reviewerRuntime)
     const nowOpen = openItems(history)

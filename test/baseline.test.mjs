@@ -6110,6 +6110,100 @@ test('a surviving executor mutation goes back to the executor before any reviewe
   assert.equal(manifest.diagnostics.filter((row) => row.kind === 'mutation-measurement').length, 2)
 })
 
+// Measured on one iOS install, twice: the executor after a rejecting review was shown the pre-review
+// "m1 caught, m2 caught, m3 caught" beside "Close every open finding", read the first as the
+// answer to the second, and returned the tree the reviewer had just rejected.
+test('an executor after a rejecting review is not shown the measurement that review already judged',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' },
+      envelope: envelope(delivery('first', [], [executorMutations[0]])) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'the value is not kept on reload' }],
+      broken: [{ where: 'src/output.txt:1', fix: 'keep the value on reload',
+        evidence: 'reloaded and the value was gone' }],
+    })) },
+    { writeFiles: { 'src/output.txt': 'value=42\nreload=kept\n' },
+      envelope: envelope(delivery('kept on reload')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.match(result.stdout, /m-value \(src\/output.txt\) — caught/)
+  const second = calls(f)[1].input
+  assert.match(second, /Close every open finding in the dossier/)
+  assert.doesNotMatch(second, /m-value \(src\/output.txt\) — caught/)
+  assert.doesNotMatch(second, /on each mutation you returned last time/)
+})
+
+const loggingGate = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'gate\\n')"`
+const rejectingReview = { envelope: envelope(verdict({
+  criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'the value is not kept on reload' }],
+  broken: [{ where: 'src/output.txt:1', fix: 'keep the value on reload',
+    evidence: 'reloaded and the value was gone' }],
+})) }
+
+// Measured on one iOS install, on two tasks: an executor returned the tree the reviewer had just
+// rejected, and the engine paid the gate, the replays and the reviewers to learn `closed 0, new 0`.
+test('an executor that returns the rejected tree unchanged goes back without a gate or reviewer',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: loggingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('first')) },
+    rejectingReview,
+    { envelope: envelope(delivery('the tree already matches the dossier')) },
+    { writeFiles: { 'src/output.txt': 'value=42\nreload=kept\n' },
+      envelope: envelope(delivery('kept on reload')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.match(result.stdout, /executor returned the tree the reviewer rejected, unchanged — back to the executor/)
+  assert.doesNotMatch(calls(f)[1].input, /byte for byte/)
+  assert.match(calls(f)[2].input, /You returned the tree the reviewer rejected, byte for byte\. That tree cannot close r1\.1/)
+  // One gate per judged delivery; the unchanged return bought none.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
+})
+
+test('an executor that returns the rejected tree unchanged twice stops for a human',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: loggingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('first')) },
+    rejectingReview,
+    { envelope: envelope(delivery('no edits were needed')) },
+    { envelope: envelope(delivery('still no edits')) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`,
+    /the executor returned the tree the reviewer rejected, unchanged, twice\. Nothing it can deliver unchanged closes r1\.1/)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 1)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_task.md.json')), true)
+})
+
 test('an executor mutation that cannot be applied is unavailable and never stops the delivery',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true, gateFast: mutationGate })
