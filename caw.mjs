@@ -3677,6 +3677,21 @@ const noticeNotesLog = () => {
 // this tool has no standing to make on a project's behalf. The notice repeating until someone
 // deals with it is the correct pressure, and `rm` is the whole remedy.
 
+// What `autopilot` reads to answer a stop, written only when it asked for one. A stop's prose is
+// for a person; this is the same fact as data: which kind of stop, on which task, from which role.
+// The first record wins — a stop that dies on its way out is still the stop it was — and a run
+// that dies without writing one is `unknown`, which autopilot hands to the human.
+let stopRecordWritten = false
+function writeStopRecord(kind, fields = {}) {
+  const target = process.env.CAW_STOP_RECORD
+  if (!target || stopRecordWritten) return
+  stopRecordWritten = true
+  try {
+    writeFileSync(target, `${JSON.stringify({ version: 1, kind, command: process.argv[2] || null, ...fields })}\n`,
+      { mode: 0o600 })
+  } catch { /* the stop itself still has to be reported */ }
+}
+
 const die = (msg) => {
   console.error(`\ncaw: ${msg}\n`)
   if (notes.length) {
@@ -5514,6 +5529,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'call timed out')
     recordProviderFailure(role, provider, r, attempt, 'timeout')
+    writeStopRecord('role-timeout', { role, task: spec || null })
     die(`${role} did not finish within ${formatTimeout(AGENT_TIMEOUT_MS)} and was killed.\n` +
         `  Nothing came back, and whatever it spent is spent. If it was genuinely still working,\n` +
         `  the cap is what is wrong rather than the run: re-run it with a larger\n` +
@@ -5538,6 +5554,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
       budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted'
         : expired ? 'credentials-expired' : 'nonzero-exit')
     if (budgetExhausted) {
+      writeStopRecord('budget-exhausted', { role, task: spec || null })
       die(`${role} reached its configured live budget and was stopped. Its partial edits remain ` +
         `in the tree and the pre-call round state preserves recovery context.\n${r.stderr.trim()}`)
     }
@@ -5547,6 +5564,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
     // reviewer mid-build, and once to a plan-reviewer that took a finished enumerator and
     // architect down with it. Nothing about the tree or the request is wrong when this fires.
     if (expired) {
+      writeStopRecord('credentials-expired', { role, provider: binding.provider, task: spec || null })
       die(`${role} could not authenticate: the provider says its credentials are expired or ` +
         `rejected.\n  Nothing is wrong with the tree, the spec or the request — re-authenticate ` +
         `the ${binding.provider} CLI and run the same command again.\n` +
@@ -10003,6 +10021,7 @@ function runTask(file, f, profileText, opts = {}) {
       if (blocked(ex.blocked)) {
         const kept = keepBlocked(file)
         const stopRecord = recordExecutorStop(ex, kept)
+        writeStopRecord('executor-blocked', { task: file })
         die(`${file} — executor stopped:\n\n${JSON.stringify(ex.blocked)}\n\n` +
             (stopRecord ? `  The full response is retained at ${stopRecord}.\n` : '') +
             (kept.path
@@ -10051,9 +10070,9 @@ function runTask(file, f, profileText, opts = {}) {
       if (stillOpen.length && rejectedDigest && deliveryDigest() === rejectedDigest) {
         const ids = stillOpen.map((item) => item.id)
         if (unchangedReturns >= 1) {
-          stop(file, spec, ex, history, round, how, noted,
+          stop(file, spec, ex, history, round, how, noted, { kind: 'unchanged-twice', text:
             `${file} — the executor returned the tree the reviewer rejected, unchanged, twice.` +
-              ` Nothing it can deliver unchanged closes ${ids.join(', ')}; no gate or reviewer ran on it.`,
+              ` Nothing it can deliver unchanged closes ${ids.join(', ')}; no gate or reviewer ran on it.` },
             taskAccounting(), runtimeHistory, weakVerification)
         }
         unchangedReturns += 1
@@ -10081,17 +10100,17 @@ function runTask(file, f, profileText, opts = {}) {
       acceptanceCases,
     })
     if (deliveryDigest() !== gateDelivery) {
-      stop(file, spec, ex, history, round, how, noted,
+      stop(file, spec, ex, history, round, how, noted, { kind: 'gate-changed-tree', text:
         `${file} — the fast gate changed the tracked delivery tree; its receipt no longer ` +
-          'describes the current delivery.',
+          'describes the current delivery.' },
         taskAccounting(), runtimeHistory, weakVerification)
     }
     const gatePolicy = taskGatePolicy(file, f, g, retry, confirmationRuns, projectGateRetries)
     if (gatePolicy?.output.action === 'stop') {
       if (g.out) say(g.out)
-      stop(file, spec, ex, history, round, how, noted,
+      stop(file, spec, ex, history, round, how, noted, { kind: 'gate-policy', text:
         `${file} — project gate policy ${gatePolicy.policy.id} stopped the run: ` +
-          gatePolicy.output.reason.trim(),
+          gatePolicy.output.reason.trim() },
         taskAccounting(), runtimeHistory, weakVerification)
     }
     const gateUnavailable = !g.ok && ['refused', 'timeout'].includes(g.state) &&
@@ -10105,9 +10124,9 @@ function runTask(file, f, profileText, opts = {}) {
     } else if (!g.ok) {
       if (g.state === 'timeout') {
         say(g.out)
-        stop(file, spec, ex, history, round, how, noted,
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-timeout', text:
              `${file} — the fast gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed.` +
-             ` No gate verdict exists; re-run it or adjust gate_fast_timeout_ms in .caw/CAW.md.`,
+             ` No gate verdict exists; re-run it or adjust gate_fast_timeout_ms in .caw/CAW.md.` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
       // A refusal spends no retry, because no executor round changes why a gate refuses to
@@ -10117,14 +10136,14 @@ function runTask(file, f, profileText, opts = {}) {
       if (g.state === 'refused') {
         say(g.out)
         if (g.receipt?.manifest?.error) {
-          stop(file, spec, ex, history, round, how, noted,
+          stop(file, spec, ex, history, round, how, noted, { kind: 'gate-evidence-refused', text:
                `${file} — the fast gate command finished with state ${g.receipt.command_state}, ` +
-               `but CAW refused its evidence: ${g.receipt.manifest.error}`,
+               `but CAW refused its evidence: ${g.receipt.manifest.error}` },
                taskAccounting(), runtimeHistory, weakVerification)
         }
-        stop(file, spec, ex, history, round, how, noted,
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-refused', text:
              `${file} — the fast gate DID NOT RUN: it refused to start, so nothing was tested.` +
-             `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}`,
+             `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
       gateRedAttempts += 1
@@ -10154,16 +10173,16 @@ function runTask(file, f, profileText, opts = {}) {
       }
       if (action === GateFailureAction.stopReview) {
         say(g.out)
-        stop(file, spec, ex, history, round, how, noted,
+        stop(file, spec, ex, history, round, how, noted, { kind: 'review-baseline-red', text:
              `${file} — review baseline stayed red after one provider-free confirmation.` +
-             ` No executor ran; fix or classify the gate failure, then run review again.`,
+             ` No executor ran; fix or classify the gate failure, then run review again.` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
       if (action === GateFailureAction.stopRetries) {
         say(g.out)
-        stop(file, spec, ex, history, round, how, noted,
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-red-retries', text:
              `${file} — gate stayed red after ${MAX_GATE_RETRIES} executor retries.` +
-             ` Its output is above.`,
+             ` Its output is above.` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
       retry += 1
@@ -10528,9 +10547,9 @@ function runTask(file, f, profileText, opts = {}) {
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
     if (gateUnavailable) {
-      stop(file, spec, ex, history, round, how, noted,
+      stop(file, spec, ex, history, round, how, noted, { kind: 'advisory-review', text:
         `${file} — advisory review finished after the fast gate was ${g.state}. ` +
-        `The delivery is not certified or committed.`, taskAccounting(), runtimeHistory,
+        `The delivery is not certified or committed.` }, taskAccounting(), runtimeHistory,
         weakVerification, gateFact)
     }
 
@@ -10546,11 +10565,11 @@ function runTask(file, f, profileText, opts = {}) {
     if (stalled || round - startRound >= rounds) {
       // `stop` prints the open items itself, so this branch does not.
       stop(file, spec, ex, history, round, how, noted, stalled
-        ? `${file} — round ${round} closed none of the ${adj.given} item(s) it was handed.` +
-          ` Another reading is not what is missing.`
-        : rounds === 1
+        ? { kind: 'stalled', text: `${file} — round ${round} closed none of the ${adj.given}` +
+          ` item(s) it was handed. Another reading is not what is missing.` }
+        : { kind: 'round-cap', text: rounds === 1
           ? `${file} — the one round this command runs is done.`
-          : `${file} — ${rounds} rounds, the cap this tool stops to ask at.`,
+          : `${file} — ${rounds} rounds, the cap this tool stops to ask at.` },
         taskAccounting(), runtimeHistory, weakVerification)
     }
     say(`    open:\n  - ${renderItems(nowOpen)}`)
@@ -10608,13 +10627,16 @@ function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, r
   })
 }
 
+// `why` is the sentence, or `{ kind, text }` when the stop is one `autopilot` can tell apart.
 function stop(file, spec, ex, history, round, how, noted, why,
   taskAccounting = zeroAccounting(), runtimeHistory = [], weakVerification = null,
   gateFact = null) {
   saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory,
     weakVerification, gateFact)
   const open = openItems(history)
-  say(`\n· ${why}`)
+  const { kind = 'decision', text } = typeof why === 'string' ? { text: why } : why
+  writeStopRecord(kind, { task: file, round, open: open.map((item) => item.id) })
+  say(`\n· ${text}`)
   say(`  This task has cost ${formatAccounting(taskAccounting)} over ${round} round(s).`)
   if (open.length) {
     say(`\n  ${open.length} item(s) open after ${round} round(s):\n  - ${renderItems(open)}`)
@@ -10713,10 +10735,182 @@ function resumeTask(cmd, arg) {
     resume,
     startAt: cmd === 'review' ? 'gate' : 'executor',
     rounds: 1,
-    how: cmd === 'review' ? 'hand' : 'resumed',
+    // Under `autopilot` the further round was authorised by a policy, not a person, and the
+    // commit must not say otherwise.
+    how: cmd === 'review' ? 'hand' : process.env.CAW_AUTOPILOT === '1' ? 'autopilot' : 'resumed',
   })
   finishReviewedTask(f, risk, fullGateBaseline)
   say(`\n  spent ${formatAccounting(accounting)}`)
+}
+
+// ---------------------------------------------------------------- autopilot
+//
+// Every stop in this file is a question with its answer printed under it — `round` or `review` —
+// and the reason it is a command rather than a keystroke is that a run is saved to a log nobody
+// is watching. Measured on one iOS install, one night of 10.3 h: 3.9 h were a stopped queue waiting for a
+// person who was asleep, and for most of those stops the person's answer was never in doubt.
+//
+// `autopilot` answers those, and only those. It runs `build`, `round` and `review` as child
+// processes, reads the stop record each writes on its way out (CAW_STOP_RECORD), and picks the
+// command the stop itself offers — never one it does not. It lowers no gate and skips no
+// reviewer: every commit is still a reviewer's approval of a tree a green gate ran on. What it
+// may answer is bounded per task by the profile, and everything it does not recognise, a stall
+// included, is the human's, exactly as without it. Running `build` instead of `autopilot` is how
+// an install opts out; nothing else changes for it.
+//
+// Three kinds of stop, three answers. A stop about the infrastructure — a gate that timed out or
+// refused, a role killed at its timeout, an expired credential with a configured re-auth command —
+// is retried. A stop with progress — the round cap, a gate still red after the executor's retries,
+// a review whose baseline was red — gets one more executor round. A stall (a round that closed
+// nothing, or the same rejected tree twice) and every judgement stop go to the human: the stall
+// guard's own sentence is "another reading is not what is missing", and a policy is not a
+// different reader.
+const AUTOPILOT_STEPS_MAX = 100
+const AUTOPILOT_HOOK_TIMEOUT_MS = 5 * 60 * 1000
+const AUTOPILOT_ROUND_KINDS = new Set(['round-cap', 'gate-red-retries', 'review-baseline-red'])
+const AUTOPILOT_GATE_KINDS = new Set(['gate-timeout', 'gate-refused'])
+
+// The whole policy, pure so it can be read and tested apart from the processes it drives.
+// `counts` is per task and per run; the caller increments what the answer spends.
+function decideAutopilot(record, counts, limits, { treeDirty }) {
+  const kind = record?.kind || 'unknown'
+  const task = record?.task || null
+  const human = (reason) => ({ action: 'stop', reason })
+  if (!task) return human(`${kind} names no task`)
+  const spent = counts.tasks[task] || { rounds: 0, gates: 0, resumes: 0 }
+  // The role that died decides where the task resumes: an executor's round is re-run, a
+  // reviewer's judgement is re-asked of the tree already there.
+  const resumeRole = (role) => role === 'reviewer' ? { argv: ['review', task] }
+    : role === 'executor' ? { argv: treeDirty ? ['round', task] : ['build'] }
+      : null
+  if (AUTOPILOT_ROUND_KINDS.has(kind)) {
+    if (spent.rounds >= limits.rounds) {
+      return human(`${task} has had the ${limits.rounds} autopilot round(s) autopilot_rounds allows`)
+    }
+    return { action: 'run', argv: ['round', task], spend: 'rounds',
+      reason: `${kind}: one more executor round (${spent.rounds + 1}/${limits.rounds})` }
+  }
+  if (AUTOPILOT_GATE_KINDS.has(kind)) {
+    if (spent.gates >= limits.gates) {
+      return human(`${task}: the fast gate ${kind === 'gate-timeout' ? 'timed out' : 'refused'} again` +
+        ` after ${limits.gates} autopilot retr${limits.gates === 1 ? 'y' : 'ies'}`)
+    }
+    return { action: 'run', argv: ['review', task], spend: 'gates',
+      reason: `${kind}: the gate is re-run on the same tree (${spent.gates + 1}/${limits.gates})` }
+  }
+  if (kind === 'role-timeout' || kind === 'credentials-expired') {
+    const resume = resumeRole(record.role)
+    if (!resume) return human(`${kind} in ${record.role || 'an unknown role'}, which autopilot does not resume`)
+    if (spent.resumes >= limits.resumes) {
+      return human(`${task}: ${record.role} failed again after ${limits.resumes} autopilot resume(s)`)
+    }
+    if (kind === 'credentials-expired') {
+      if (!limits.reauth) return human('credentials expired and the profile sets no autopilot_reauth_cmd')
+      if (counts.reauths >= limits.reauthMax) {
+        return human(`credentials expired again after ${limits.reauthMax} re-authentication(s)`)
+      }
+      return { action: 'run', argv: resume.argv, spend: 'resumes', reauth: true,
+        reason: `${kind} in ${record.role}: re-authenticate, then resume` }
+    }
+    return { action: 'run', argv: resume.argv, spend: 'resumes',
+      reason: `${kind} in ${record.role}: resume the task (${spent.resumes + 1}/${limits.resumes})` }
+  }
+  return human(kind === 'unknown' ? 'the run stopped without a stop record' : `${kind} is a decision`)
+}
+
+function autopilotLimits(f) {
+  const count = (key, fallback) => {
+    const raw = f[key]
+    if (raw === undefined || raw === '') return fallback
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 0 || value > 10) {
+      die(`.caw/CAW.md ${key} must be a whole number from 0 to 10`)
+    }
+    return value
+  }
+  return {
+    rounds: count('autopilot_rounds', 3),
+    gates: count('autopilot_gate_retries', 1),
+    resumes: count('autopilot_role_resumes', 1),
+    reauthMax: count('autopilot_reauth_max', 2),
+    reauth: f.autopilot_reauth_cmd || null,
+    notify: f.autopilot_notify_cmd || null,
+  }
+}
+
+function runAutopilot(noFull) {
+  const { f } = profile()
+  const limits = autopilotLimits(f)
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '')
+  mkdirSync(LOG_DIR, { recursive: true })
+  const journal = join(LOG_DIR, `autopilot-${stamp}.jsonl`)
+  const scratch = mkdtempSync(join(tmpdir(), 'caw-autopilot-'))
+  const recordPath = join(scratch, 'stop.json')
+  const counts = { tasks: {}, reauths: 0 }
+  const note = (entry) => {
+    appendFileSync(journal, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+      { mode: 0o600 })
+  }
+  const hook = (label, command, env) => {
+    if (!command) return null
+    const r = spawnShellGroupSync(command, { encoding: 'utf8', timeoutMs: AUTOPILOT_HOOK_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024, env: { ...process.env, ...env } })
+    const status = r.error?.code === 'ETIMEDOUT' ? 'timeout' : r.status
+    note({ event: label, command, status })
+    return status
+  }
+  const finish = (outcome, fields, code) => {
+    note({ event: outcome, ...fields })
+    say(`\n· autopilot ${outcome}${fields.reason ? `: ${fields.reason}` : ''}`)
+    say(`  its decisions are in ${journal}`)
+    hook('notify', limits.notify, {
+      CAW_AUTOPILOT_OUTCOME: outcome, CAW_AUTOPILOT_KIND: fields.kind || '',
+      CAW_AUTOPILOT_TASK: fields.task || '', CAW_AUTOPILOT_JOURNAL: journal,
+    })
+    try { removeTree(scratch) } catch { /* temp sweep */ }
+    process.exit(code)
+  }
+  say(`· autopilot: rounds ${limits.rounds}, gate retries ${limits.gates}, role resumes` +
+    ` ${limits.resumes} per task; re-auth ${limits.reauth ? `up to ${limits.reauthMax}` : 'not configured'}`)
+  note({ event: 'start', limits: { ...limits, reauth: Boolean(limits.reauth), notify: Boolean(limits.notify) } })
+  let argv = ['build', ...(noFull ? ['--no-full'] : [])]
+  for (let step = 1; step <= AUTOPILOT_STEPS_MAX; step += 1) {
+    rmSync(recordPath, { force: true })
+    say(`\n· autopilot step ${step}: caw.mjs ${argv.join(' ')}`)
+    note({ event: 'run', step, argv })
+    const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+      stdio: 'inherit',
+      env: { ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1' },
+    })
+    if (child.status === 0) {
+      if (argv[0] === 'build') finish('finished', { reason: 'the queue is built' }, 0)
+      if (!specFiles().length) finish('finished', { reason: `${argv[1]} was the last task` }, 0)
+      note({ event: 'committed', task: argv[1] })
+      argv = ['build', ...(noFull ? ['--no-full'] : [])]
+      continue
+    }
+    let record = null
+    try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { /* unknown */ }
+    const decision = decideAutopilot(record, counts, limits, { treeDirty: changedFiles().length > 0 })
+    note({ event: 'stop', status: child.status, record, decision })
+    if (decision.action === 'stop') {
+      finish('stopped', { reason: decision.reason, kind: record?.kind || 'unknown',
+        task: record?.task || null }, child.status || 1)
+    }
+    if (decision.reauth) {
+      counts.reauths += 1
+      const status = hook('reauth', limits.reauth, {})
+      if (status !== 0) {
+        finish('stopped', { reason: `re-authentication command ended with ${status}`,
+          kind: record.kind, task: record.task }, child.status || 1)
+      }
+    }
+    const spent = counts.tasks[record.task] ||= { rounds: 0, gates: 0, resumes: 0 }
+    spent[decision.spend] += 1
+    say(`· autopilot: ${decision.reason}`)
+    argv = decision.argv[0] === 'build' ? ['build', ...(noFull ? ['--no-full'] : [])] : decision.argv
+  }
+  finish('stopped', { reason: `${AUTOPILOT_STEPS_MAX} steps without an end` }, 1)
 }
 
 // The spec is deleted once its task is committed, so `ls .caw-tasks/` is the queue. Its exact
@@ -10725,7 +10919,8 @@ function resumeTask(cmd, arg) {
 // change staging, evidence or the private record.
 // `how` records the shape of the round that earned the approval, and it exists because the
 // signature line is the thing this loop is for. `null` — the ordinary case, the whole task ran
-// inside one `build`. `'resumed'` — a human authorised further rounds after a stop. `'hand'` —
+// inside one `build`. `'resumed'` — a human authorised further rounds after a stop; `'autopilot'`
+// — the `autopilot` command did, under the profile's limits. `'hand'` —
 // no executor ran in the approving round, so the code came from a hand or from a round this
 // pipeline started and never judged.
 //
@@ -10749,12 +10944,13 @@ const COMMIT_BODY_FILES_MAX = 30
 
 function reviewLine(certification, round, how) {
   const limited = certification?.state === 'limited'
-  if (!limited && !['hand', 'human', 'resumed'].includes(how)) return null
+  if (!limited && !['hand', 'human', 'resumed', 'autopilot'].includes(how)) return null
   const detail = how === 'hand'
     ? ' — approved by `review`: no executor ran in the approving round, so the code above it was' +
       ' written by a hand or by an earlier round this pipeline did not get to judge'
     : how === 'human' ? ' — approved by a signed human attestation'
     : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
+    : how === 'autopilot' ? ' — rounds beyond the cap were authorised by `autopilot`, not by a person'
     : ''
   return `Review: ${limited ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${detail}.`
 }
@@ -12013,6 +12209,7 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
 
   caw.mjs plan "<description>"            architect + reviewers -> specs in ${QUEUE_DIR}/
   caw.mjs build [--no-full]               each spec: executor -> fast gate -> reviewer
+  caw.mjs autopilot [--no-full]           build, answering the stops whose answer is not in doubt
   caw.mjs ship "<description>"            both, without stopping to show you the plan
   caw.mjs review-specs "<description>"    judge hand-written specs in ${QUEUE_DIR}/
   caw.mjs round <NNN_slug.md>             one more review round on a stopped task
@@ -12027,7 +12224,7 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
 Every pipeline command refuses until all five roles resolve and carry current green probe
 evidence. Run \`caw.mjs probe <provider>\` on the machine that will execute it.`
 
-const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done', 'probe', 'smoke',
+const KNOWN = ['plan', 'build', 'autopilot', 'ship', 'review-specs', 'round', 'review', 'done', 'probe', 'smoke',
   'human-review',
   'verify-project', 'artifacts']
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { say(USAGE); return }
@@ -12071,6 +12268,7 @@ if (AGENT_TIMEOUT_MS !== AGENT_TIMEOUT_DEFAULT_MS) {
 
 if (cmd === 'plan') { if (!arg) die('plan needs a description'); activeRequest = arg; plan(arg) }
 else if (cmd === 'build') build(noFull)
+else if (cmd === 'autopilot') runAutopilot(noFull)
 else if (cmd === 'ship') {
   if (!arg) die('ship needs a description')
   activeRequest = arg
@@ -12149,6 +12347,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 export {
+  decideAutopilot,
   GateFailureAction, PlanningAction, SCHEMA, addAccounting, adapterImplementationDigest,
   buildTaskDossier,
   canonicalAuthorityPaths, compactRunMetrics,

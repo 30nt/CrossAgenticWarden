@@ -164,6 +164,7 @@ guard-хуки способны разом лишить сессию и `Bash`, 
 ```bash
 node caw.mjs plan "<request>"        # architect + reviewers → specs in .caw-tasks/
 node caw.mjs build [--no-full]       # each spec: executor → fast gate → reviewer, until approved
+node caw.mjs autopilot [--no-full]   # build, answering the stops whose answer is not in doubt
 node caw.mjs ship "<request>"        # both, without stopping to show you the plan
 node caw.mjs review-specs "<request>"  # judge (and fix) whatever is in .caw-tasks/
 node caw.mjs round <spec>            # one more review round on a task that stopped
@@ -185,6 +186,18 @@ node caw.mjs artifacts list          # retained run/recovery/probe/transport art
 точным runtime. Ротация, оставляющая двадцать новейших записей прогона, его не трогает.
 Остановка исполнителя по `blocked` удерживается так же, в `caw/executor-stops/`.
 `artifacts list` показывает обе.
+
+`autopilot` — это `build` для очереди, за которой никто не следит. Он запускает `build`, `round` и
+`review` дочерними процессами, читает вид каждой остановки и отвечает только на те, где ответ не
+вызывает сомнений: гейт, упавший по таймауту или отказавшийся стартовать, перезапускается через
+`review`; роль, убитая по таймауту, продолжается; потолок раундов или гейт, красный после
+ретраев, получают ещё один `round`; истёкший токен обновляется командой `autopilot_reauth_cmd`,
+если профиль её задаёт. Застой, исполнитель с `blocked` и все прочие остановки уходят человеку,
+как и без него. На задачу он разрешает `autopilot_rounds` (3), `autopilot_gate_retries` (1) и
+`autopilot_role_resumes` (1); он никогда не понижает гейт и не пропускает ревьюера, а коммит,
+который он разрешил, говорит об этом в строке `Review:`. Его решения пишутся в
+`.caw-logs/autopilot-*.jsonl`, а `autopilot_notify_cmd` запускается, когда он заканчивает или
+останавливается.
 
 `ls .caw-tasks/` — это вся очередь. Публичное сообщение task-коммита остаётся коротким, а его
 digest `CAW-Audit` указывает на полную приватную запись в Git-пути `caw/audit/`. Там после

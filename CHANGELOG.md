@@ -42,6 +42,13 @@ Target release: **0.2.0**.
   mutations, after the same unmutated gate. A survived one sends the delivery back to the
   executor before any reviewer is paid; a caught one is trusted evidence as
   `review-mutation:<id>`, and a finding whose replay survived cannot be closed on that delivery.
+- `autopilot [--no-full]`: `build` for an unwatched queue. Every task stop and every provider
+  failure writes a machine-readable stop record when `CAW_STOP_RECORD` is set; `autopilot` reads
+  it and answers only infrastructure stops (gate timeout or refusal, role timeout, expired
+  credentials with `autopilot_reauth_cmd`) and progress stops (round cap, gate red after retries,
+  red review baseline), within per-task limits from the profile. Stalls and judgement stops go
+  to the human. Decisions are journalled to `.caw-logs/autopilot-*.jsonl`; `autopilot_notify_cmd`
+  runs at the end. A commit whose extra rounds autopilot authorised says so on its `Review:` line.
 
 ### Changed
 

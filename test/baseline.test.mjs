@@ -7188,3 +7188,84 @@ test('adaptive executor profiles reject partial, mixed, and non-monotonic limits
     assert.equal(calls(f).length, 0)
   }
 })
+
+// ---------------------------------------------------------------- autopilot
+
+const autopilotJournal = (f) => {
+  const name = readdirSync(join(f.root, '.caw-logs')).find((entry) => entry.startsWith('autopilot-'))
+  return readFileSync(join(f.root, '.caw-logs', name), 'utf8').trim().split('\n').map(JSON.parse)
+}
+
+test('autopilot answers a refused gate by re-running it through review, and finishes the queue',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const refusesOnce = `node -e "const f=require('fs'),p=process.env.CAW_GATE_COUNT;` +
+    `const n=f.existsSync(p)?Number(f.readFileSync(p,'utf8')):0;f.writeFileSync(p,String(n+1));process.exit(n===0?75:0)"`
+  const f = fixture({ git: true, gateFast: refusesOnce })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['autopilot', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_COUNT: join(f.parent, 'gate-count') })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /the fast gate DID NOT RUN/)
+  assert.match(result.stdout, /autopilot: gate-refused: the gate is re-run on the same tree \(1\/1\)/)
+  assert.match(result.stdout, /autopilot finished: 001_task\.md was the last task/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_task.md')), false)
+  const journal = autopilotJournal(f)
+  const stop = journal.find((entry) => entry.event === 'stop')
+  assert.equal(stop.record.kind, 'gate-refused')
+  assert.equal(stop.record.task, '001_task.md')
+  assert.deepEqual(stop.decision.argv, ['review', '001_task.md'])
+  assert.deepEqual(journal.filter((entry) => entry.event === 'run').map((entry) => entry.argv),
+    [['build', '--no-full'], ['review', '001_task.md']])
+  assert.equal(journal.at(-1).event, 'finished')
+})
+
+test('autopilot hands a judgement stop to the human and says so through the notify hook',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const notified = join(f.parent, 'notified.txt')
+  configureProfileFields(f, {
+    autopilot_notify_cmd: `node -e "require('fs').writeFileSync(process.env.CAW_TEST_NOTIFY,` +
+      `[process.env.CAW_AUTOPILOT_OUTCOME,process.env.CAW_AUTOPILOT_KIND,process.env.CAW_AUTOPILOT_TASK].join(' '))"`,
+  })
+  execFileSync('git', ['commit', '-qam', 'notify hook'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['autopilot', '--no-full'], [
+    { envelope: envelope({ ...delivery('cannot'), blocked: 'the spec contradicts the canonical document' }) },
+  ], { CAW_TEST_NOTIFY: notified })
+
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /autopilot stopped: executor-blocked is a decision/)
+  assert.equal(readFileSync(notified, 'utf8'), 'stopped executor-blocked 001_task.md')
+  assert.deepEqual(autopilotJournal(f).filter((entry) => entry.event === 'run').length, 1)
+})
+
+test('a stop writes its kind for autopilot, and a round autopilot authorised says so in the commit',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'first\n')
+  const record = join(f.parent, 'stop.json')
+  const first = run(f, ['review', '001_task.md'], [rejectingReview], { CAW_STOP_RECORD: record })
+  assert.equal(first.status, 1)
+  assert.deepEqual(JSON.parse(readFileSync(record, 'utf8')), {
+    version: 1, kind: 'round-cap', command: 'review', task: '001_task.md', round: 1, open: ['r1.1'],
+  })
+
+  const second = run(f, ['round', '001_task.md'], [
+    { writeFiles: { 'delivery.txt': 'kept on reload\n' }, envelope: envelope(delivery('kept')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_AUTOPILOT: '1' })
+  assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /^Review: .*, round 2 — rounds beyond the cap were authorised by `autopilot`, not by a person\.$/m)
+})

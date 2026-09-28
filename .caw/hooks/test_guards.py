@@ -651,6 +651,10 @@ def test_bash_guard_does_not_see_a_path_hidden_in_a_variable(tmp_path: Path) -> 
         ('node caw.mjs plan "x" > .caw-logs/p.log 2>&1', "allow"),
         ("caffeinate -dims node caw.mjs build > .caw-logs/b.log 2>&1", "allow"),
         ("node caw.mjs build | tee .caw-logs/b.log", "allow"),
+        # `autopilot` runs `build`, `round` and `review` as its children, so its log is
+        # the only place all of their output and its own decisions land together.
+        ("node caw.mjs autopilot", "deny"),
+        ("caffeinate -dims node caw.mjs autopilot > .caw-logs/a.log 2>&1", "allow"),
         ('grep -n "node caw.mjs plan" CLAUDE.md', "allow"),
         ("node caw.mjs --help", "allow"),
         # `done` spawns no agent and costs nothing, so it is not a run.
