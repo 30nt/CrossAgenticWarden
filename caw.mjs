@@ -6070,6 +6070,59 @@ function retainGateEvidence({ command, task, kind, deliveryDigest: digest, state
   return receipt
 }
 
+// A gate is a process tree, and `spawnSync`'s timeout kills one process of it. Measured on
+// one iOS install: a timed-out gate lost its `bash -lc`, while the xcodebuild under it — stuck behind
+// a `| tee` after its simulator died — ran on for forty more minutes. The next weak-mutation gate
+// shared that simulator and derived data, went red in 36 seconds against the survivor, and was
+// scored `mutation-caught`: an orphan refuted a reviewer's finding.
+//
+// So the command runs in a process group of its own, and the whole group is stopped — SIGTERM,
+// then SIGKILL after a grace — on timeout, on a signal, and after the command exits, since
+// anything still in the group then is an orphan of a finished gate racing the next one.
+//
+// The group cannot simply be the engine's direct child, which is how the gate probe does it.
+// A detached child leaves the terminal's foreground group, so Ctrl-C would stop reaching the
+// gate; and the engine's own SIGINT handler cannot run while it is blocked in `spawnSync`, so
+// it could not pass the signal on. Nothing would stop the gate before its timeout. This runner
+// stays in the foreground group, receives what the engine cannot, and owns the group it starts.
+// It also stops the group if the engine dies outright, which no handler of the engine's can.
+const GATE_GROUP_STOP_GRACE_MS = 3000
+const GATE_GROUP_RUNNER = `
+const { spawn } = require('node:child_process')
+const { constants } = require('node:os')
+const [command, graceArg] = process.argv.slice(1)
+const grace = Number(graceArg)
+const group = process.platform !== 'win32'
+const parent = process.ppid
+const child = spawn('bash', ['-lc', command], { stdio: 'inherit', detached: group })
+const pause = new Int32Array(new SharedArrayBuffer(4))
+const live = () => { try { process.kill(-child.pid, 0); return true } catch { return false } }
+const stop = () => {
+  if (!child.pid) return
+  if (!group) { try { child.kill('SIGKILL') } catch {} return }
+  try { process.kill(-child.pid, 'SIGTERM') } catch { return }
+  const until = Date.now() + grace
+  while (live() && Date.now() < until) Atomics.wait(pause, 0, 0, 50)
+  try { process.kill(-child.pid, 'SIGKILL') } catch {}
+}
+let done = false
+const finish = (code) => { if (done) return; done = true; stop(); process.exit(code) }
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => finish(128 + constants.signals[signal]))
+child.on('error', (error) => { process.stderr.write('caw: gate could not start: ' + error.message + '\\n'); finish(127) })
+child.on('exit', (code, signal) => finish(code ?? 128 + (constants.signals[signal] || 0)))
+setInterval(() => { if (process.ppid !== parent) finish(129) }, 1000).unref()
+`
+
+// `spawnSync('bash', ['-lc', command], options)`, except that the timeout — and everything else
+// that ends the call — stops every process the command started. See GATE_GROUP_RUNNER.
+function spawnShellGroupSync(command, { timeoutMs = null, ...options } = {}) {
+  return spawnSync(process.execPath,
+    ['-e', GATE_GROUP_RUNNER, '--', command, String(GATE_GROUP_STOP_GRACE_MS)], {
+      ...options,
+      ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGTERM' } : {}),
+    })
+}
+
 // `spec`, when given, names the one spec whose task is being gated, and is exported to the
 // gate as CAW_SPEC. This script writes every spec of a plan into .caw-tasks/ before the build
 // starts and removes each only at its own task's commit, so a gate that reads .caw-tasks/ — one
@@ -6157,9 +6210,8 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
   env.CAW_GATE_CONTRACT = contractPath
   const startedAt = Date.now()
   try {
-    const r = spawnSync('bash', ['-lc', cmd], {
-      cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env,
-      ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
+    const r = spawnShellGroupSync(cmd, {
+      cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env, timeoutMs,
     })
     const commandState = r.error?.code === 'ETIMEDOUT' ? 'timeout'
       : r.status === 0 ? 'green'
@@ -8723,13 +8775,12 @@ function runWeakControlCommand(command, f, spec, surface) {
   const env = { ...process.env, PWD: surface.workingRoot }
   if (spec) env.CAW_SPEC = spec
   const startedAt = Date.now()
-  const result = spawnSync('bash', ['-lc', command], {
+  const result = spawnShellGroupSync(command, {
     cwd: surface.workingRoot,
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
     env,
-    timeout: timeoutMs,
-    killSignal: 'SIGKILL',
+    timeoutMs,
   })
   const stdout = (result.stdout || '').slice(-8000)
   const stderr = (result.stderr || '').slice(-8000)

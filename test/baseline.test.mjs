@@ -5472,8 +5472,8 @@ test('mutation gate refusal is non-blocking unavailable evidence',
 
 test('weak baseline timeout is non-blocking and limits certification',
   { skip: claudeOuterProfileSkip() }, () => {
-  const gateFast = `test -f .env || exec node -e "setTimeout(()=>{},2000)"`
-  const f = fixture({ git: true, gateFast, gateFastTimeout: '50' })
+  const gateFast = `test -f .env || exec node -e "setTimeout(()=>{},5000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '1000' })
   mkdirSync(join(f.root, '.caw-tasks'))
   writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
   writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
@@ -5496,13 +5496,13 @@ test('weak baseline timeout is non-blocking and limits certification',
     f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
   assert.equal(certification.state, 'limited')
   assert.equal(certification.weak_verification.state, 'unverified-baseline-timeout')
-  assert.equal(certification.weak_verification.baseline.gate_timeout_ms, 50)
+  assert.equal(certification.weak_verification.baseline.gate_timeout_ms, 1000)
 })
 
 test('weak mutation timeout is non-blocking and limits certification',
   { skip: claudeOuterProfileSkip() }, () => {
-  const gateFast = `grep -q '^# fixture$' README.md || exec node -e "setTimeout(()=>{},2000)"`
-  const f = fixture({ git: true, gateFast, gateFastTimeout: '50' })
+  const gateFast = `grep -q '^# fixture$' README.md || exec node -e "setTimeout(()=>{},5000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '1000' })
   mkdirSync(join(f.root, '.caw-tasks'))
   writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
   writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
@@ -5524,7 +5524,7 @@ test('weak mutation timeout is non-blocking and limits certification',
   assert.equal(certification.state, 'limited')
   assert.equal(certification.weak_verification.state, 'unverified-mutation-timeout')
   assert.equal(certification.weak_verification.mutations[0].state, 'unverified-timeout')
-  assert.equal(certification.weak_verification.mutations[0].gate_timeout_ms, 50)
+  assert.equal(certification.weak_verification.mutations[0].gate_timeout_ms, 1000)
 })
 
 test('reviewer timeout retains a bounded interrupted surface',
@@ -6846,6 +6846,35 @@ test('a full gate timeout has no red verdict and offers no bisect', () => {
   assert.equal(result.status, 1)
   assert.match(text, /full gate TIMED OUT after 30 ms and was killed/)
   assert.doesNotMatch(text, /full gate is RED|git bisect/)
+})
+
+// Measured on one iOS install: a timed-out gate lost only its `bash`, while the xcodebuild under it ran
+// on for forty more minutes, and the next gate on the same simulator went red against that
+// survivor. A red it causes is scored as a caught mutation, so the orphan refutes findings.
+test('a gate timeout kills every process the gate started, not only its shell', () => {
+  const f = fixture({
+    git: true,
+    gateFast: 'node -e "require(\'fs\').writeFileSync(process.env.CAW_TEST_ORPHAN_PID, String(process.pid)); setTimeout(()=>{},20000)" | cat',
+    gateFastTimeout: '1500',
+  })
+  const pidFile = join(f.root, '..', `orphan-${process.pid}.pid`)
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const spec = '001_orphan.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Orphan\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [], { CAW_TEST_ORPHAN_PID: pidFile })
+  const pid = Number(readFileSync(pidFile, 'utf8'))
+  const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+  try {
+    assert.match(result.stdout + result.stderr, /fast gate TIMED OUT after 1500 ms and was killed/)
+    // A killed orphan is reaped by init, not by the engine, so it may linger for a moment.
+    const until = Date.now() + 1000
+    while (alive() && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+    assert.equal(alive(), false, `gate grandchild ${pid} outlived the gate's timeout`)
+  } finally {
+    if (alive()) process.kill(pid, 'SIGKILL')
+  }
 })
 
 test('invalid project gate timeouts fail before provider calls', () => {
