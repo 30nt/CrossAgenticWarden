@@ -6,6 +6,7 @@
 // young survives, old is removed as before. For review surfaces the young case passed before the
 // grace too — that sweep keeps its newest three — so there it guards; the transport and scratch
 // cases are the ones that measure the fix.
+import './isolated-tmp.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, rmSync, utimesSync } from 'node:fs'

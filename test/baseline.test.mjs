@@ -1,3 +1,4 @@
+import './isolated-tmp.mjs'
 import test, { afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
