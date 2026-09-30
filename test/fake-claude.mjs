@@ -247,6 +247,9 @@ if (next.recordReviewProbe) {
   })}`)
 }
 
+// Written before the delay, in the role's own working directory (a reviewer's is its isolated
+// surface), so a test can tell a provider that is running from one that has only been recorded.
+if (next.startedMark) writeFileSync(resolve(process.cwd(), next.startedMark), `${process.pid}\n`)
 if (next.delayMs) await new Promise((done) => setTimeout(done, next.delayMs))
 if (next.stderr) process.stderr.write(next.stderr)
 if (next.probeTools) {
