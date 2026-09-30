@@ -11,9 +11,13 @@ and commits it has hazards; the choice is whether its users find them here or in
 Measurements name their instrument as a class — "one install, Python", "one install, iOS/Swift".
 They are single-install observations, not benchmarks.
 
-## Hazards you can hit on a real run
+## Historical incidents closed in the current engine
 
-### An interrupted reviewer can leave a mutation in your working tree
+### An interrupted reviewer could leave a mutation in the working tree
+
+Current status: fixed. The engine now creates and owns an isolated review surface, checks the
+delivery digest after every pass, and retains a bounded failed surface when cleanup cannot finish.
+The incident below is kept as the reason for that boundary.
 
 The reviewer copies the working tree somewhere, mutates it to see whether a test can still fail,
 and deletes it. **No role file tells it to.** The copy is made by an agent's shell command, so
@@ -32,9 +36,19 @@ A second install splits the finding: the surface is built there too, unasked, bu
 enumerated subtrees, so its two credential files never left. **The behaviour is 2 of 2; the
 exposure is 1 of 2**, and nothing measured yet predicts which shape you get.
 
-*What you can do:* write the `## Standing authorizations` entry in `.caw/CAW.md`, and name the
-paths the copy must never **receive** — not paths deleted afterwards, which is a narrower window
-and not a closed one.
+### One invalid coverage row discarded a complete paid planning run
+
+Current status: fixed. Architect and plan-reviewer canonical failures now receive one bounded
+repair call with the exact validation path, the original role request, and the complete rejected
+value. A second invalid answer still stops.
+
+Measured on one vendored 0.1.0 install: `ship` enumerated 104 cases, completed one architect pass
+and two plan-review rounds, then stopped because one coverage case appeared twice. No specs were
+written and the role received no diagnostic. The discarded run cost $10.66. The repair path does
+not enumerate again, and 0.2.0's exact population cache also preserves that work across a later
+restart.
+
+## Current hazards
 
 ### A mutation can be inert without anything noticing
 
@@ -44,10 +58,16 @@ symlink survives pointing at the original; and an inert edit can land on a branc
 walks. All four return the same green, and a reviewer reads that green as a weak test — so the
 finding lands as a revision written against a healthy test, which is the expensive direction.
 
-The check that covers all four is a positive control: break the same site outright and require
-*that* to go red first. Nothing the reviewer reads says so today.
+The check that covers all four is a positive control. CAW now supports it through the paired
+`weak_source_probe_cmd` and `weak_positive_control_cmd`; projects that leave both empty retain this
+hazard and receive no controlled weak-verification claim.
+
+## Historical incidents closed in the current engine (continued)
 
 ### A git-based gate reports PASS where it enumerated nothing
+
+Current status: fixed in engine-owned review surfaces, which are Git clones with a delivery overlay.
+The incident remains relevant to project-created copies and explains the clone invariant.
 
 The manual prescribes enumerating with `git ls-files --cached --others --exclude-standard`. Build
 the review surface with `tar` instead of `git clone` and there is no `.git` there, so the
@@ -58,18 +78,18 @@ Measured in both directions on one install: built as a clone and then mutated, t
 and names the test. **Built without a `.git`, it exits 0 and PASSES on every mutation.**
 Confirmed on a second install in a second language.
 
-*What you can do:* if your gate enumerates through git, build the surface with `git clone
---no-hardlinks`, not with `tar`. This is not a preference.
+## Current hazards (continued)
 
 ### The gate runs before anything is staged
 
 A gate that inspects the index rather than the working tree sees the previous state. The script
 sets this trap for every install that writes one.
 
-### `approved: true` is one draw, and `build` treats it as a gate
+### `approved: true` is a bounded sample, and `build` treats it as a gate
 
 Measured on one install with ten byte-identical specs across two runs, clean tree: the same
-question got different answers at different times. An approval is a sample, not a proof.
+question got different answers at different times. Task review now uses a primary plus one blind
+challenger pass by default, but two bounded samples are still not proof.
 
 ### An executor can commit its own work, and only prose stops it
 
@@ -90,6 +110,50 @@ express it. It is not built because it needs measuring first: the gate runs insi
 boundary, and a gate that takes an index lock or stashes would break. The falsifier is "denying
 `.git` writes to the executor breaks no gate the manual's own rules permit".
 
+### An executor undoing its own probe with git destroys the task it is delivering
+
+Measured across two queues on one install — a ten-task queue and a six-task one — by reading
+every `git checkout --` in `.caw-tasks/notes.log`: **four incidents, three in the first queue and
+one in the second.** All four are one shape. The executor breaks the code its new test covers, to
+see the test go red, then undoes the probe with `git checkout -- <file>`. On a build tree that
+command does not undo the probe: it restores the file to `HEAD` and discards the task's entire
+uncommitted delivery for that file. One lost 114 lines; another dropped 83 of 107 tests in the
+file back to red.
+
+The executor is the one role that always works on a dirty tree, so this is not a mistake a
+careful executor avoids — the tool's safe reading is false in exactly the place that role stands.
+Reviewers run the same probes and lose nothing: their surface is a clone at a committed baseline,
+where the command means what it says. **The asymmetry is the finding.**
+
+`.caw/agents/executor.md` now names `git checkout --`, `git restore`, `git stash` and `git reset`
+as things that role never undoes anything with, tells it to use the inverse `Edit` or a copy
+aside instead, and to check `git status --short -- <path>` at the point of the command rather
+than from something read earlier in the conversation. That is prose, and prose is a preference —
+the same limit as the hazard above, with the same shape of fix available and unbuilt.
+
+**All four were self-reported**, counted from notes the roles chose to write, so the rate is
+unknown and the floor is four. Every one reports a successful reconstruction from an earlier read
+in the same session, each verified by the role against a `git diff --stat` it had seen before —
+that is a role checking its own memory, not an independent record. No fourth party saw the
+original bytes. The fifth will be the one that is not recovered.
+
+### The gate probe runs the executor's code outside its boundary, during its turn
+
+The executor's write boundary cannot hold a gate whose toolchain starts its own sandbox: SwiftPM
+compiles package manifests under seatbelt, and macOS refuses a sandbox inside the executor's
+(`sandbox_apply: Operation not permitted`) whatever paths are writable. Measured on one iOS
+install, 51 tasks: no executor ever reached a gate verdict, and its red-making mutations stayed
+"unmeasured" until a reviewer round found the survivor.
+
+The gate probe answers that by running the profile's fast gate for the executor, on a disposable
+copy of its tree, outside the boundary. The command is the profile's and cannot be chosen, but
+the code it runs is the executor's, including any edit it made to the gate script. That is not a
+new kind of reach — the deciding gate runs the same code outside the boundary the moment the
+executor returns — but it is a new timing: the executor can iterate on what that run does. The
+probe is capped at six runs per call and each is recorded as a `gate-probe` diagnostic; nothing
+else limits it. Because it runs on a copy, it also removes the reason an executor had to mutate
+and then restore its own tree.
+
 ## Limits that are not hazards
 
 - **The request is the only input nothing checks.** The engine refuses a case the enumerator
@@ -105,19 +169,17 @@ boundary, and a gate that takes an index lock or stashes would break. The falsif
   `.caw/hooks/` answer this for an agent session — not for a hand or a script. Half is now
   instrumented: `review-specs` records a digest per spec at the moment it flips the flag, and
   `build` compares the queue against it. It **reports and does not refuse**, on purpose.
-- **The reviewer can write, and so can the architect.** Both get `Bash` for a real reason, and a
-  shell can write files. The guarantee is that no edit *path* is offered, not that writing is
-  impossible. Two roles rather than one doubles that surface without changing the argument.
-- **The gate has no timeout.** A hung agent call no longer blocks a run; a gate that never
-  returns does. It is open deliberately: how long a suite runs is a property of the project —
-  one install measures 3:20, another's is seconds — so the tool has no basis to pick a bound,
-  and a wrong guess turns a passing suite into a failed run.
-- **The manual approval path is narrowed, not closed.** `build` can tell a hand-flipped `PLAN.md`
+- **Shell-enabled roles retain read and network residuals.** Supported adapters enforce their
+  write scope with an OS boundary; a host without that boundary refuses before a role call.
+- **Gate timeouts are project-owned.** Empty timeout fields mean no deadline. A configured timeout
+  kills the gate and records `timeout`, which is neither red nor refused.
+- **Unsigned manual approval remains possible by editing project files.** `build` can tell a hand-flipped `PLAN.md`
   from a judged one, because `review-specs` removes the `## Unclosed` section when it flips the
   flag. Anyone who also deletes that section by hand gets silence. The override went from editing
   one word to a deliberate second act — which is the whole change. Worth recording why it needed
   narrowing: on one install the person who wrote the refusal text reached for the override
-  reflexively, within an hour.
+  reflexively, within an hour. Projects that require human independence should use the signed
+  `human-review` flow; it binds the decision to exact plan bytes or a delivery digest.
 - **Byte-identity is the graduation rule and is not observable across platforms.** An install is
   a vendored copy whose version is the tag its bytes match. Line endings and file modes both
   break that check invisibly — one install carried `755` on two files tracked as `644` and every
@@ -127,7 +189,7 @@ boundary, and a gate that takes an index lock or stashes would break. The falsif
   has no gate to keep green. A human makes the first commit — skeleton, manifest, one passing
   test, `gate_fast` — by hand.
 
-### Presence is not capability, and a Linux container shows it
+### Historical: presence was mistaken for capability on Linux
 
 `bwrap` on `PATH` does not mean `bwrap` can run. A default Docker container ships it and denies
 the unprivileged user namespace it needs; Ubuntu 24.04 restricts the same namespace through
@@ -161,7 +223,7 @@ artifacts themselves are not published.
 | Codex executor / Claude reviewer | task 002 round 3, commit `cfaff0a`; carried Codex finding adjudicated by Claude with origin retained | engine contract suite also covers provider-change carry |
 | all-Claude | task 003, commit `1ef3768` | engine contract suite also covers it |
 | Claude executor / Codex reviewer | task 004, commit `86b2d10` | engine contract suite also covers it |
-| all-Codex | none | not run; the earlier release could not bind its enumerator, while this version requires new green `codex-enumerator-boundary-v1` evidence and still has no live all-Codex matrix evidence |
+| all-Codex | reported by one install: a separate two-task sample completed and committed at `0f33479` and `56c6930` | **not verified here** — the disposable run artifacts were intentionally removed after comparison; the engine contract suite covers the binding and exact smoke/probe checks |
 | red-gate retry and gate exit 75 | none; three attempts stopped earlier as truthful executor `blocked` results | deterministic only; neither branch has fired live |
 | Claude reviewer weak capture | reported by one Linux install, 2026-09-03: three weaks on one task, capture commits at `caw-weak-N`, closed by replay | **not verified here** — the run record is a gitignored log on that machine; what reached this repository is the same claim in a commit. The earlier statement that no round had ever produced one was a claim about this repository's evidence, and is withdrawn as a blanket one |
 | native macOS Xcode/Swift review gate | direct experiment failed four of five checks inside the current profile; controls passed outside it | the review-boundary limitation above; Node-gate acceptance does not generalize to toolchains needing external writable temp/cache state |
@@ -169,10 +231,11 @@ artifacts themselves are not published.
 | Linux, `build` | reported in progress by the same install: executor under bwrap, `createReviewSurface()` built by the engine, `gate_fast` green and red inside it | **not verified here**. Not reported even there: a task commit, five remaining tasks, a completed `build` |
 | Windows | none | portable contract tests do not substitute for an OS boundary run |
 
-Across the four supported live bindings, four tasks were planned, spec-reviewed, built,
-task-reviewed and committed through one engine. The queue emptied, `.caw-tasks/PLAN.md` cleared and the
-resulting tree passed 24 tests. This is evidence about the exact measured machine, CLI versions and
-adapters; your install still needs its own current probes and smoke task.
+Across the four bindings in the published acceptance summary, four tasks were planned,
+spec-reviewed, built, task-reviewed and committed through one engine. The separate all-Codex
+sample adds two reported task deliveries whose raw run artifacts are not published. This is
+evidence about exact measured machines, CLI versions and adapters; your install still needs its
+own current probes and smoke task.
 
 A plan revision costs a fraction of the pass it revises. Reported by one Linux install, and not verified in this repository: the
 architect's first pass cost $3.98 and its two revisions $1.09 and $1.15, across a `plan` that
@@ -184,14 +247,14 @@ one install, and the first number attached to a claim this tool had been making 
 
 Recorded so they are not re-proposed as omissions.
 
-- **No metrics ledger.** Cost is printed and discarded. A run reports what it did; where that
-  report is kept is not the tool's business. One install lost a $3.87 plan to a truncated
-  terminal and re-planned the same ground three times — the answer was to redirect output to a
-  file, and on that install a guard now refuses a run whose command line does not name the log
-  directory.
+- **No payload or conversation metrics ledger.** Before private run records are pruned, CAW
+  appends compact counters, usage states, durations and certification outcomes to Git's private
+  `caw/metrics/runs.jsonl`. Prompts, responses and diagnostics remain only in bounded run records;
+  operator logs are still the durable place for a full transcript.
 - **No queue file the tool can write to, no history tiers, no archive command.** `ls .caw-tasks/`
   is the whole queue and existence is its whole state. What `round` and `review` resume is not
   progress — it is what a reviewer already checked, which is the one thing in this pipeline with
   nowhere else to live.
-- **No scoping tier between "fast" and "full".** A per-task scope-selection map with three
-  branches resolved to the full suite on 2 tasks out of 2.
+- **No per-path scope-selection map.** CAW exposes `gate_fast`, `gate_batch`, and `gate_full`.
+  The project chooses their commands explicitly; CAW does not infer a different gate from the
+  files touched by an individual task.

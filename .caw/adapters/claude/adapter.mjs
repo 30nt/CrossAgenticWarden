@@ -1,7 +1,10 @@
 import { chmodSync, existsSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { arch, platform } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const runnerPath = join(dirname(fileURLToPath(import.meta.url)), 'runner.mjs')
 
 const TOOLS = {
   architect: 'Read,Grep,Glob,Bash',
@@ -160,6 +163,20 @@ function observations(env) {
   }
 }
 
+function streamEvents(stdout) {
+  try { return stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) }
+  catch { return null }
+}
+
+function streamTelemetry(stdout, events) {
+  const toolEventCount = events.reduce((count, event) => {
+    const content = event?.message?.content
+    return count + (Array.isArray(content)
+      ? content.filter((item) => item?.type === 'tool_use').length : 0)
+  }, 0)
+  return { eventCount: events.length, toolEventCount, eventBytes: Buffer.byteLength(stdout || '') }
+}
+
 function guarantees(role, cliVersion) {
   const planning = role === 'architect' || role === 'plan-reviewer'
   const probe = role === 'executor'
@@ -209,11 +226,13 @@ function guarantees(role, cliVersion) {
 }
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'claude',
+  vendor: 'anthropic',
   features: {
     schemaTransport: 'inline', resultTransport: 'stdout',
     reportsCost: true, reportsCacheCounters: true, reportsModels: true,
+    modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
   },
   resolveExecutable(env) { return env.CAW_CLAUDE || 'claude' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },
@@ -308,14 +327,24 @@ export default {
       '--permission-mode', 'bypassPermissions', '--model', binding.model,
       '--effort', binding.reasoning,
     ]
-    let target = executable
-    let targetArgs = [...executableArgs, ...args]
+    const boundedExecutor = role === 'executor' &&
+      (execution.env.CAW_EXECUTOR_MAX_TOOL_EVENTS || execution.env.CAW_EXECUTOR_MAX_EVENT_BYTES)
+    if (boundedExecutor) {
+      args[args.indexOf('--output-format') + 1] = 'stream-json'
+      args.push('--verbose')
+    }
+    let target = boundedExecutor ? process.execPath : executable
+    let targetArgs = boundedExecutor
+      ? [runnerPath, executable, ...executableArgs, ...args]
+      : [...executableArgs, ...args]
     if (['os-boundary', 'isolated-surface'].includes(execution.writeBoundaryBy)) {
       if (!execution.scratchRoot) throw new Error('bounded Claude invocation requires an engine scratch root')
       const profile = outerProfile()
       if (!profile) throw new Error('bounded Claude invocation has no outer profile on this host')
+      const wrappedTarget = target
+      const wrappedArgs = targetArgs
       target = profile.executable
-      targetArgs = profile.wrap(execution, executable, [...executableArgs, ...args])
+      targetArgs = profile.wrap(execution, wrappedTarget, wrappedArgs)
     }
     const {
       CLAUDECODE: _claudeCode,
@@ -343,6 +372,7 @@ export default {
   },
   decodeSuccess(stdout, { binding, requestedNative }) {
     let env
+    let eventTelemetry = null
     if (requestedNative?.probeKind === 'tool-contract') {
       let events
       try {
@@ -360,6 +390,11 @@ export default {
         for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child)
       }
       events.forEach(visit)
+      eventTelemetry = {
+        eventCount: events.length,
+        toolEventCount: toolUseNames.length,
+        eventBytes: Buffer.byteLength(stdout || ''),
+      }
       env = {
         ...env,
         structured_output: {
@@ -371,7 +406,14 @@ export default {
         },
       }
     } else {
-      try { env = JSON.parse(stdout) } catch { throw new Error(`returned no JSON:\n${stdout.slice(0, 2000)}`) }
+      const events = streamEvents(stdout)
+      if (events?.length > 1) {
+        env = events.findLast((event) => event?.type === 'result')
+        if (!env) throw new Error(`returned no final result event:\n${stdout.slice(-2000)}`)
+        eventTelemetry = streamTelemetry(stdout, events)
+      } else {
+        try { env = JSON.parse(stdout) } catch { throw new Error(`returned no JSON:\n${stdout.slice(0, 2000)}`) }
+      }
     }
     if (env?.is_error) throw new Error(`errored: ${env.result ?? env.subtype ?? 'unknown'}`)
     let value = env?.structured_output ?? env?.result ?? env
@@ -383,6 +425,7 @@ export default {
         provider: 'claude',
         requested: { model: binding.model, reasoning: binding.reasoning, native: requestedNative },
         ...seen,
+        telemetry: eventTelemetry || { eventCount: null, toolEventCount: null, eventBytes: null },
         cost: typeof env.total_cost_usd === 'number'
           ? { amount: env.total_cost_usd, currency: 'USD' }
           : null,

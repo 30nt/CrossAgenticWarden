@@ -44,6 +44,13 @@ Split the request into tasks that are each:
   only way to state a dependency — there is no `depends_on` field, because in a sequential
   pipeline "after" is the only relation there is.
 
+For every task, name each independently changeable `surface` with a globally unique kebab-case
+id and one responsibility. Give every surface exactly one `state_machine`: at least two named
+states and at least one event-labelled transition between declared states. Split unrelated
+surfaces into separate tasks. A task may contain several surfaces only when
+`indivisible_reason` says why they cannot be delivered independently; leave it empty for a
+single-surface task.
+
 Write `read`, `change` and `done_when` for someone who has not seen this request and will
 not see it. They are the entire scope the executor gets.
 
@@ -58,6 +65,20 @@ Know this before you write anything, because it decides what is true when each t
 - The gate runs over the **whole** tree after every task, never over that task's files
   alone. A task that reddens something elsewhere fails, whatever its own files look like.
 - Nothing is carried between tasks except the commits and the remaining specs.
+
+## Evidence exists at two different times
+
+The task reviewer receives one engine-owned receipt: the configured `gate_fast` run over that
+task's uncommitted delivery. The configured `gate_full` runs only after every task in the queue
+has been reviewed and committed. It is queue-finalization evidence, so **never put a successful
+`gate_full` run, or an equivalent completed-queue check, in a task's `must_cover`, `change`, or
+`done_when`**. That creates a cycle: the task cannot be approved without evidence that cannot
+exist until after the task is approved.
+
+The same rule applies to any required command outside `gate_fast`: an executor saying it ran is a
+claim, not an engine receipt. If a task needs a project-specific database, integration, or other
+check before review, the project's configured fast gate must invoke that check. Do not turn a
+manual run into a proof file; ask for a gate integration or stop as blocked when none exists.
 
 ## `done_when` is a property of the final tree
 
@@ -93,15 +114,18 @@ boolean are the usual collapses. Where one is unavoidable, pin the text.
 Before you return, **enumerate the population**: the cases, states, inputs, call sites and
 surfaces this request implies. Every case of an enum. Both overloads of a method. Each
 caller of the function you are changing. The empty state and the populated one. Then map
-each case to the task that handles it, and return that as `coverage`.
+each case to the task that handles it and to one or more exact `done_when` strings from that
+task. Return that as `coverage`. A task name without an acceptance criterion is not coverage:
+it says where work happens, but not what will prove that this case survived it.
 
 This is not paperwork. Completeness is otherwise a judgement nobody can check; as a mapping
 it is something a reader compares against their own enumeration. A case you did not think
 of is a hole, and writing the mapping is what makes it visible — first of all to you.
 
-Every task must appear in the mapping, and every case must name a task that genuinely
-handles it. If you cannot name the population, say so in `blocked`: a request whose
-population you cannot enumerate has not been stated clearly enough to plan.
+Every task must appear in the mapping, every case must appear exactly once, and every named
+acceptance criterion must be copied exactly from that task's `done_when`. If you cannot name
+the population, say so in `blocked`: a request whose population you cannot enumerate has not
+been stated clearly enough to plan.
 
 ## Do not
 

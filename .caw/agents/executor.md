@@ -23,10 +23,39 @@ close the task — it only leaves the orchestrator a clean tree with nothing to 
 task stops there. Measured once, on an executor that committed correct work and stopped its
 own run.
 
+**Never undo anything with git.** `git checkout -- <file>`, `git restore <file>`, `git stash`
+and `git reset` all mean "give me back the committed file", and the committed file is the one
+without your task in it. You are the one role that always works on a dirty tree — that is what
+you are for — so the reading that is safe everywhere else ("throw away my change") is false in
+exactly the place you stand.
+
+Measured across two queues on one install: four executors probed their own new test by breaking
+the code it covers, then undid the probe with `git checkout -- <file>`. Each one discarded its
+task's entire uncommitted delivery for that file — 114 lines in one, 83 of 107 tests back to red
+in another. All four reconstructed the work from what they had read earlier in the same session,
+which is the role checking its own memory, not a record. The fifth will be the one that is not.
+
+If you want to see your own test fail, undo the probe with the inverse `Edit`, or copy the file
+aside first and copy it back. The reviewer runs the same probes and loses nothing, because its
+surface is a clone at a committed baseline where `git checkout --` means what it says. That
+asymmetry is the whole point: it is not a mistake a careful executor avoids by being careful.
+
+And check at the point of the command, not from something you read earlier in the conversation:
+`git status --short -- <path>` immediately before, if you are about to run anything that could
+restore a file.
+
 Run the profile's `gate_fast` yourself before you return. Not to certify it — the
 orchestrator re-runs it, and that run is the one that counts. You run it because a failing
 test is a **fact**, not a verdict, and keeping the fact from you along with the judgement
 costs a whole round to surface something visible in seconds.
+
+When the prompt names a gate probe (`$CAW_GATE_PROBE`), use it: it runs the same gate on a
+copy of your tree outside your write boundary, and `--mutation -` runs it with one mutation of
+the shipped code applied, so you can watch your own test go red. On a host whose toolchain cannot
+run inside the boundary at all — Xcode with Swift packages is one, because SwiftPM starts its own
+sandbox and macOS refuses a sandbox inside yours — the probe is the only gate you can reach, and
+trying the gate directly first only spends your budget. The probe is limited per call; spend it
+on the check whose answer would change what you do next.
 
 You must make that attempt, but inability to run the gate is never `blocked`: put the exact
 failure in `notes` and continue, because the orchestrator runs the deciding gate outside your
@@ -34,6 +63,27 @@ write boundary. In particular, denied writes to a per-user cache or temporary di
 the delivery tree are the `delivery-tree` boundary working as designed, not evidence that the
 task is impossible or permission to widen or escape the boundary. This exception is only for a
 gate that cannot run: when the gate does run and fails, investigate and report that real failure.
+
+## Mutations: have the engine run what you cannot
+
+For every test you add or change for a `Must cover` row, name in `mutations` the smallest change
+to the **shipped** code that the test exists to catch: `path`, a `find` that occurs exactly once
+in that file, its `replace`, and what it `breaks`. After a green gate the engine applies each one
+to a disposable copy of your delivery and runs the fast gate there, outside your write boundary.
+A mutation the gate catches is engine evidence the reviewer may cite. One that **survives** comes
+back to you before any reviewer sees the delivery: make your test catch it, and return it again.
+
+This is the fact the gate attempt above would have given you, on a host where it cannot. On one
+install the executor could never run the gate, listed every red-making mutation as
+"unmeasured", and the reviewer spent a whole round on each one that survived. Do not mutate the
+test itself, and do not name a mutation you expect to survive. Leave `mutations` empty when the
+task adds no test.
+
+Record every meaningful check in `claims`. A claim has a stable id, links to the criterion and
+acceptance-case ids it exercised, the command and selector, the observed result, a short summary
+and any artifact references. These are navigation hints for the reviewer, not certification:
+only the orchestrator can produce an engine-owned gate receipt. Do not write proof files into the
+repository merely to make a claim visible.
 
 ## Scope of the edit is not scope of the search
 
@@ -59,5 +109,6 @@ end of the run and then it is gone. That is the mechanism, not a gap in it.
 
 ## Return
 
-`summary` is one sentence: what changed. Nothing in your return value reaches the
-reviewer — it reads the spec and the diff, never your account of your own work.
+`summary` is one sentence: what changed. The reviewer receives your structured `claims`,
+explicitly labelled untrusted, alongside the engine-owned receipt. It does not receive your prose
+as proof and must not upgrade a claim into evidence merely because you reported it.

@@ -39,17 +39,18 @@ Two steps of this procedure have their own file, because each is a job rather th
 - **Every provider executable named by `.caw/runtime.json`.** Claude resolves as
   `CAW_CLAUDE` or `claude`; Codex resolves as `CAW_CODEX` or `codex`. Executable overrides and
   credentials stay environment-owned, never in the runtime file. The currently measured Codex
-  executor/reviewer path is macOS arm64 and exact-version probed: a new CLI version may declare the
-  same semantic rows, but remains unavailable until its own probe is green. The default npm wrapper
+  executor/reviewer path is macOS arm64. A new CLI version may reuse current boundary evidence,
+  while exact role-smoke evidence becomes stale when that check is enabled. The default npm wrapper
   is not replaced automatically when it is broken. If authentication must be staged for Codex, point
   `CAW_CODEX_AUTH_FILE` at a regular private auth file. The adapter copies it into a private
   transport, caps it at 1 MiB and removes the copy after observing that the turn started. This is
   cleanup, not an access barrier: from child start until that event, the role's first shell command
   can read the copy. Set `CAW_CODEX_AUTH_FILE` only if you accept that residual exposure.
 - **Green live evidence for every configured binding that declares a probe.** Run
-  `node caw.mjs probe <provider>` on the machine that will execute it. A CLI upgrade, adapter
-  change, executable change, missing evidence or red probe makes that binding unavailable before
-  spend. This is not a warning you can opt past.
+  `node caw.mjs probe <provider>` on the machine that will execute it. An adapter implementation
+  change, executable change, expired or missing evidence, or red probe makes that binding
+  unavailable before spend. CLI drift is recorded and reported; `require_role_smoke: true` binds
+  the exact CLI as well. This is not a warning you can opt past.
 - **`bash` on `PATH`.** Every gate runs as `bash -lc "<your gate command>"` from the
   repository root. It is a **login** shell, so PATH comes from the login profile: a gate that
   needs nvm, rbenv or asdf behaves differently here than in your own shell. On Windows this
@@ -191,12 +192,72 @@ It is a form and its fields are the whole configuration; the comments in it say 
 field is for. Two things it points at that live here: the gate contract, and `gate_full:`
 may be left empty, meaning the fast gate is the whole gate.
 
+Strict weak verification is optional. To enable it, fill in both `weak_source_probe_cmd` and
+`weak_positive_control_cmd`; leaving only one set is a profile error. The source probe runs in the
+review surface and must print only strict JSON with a non-empty `loaded_paths` array of absolute
+regular-file paths inside that surface. It must not change files. The positive control runs in the
+same surface, must change an existing tracked file, and must make `gate_fast` fail. Keep both
+commands short: their timeout is `gate_fast_timeout_ms`, or five seconds when that field is empty.
+
+Provider calls have four independent budgets in the same frontmatter: the whole command
+(`budget_request_calls`), planning only (`budget_planning_calls`), one task
+(`budget_task_calls`), and each role (`budget_<role>_calls`, with hyphens written as underscores).
+`budget_unknown_cost_calls` separately limits completed calls whose monetary cost was not
+reported. Every value is a positive integer and is checked before the next provider process
+starts. Defaults are finite and appear in the distributed profile; lower them per project when
+the project needs a tighter spending boundary.
+
+`review_challenger_passes` is the number of blind passes after the primary task review: `1` gives
+two total passes and is the distributed default; the allowed range is `0..2`. Every pass costs a
+reviewer call. `require_role_smoke: true` requires exact binding evidence after any model,
+reasoning, CLI, adapter or engine change.
+
+`pipeline_mode` selects `fast`, `standard`, or `strict`. Fast consumes existing specs and uses
+one executor, focused gate, and primary review path. Standard performs one planning review and
+uses risk-triggered challenger passes. Strict retains iterative planning and fixed challengers.
+`planning_max_rounds` bounds planning at `1..3`; `review_challenger_policy: risk` adds configured
+challengers only for broad or risky paths, carried findings, or a primary blocking result.
+
+Set `builtin_index: request-v1` for the engine's bounded request-token/file index, and
+`index_audience: planning` to pass the same digest, together with any `index_cmd` output, to
+enumerator, architect, and plan-reviewer. Use `gate_batch` for broad tests that should run once after the task
+queue; keep focused evidence in `gate_fast`.
+
+For Codex executors, `executor_max_tool_events` and `executor_max_event_bytes` are live limits,
+not accounting warnings after the call. The adapter interrupts the provider when either observed
+limit is reached. CAW saves round state before launch, so partial edits and the last confirmed-red
+receipt remain recoverable. Start with a measured ceiling above ordinary tasks; a value below the
+smallest complete delivery only converts spend into repeated partial attempts.
+
+For automatic per-task selection, leave those two static fields empty and configure all six
+`executor_budget_<small|normal|large>_<tool_events|event_bytes>` fields. The architect assigns
+`executor_budget: small | normal | large`; the plan reviewer sees the selected class and must file
+an `unverifiable` hole when it is too small for reliable completion. CAW never lowers the proposal.
+It raises indivisible multi-surface work and tasks naming database, schema, migration, RLS,
+authorization, authentication, permissions, credentials, secrets, grants, access policies, or security to
+`large`; four or more state transitions impose at least `normal`. Old and hand-written specs without
+the field start at `normal` and receive the same safety floor. The exact selection and limits are
+retained in every executor call's run record; generated specs keep the architect proposal in
+`executor_budget_requested` and the engine-selected value in `executor_budget`.
+
+Set `gate_unavailable_review: true` only when an advisory code review is useful during a refused
+or timed-out task gate. CAW runs exactly one reviewer pass, records its findings, and stops. The
+delivery is never certified or committed without a green required gate.
+
+For human independence, set `human_review_allowed_signers` to a repository-relative OpenSSH
+allowed-signers file. CAW signs no decision itself: `human-review prepare` writes the exact census,
+the reviewer fills it and signs its bytes in namespace `caw-review`, and `human-review accept`
+verifies the signature and unchanged artifact.
+
 ## Bind all five roles in `.caw/runtime.json`
 
 The runtime file is explicit and closed: `architect`, `enumerator`, `plan-reviewer`, `executor`
 and `reviewer` each name `provider`, provider-native `model`, and CAW reasoning
 `low | medium | high | max`. There are no inherited role defaults and no executable or credential
 paths in this file.
+
+Every shipped adapter declares explicit model-id selection and its supported CAW reasoning levels.
+Model ids are passed through as written; CAW does not require aliases.
 
 ### Clean machine with Claude only
 
@@ -268,6 +329,15 @@ test "$(find "$probe_dir" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' '
 Missing, red or evicted evidence correctly makes every pipeline command refuse before its first
 role call and print `node caw.mjs probe claude` as the recovery command.
 
+When the distributed profile keeps `require_role_smoke: true`, also run:
+
+```bash
+node caw.mjs smoke all
+```
+
+This makes one bounded call per role and stores Git-private evidence for the exact binding. Change
+one model or reasoning value and only that role's evidence becomes stale.
+
 The planning roles run with `writeScope: engine-private-only`: provider transport and scratch may
 write, but delivery may not. That scope is enforced by the probe-backed `os-boundary`; it is not an
 `isolated-surface`, because no writable repository copy is created. `os-boundary` names one
@@ -312,8 +382,8 @@ rejected with a complete five-row migration starting point; move the choices to 
 then remove the legacy fields rather than keeping two sources of truth.
 
 The enumerator is bound by outcome, not by which repository-reading tool a provider happens to
-use. It must read delivery while an exact-version OS-boundary probe demonstrates that delivery
-writes fail and engine-private writes succeed. Every adapter still reports shell availability, but
+use. It must read delivery while a current OS-boundary probe demonstrates that delivery writes
+fail and engine-private writes succeed. Every adapter still reports shell availability, but
 the enumerator row does not compare it. After a paid enumeration, the engine independently resolves
 every case's structured source against the current repository, the exact human request or the exact
 digested `index_cmd` block delivered to that call. One malformed or invented anchor discards the

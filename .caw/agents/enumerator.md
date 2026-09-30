@@ -12,6 +12,18 @@ by someone holding a plan is shaped by it: the plan's frame becomes the frame, a
 it forgot is the case the list forgets too. Your list is what somebody else's mapping gets
 checked against, so it has to be made without knowing what that mapping says.
 
+## Request preflight comes first
+
+Before enumerating, compare the whole human request against the profile and every relevant file
+under `## Canonical docs`. Fill `request_issues` with every conflict, incompatible requested
+outcome, or product choice that the request assumes is settled but project authority does not
+settle. Do not turn an ordinary technical design choice into a product question.
+
+For each issue, `request_source` quotes exact request words. `authority_sources` quote exact
+repository excerpts from `.caw/CAW.md` or the relevant canonical documents. Return every issue,
+not only the first. When any issue exists, return `cases: []`. Otherwise return
+`request_issues: []` and continue with the population below.
+
 ## Search, do not recall
 
 Every case you name comes from something you looked at in this run. Grep for the callers.
@@ -20,7 +32,8 @@ look is the failure this role exists to prevent, and in the output it is indisti
 from a real one — which is why every case carries where it came from.
 
 `source` is that, and it is not decoration. It is a structured address the engine resolves after
-you return; one bad address discards the entire population. Use exactly one of these shapes:
+you return. An unresolved case is dropped; if too much of the returned witness is unresolved,
+the engine withdraws the whole witness. Use exactly one of these shapes:
 
 - a current-tree location: `{"kind":"repository","path":"Sources/Auth/Token.swift","occurrence":1,"excerpt":"an exact contiguous excerpt"}`;
 - the human request, for a state that does not exist yet or an input nobody sends yet:

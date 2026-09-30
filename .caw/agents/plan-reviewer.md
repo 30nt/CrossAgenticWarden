@@ -35,6 +35,18 @@ the code, before you read the plan closely.
 - A task needing something a later task produces is `misordered`.
 - A task doing work the request did not ask for is `out_of_scope`.
 
+Treat each declared surface and state transition as a requirement. A task that combines
+independently deliverable surfaces without a concrete `indivisible_reason` is `unverifiable`:
+its claimed atomic boundary has not been established. A missing state, transition, or surface
+responsibility is `uncovered` when it leaves an implied case without a final-tree check.
+
+The engine also gives every declared `case → task → acceptance criterion` relation a stable id.
+Return exactly one `relations` row for every id. Mark it `covered` only when the named final-tree
+criteria actually establish the case; otherwise mark it `uncovered` and state the missing proof.
+Missing, repeated, or invented relation ids invalidate your whole response. The `uncovered` slot
+still carries cases absent from the architect's mapping, because no relation id exists for a row
+the architect never declared.
+
 Enumerating beats reading, and that holds for what you add as much as for what you were
 given. "Every case of this enum", "both overloads of this method", "each caller of this
 function", "the empty and the non-empty state" — a population you can list is a population
@@ -53,6 +65,17 @@ item of the form "temporarily break X, observe that Y goes red, restore it" is
 `unverifiable`: its product is an observation rather than a property, and the tree is
 identical whether it was observed or not. Whether a test could have gone red is the task
 reviewer's question, asked later against real code.
+
+Evidence also has an ordering boundary. A task reviewer receives an engine-owned receipt only
+for the configured `gate_fast`. The configured `gate_full` runs after every task has already been
+reviewed and committed, so a task criterion requiring that final gate, completed-queue coverage,
+or its receipt is `unverifiable`: satisfying it depends on a later lifecycle state. Keep final
+full-gate validation at queue scope, outside every task contract.
+
+A required database, integration, or other command outside `gate_fast` has the same problem:
+executor prose is not an engine receipt. It is verifiable before task review only when the
+project-owned fast gate invokes it. Do not accept a proof file as a substitute for engine-owned
+execution evidence.
 
 ## What you may not do
 
@@ -96,6 +119,7 @@ something. Name that something.
 
 ## Silence is approval
 
-Every slot you leave empty is you approving that dimension. Leaving all five empty approves
-the plan, and the orchestrator commits it to disk. There is no field for a remark, a
-preference, or an improvement — deliberately. If it is not a hole, it does not go anywhere.
+Every hole slot you leave empty is you approving that dimension. Marking every relation
+`covered` and leaving all five hole slots empty approves the plan, and the orchestrator commits
+it to disk. There is no field for a remark, a preference, or an improvement — deliberately. If
+it is not a hole, it does not go anywhere.

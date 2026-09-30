@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "baseline_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "passes": [
+    {
+      "criteria": [{"id":"done-when-1","state":"met","evidence":"primary traced the consumer"}],
+      "carried": [{"id":"r1.1","state":"closed","evidence":"primary no longer reproduces it"}],
+      "broken": [], "uncovered": [], "weak": [], "noted": []
+    },
+    {
+      "criteria": [{"id":"done-when-1","state":"broken","evidence":"challenger reproduced the failure"}],
+      "carried": [{"id":"r1.1","state":"open","evidence":"challenger still reproduces it"}],
+      "broken": [{"where":"src/token.js:8","fix":"preserve the stored token","evidence":"challenger reproduction"}],
+      "uncovered": [], "weak": [], "noted": []
+    }
+  ],
+  "expect": {
+    "criterion_state": "broken",
+    "carried_state": "open",
+    "new_findings": 1,
+    "new_finding_discovery": "late-same-baseline"
+  }
+}

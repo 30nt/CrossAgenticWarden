@@ -5,6 +5,7 @@ import { delimiter, join } from 'node:path'
 const FEATURES = {
   schemaTransport: 'inline', resultTransport: 'stdout',
   reportsCost: false, reportsCacheCounters: false, reportsModels: false,
+  modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
 }
 
 const scopeFor = (role) => role === 'executor' ? 'delivery-tree'
@@ -94,8 +95,9 @@ const requestedNative = (binding) => ({
 })
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'test-third',
+  vendor: 'independent-fixture',
   features: FEATURES,
   resolveExecutable(env) { return env.CAW_THIRD || 'test-third' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },
@@ -168,6 +170,9 @@ export default {
         requested: { model: binding.model, reasoning: binding.reasoning, native },
         models: [],
         tokens: { input: null, output: null, cachedRead: null, cachedWritten: null, reasoning: null },
+        telemetry: {
+          eventCount: null, toolEventCount: null, eventBytes: Buffer.byteLength(stdout || ''),
+        },
         cost: null,
         durationMs: null,
       },

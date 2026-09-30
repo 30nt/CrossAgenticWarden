@@ -6,9 +6,47 @@ The gate is the one thing in this pipeline whose verdict never passes through a 
 or red is an exit code. That makes it the piece most worth getting right, and these rules were
 each bought by an install that did without one.
 
-`gate_fast` and `gate_full` are each **one command**. A project whose gate is really five
+`gate_fast`, `gate_batch`, and `gate_full` are each **one command**. A project whose gate is really five
 checks wraps them in a script and names that — `bash scripts/gate_fast.sh`, or a `make check`
 that already does it. Five rules, every one of them bought by an install that did without it:
+
+Set `gate_fast_timeout_ms` and `gate_full_timeout_ms` in `.caw/CAW.md` when the project has a
+defensible limit. They are positive whole milliseconds; an empty value leaves that gate without
+an engine timeout. A timeout is recorded separately from red and exit-75 refusal: CAW kills the
+gate, keeps task recovery state, and does not wake an executor or recommend a bisect.
+
+`gate_fast` runs for every task. Optional `gate_batch` runs once after the queue, so broad unit
+suites can move there instead of repeating after every ticket. `gate_full` remains the final
+integration gate. Fast pipeline mode ends after focused task gates and reviews; standard and
+strict modes run the configured batch and full gates.
+
+With `gate_unavailable_review: true`, a refused or timed-out task gate can receive one advisory
+review pass. This is a diagnosis path: it records findings against the preserved dirty tree and
+receipt, then stops without certification or commit.
+
+Generated specs carry a stable `task_key` independent of their numbered queue position. The
+engine exports it as `CAW_TASK_KEY`; gate routing should use that value. `CAW_SPEC` remains
+available for compatibility and for reading the current spec.
+
+A spec may declare `## Required gate checks` with bullets beginning in a backticked check id. A
+zero exit is then insufficient: `CAW_GATE_EVIDENCE_OUT` must contain every declared id with state
+`passed`. CAW refuses the receipt before reviewer judgment if the manifest or a required passed
+check is missing.
+
+A project policy API v2 risk class may require a full-gate baseline. In that mode `gate_full`
+runs once on the starting commit before any executor and once after the queue. `--no-full` and an
+empty `gate_full` are refused. Red, refusal, timeout, or a project gate-policy stop at the baseline
+ends the run before delivery changes; a green baseline is retained in the run record and private
+queue state. A stopped task may resume with `round` or `review` only from that ancestry and with
+the same full-gate command; the resumed task is followed by the final full gate.
+
+Project policy API v2 may classify a confirmed red fast gate as allowlisted flaky and request a
+provider-free retry. The engine, not the policy, caps these at two per delivery. A persistent red
+then returns to the normal executor retry or review-stop decision.
+
+Required full-gate baseline caching is fail-safe and project opt-in. CAW combines its own exact
+repository, queue, engine, profile, policy, risk, command, and timeout digests with a v2 gate-policy
+digest for external inputs. Without the project digest, or on any mismatch, the gate runs again.
 
 1. **Exit 0 green, 75 refused-to-start, any other non-zero red.** 75 (`EX_TEMPFAIL`) means
    the gate never looked: a machine too loaded for the suite it shards, a simulator that is
@@ -45,6 +83,60 @@ that already does it. Five rules, every one of them bought by an install that di
    plan-reviewer never see it.
    Unset — a hand run, or the full gate — means the whole directory is the right subject.
    (Without it a gate reds a plan's early tasks over a debt only its last task settles.)
+   It is also unset for the evidence-contract preflight `build` runs once before any executor,
+   whose `CAW_GATE_CONTRACT` carries `"kind": "contract-preflight"`. That run only asks whether the
+   gate writes a manifest: a red or refused run without one leaves the question open and the
+   build going, and only a green run without one refuses the queue.
+
+## Structured evidence
+
+Every gate receives `CAW_GATE_EVIDENCE_OUT` and `CAW_GATE_ARTIFACTS_DIR`. A project with an
+API-v3 acceptance policy writes the version-1 manifest documented in
+[project policies](project-policies.md). A green fast gate must report a passed check for every
+acceptance case with the required evidence kind.
+
+### The contract the manifest is judged against
+
+A manifest is validated against a contract, and the gate is handed that contract rather than
+left to re-derive it. **More evidence than was asked for is refused exactly like none**: a check
+is allowed to carry no links only when its id was declared required, so a gate emitting one check
+per test tier is rejected with `not linked to a criterion or acceptance case`. Measured on one
+install, over a green suite, that reads as a defect in the pipeline.
+
+Two variables carry it, and both are always set, including empty — so a gate can tell an engine
+that offers the contract from one that does not:
+
+| variable | holds |
+|---|---|
+| `CAW_GATE_REQUIRED_CHECKS` | the required check ids, one per line, for a shell to loop over |
+| `CAW_GATE_CONTRACT` | a path to version-1 JSON: `required_check_ids`, `criteria`, `acceptance_cases` |
+| `CAW_GATE_MUTATION_PATHS` | on a `weak-mutation` run, the files the mutation changed, one per line; empty on every other run |
+
+The JSON is what a gate needs to link rather than declare. A check naming a criterion must use
+the engine's own stable census id, and one naming an acceptance case must match that row's exact
+`evidence_kind` and `selector` — none of which a project can guess. Emit the required ids from
+`CAW_GATE_REQUIRED_CHECKS` directly; do not parse `## Required gate checks` out of `CAW_SPEC`,
+which duplicates engine-owned identity in project code and drifts silently when it changes.
+
+The JSON also names the run's `kind`: `fast`, `batch`, `full`, `contract-preflight`, and on a
+disposable review copy `weak-baseline` or `weak-mutation`. A replay run exists only to learn whether
+one mutation turns the gate red, so a gate may make it cheaper: stop at the first failure, and run
+only the tests that reach `CAW_GATE_MUTATION_PATHS`. Narrowing is the project's call and its risk.
+A suite cut too far lets a mutation survive that the full suite would catch, and the reviewer's
+weak finding then blocks the task on a test gap that does not exist. Within one invocation the
+engine asks a weak gate once per exact delivery digest and patch: a green baseline and a caught
+or surviving mutation are reused, a red, timed-out or refused run is asked again.
+
+```bash
+while IFS= read -r id; do [ -n "$id" ] && printf '%s\n' "$id"; done \
+  <<< "$CAW_GATE_REQUIRED_CHECKS"
+```
+
+CAW owns the resulting receipt. It records the command result, bounded output and artifact
+digests against the exact delivery digest. Manifest files are limited to 1 MiB, 128 checks and 32
+artifacts. Each artifact is at most 16 MiB and all artifacts together at most 64 MiB. Paths must
+be relative regular files without symlink components. Archive directory-style result bundles
+before listing them, for example as `.xcresult.zip`.
 
 The reviewer and every `weak` replay run this gate again inside an isolated write boundary. A green
 delivery gate does not prove that the same command is runnable there. The live acceptance repository
@@ -66,6 +158,30 @@ One command, like a gate, printing to stdout. What belongs in it is whatever you
 list **in full**: every member of an enum, every caller of a function, every migration, every
 route, every numbered section of a specification against the files that cite it. What does not
 belong is anything you cannot close — a summary, an architectural overview, advice.
+
+New profiles set `index_format: json-v1`. The command must print one strict object:
+
+```json
+{
+  "api_version": 1,
+  "sets": [
+    {
+      "id": "public-routes",
+      "label": "Public HTTP routes",
+      "source": "scripts/project-index.mjs",
+      "members": ["GET /health", "POST /orders"]
+    }
+  ]
+}
+```
+
+Set ids and members must be unique inside their scope. Unknown fields, malformed output,
+duplicate ids or members, non-zero exit, oversized output, and a rendered index above the prompt
+cap stop planning before a provider call. CAW never truncates a structured closed set.
+
+Profiles installed before this contract and lacking `index_format` keep `text-v0`: their stdout
+is passed as before, and command failure stays non-fatal. Set `index_format: json-v1` only after
+the command emits the object above.
 
 **A set may only be drawn from what the project says it MUST do, never from what it records
 having done.** An archive of finished tasks carries section numbers exactly like a
@@ -95,8 +211,8 @@ on one project returned 22 where the real number was 90, and its own commit mess
 A script that quietly under-reports is worse than no script, because the enumerator is about to
 be told the set is closed.
 
-Failure is never fatal. No command, an empty print, a non-zero exit — the run says so and
-enumerates as it always has. Output above the cap is truncated, the run says how much was
-dropped, and the enumerator is told it may not treat any set in there as closed. A visible index
-member can still be cited with the exact digest, line range and excerpt; the model never turns that
-address into a global completeness claim.
+In legacy `text-v0`, failure remains non-fatal. No command, an empty print, or a non-zero exit
+makes the run enumerate as it always has. Output above the cap is truncated, the run says how much
+was dropped, and the enumerator is told it may not treat any set in there as closed. In both
+formats a visible index member can still be cited with the exact digest, line range and excerpt;
+the model never turns that address into a global completeness claim.

@@ -20,11 +20,11 @@
 import { spawnSync, spawn, execFileSync } from 'node:child_process'
 import {
   appendFileSync, chmodSync, closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync,
-  mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync,
+  mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync,
   symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -146,7 +146,584 @@ const MAX_PLAN_ROUNDS = 3
 // that same install — two rounds, $4.88, five substantive items closed and three fresh ones
 // raised, stopped at the cap with the task one hand-edit from done.
 const MAX_TASK_ROUNDS = 4 // rounds a task runs before the run stops and asks the human
-const MAX_GATE_RETRIES = 2 // red-gate attempts, which buy no review and spend no review round
+const DEFAULT_REVIEW_CHALLENGER_PASSES = 1
+const MAX_REVIEW_CHALLENGER_PASSES = 2
+const MAX_REVIEW_SEMANTIC_REPAIRS = 1
+const MAX_PLANNING_CANONICAL_REPAIRS = 1
+const MAX_GATE_RETRIES = 2 // executor retries after a provider-free red confirmation
+// An executor that names a mutation its tests should catch gets it measured by the engine, which
+// runs the gate outside the executor's boundary. Each mutation costs one gate run, so the list is
+// capped; a surviving one buys an executor retry before any reviewer is paid, at most this many
+// times per review round.
+const EXECUTOR_MUTATIONS_MAX = 8
+const MAX_MUTATION_RETRIES = 2
+const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
+const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
+const EXECUTOR_BUDGET_CLASSES = Object.freeze(['small', 'normal', 'large'])
+const EXECUTOR_BUDGET_RANK = new Map(EXECUTOR_BUDGET_CLASSES.map((name, index) => [name, index]))
+const PIPELINE_MODES = new Set(['fast', 'standard', 'strict'])
+const TASK_DOSSIER_TOTAL_MAX = 192 * 1024
+const TASK_DOSSIER_CAPS = Object.freeze({
+  spec: 32 * 1024,
+  contract: 24 * 1024,
+  profile: 24 * 1024,
+  open_findings: 32 * 1024,
+  gate_evidence: 24 * 1024,
+  executor_claims: 24 * 1024,
+  acceptance_cases: 24 * 1024,
+  changed_files: 12 * 1024,
+  diff: 64 * 1024,
+})
+const GATE_EVIDENCE_MANIFEST_MAX = 1024 * 1024
+const GATE_EVIDENCE_CHECKS_MAX = 128
+const GATE_EVIDENCE_ARTIFACTS_MAX = 32
+const GATE_EVIDENCE_ARTIFACT_MAX = 16 * 1024 * 1024
+const GATE_EVIDENCE_ARTIFACTS_TOTAL_MAX = 64 * 1024 * 1024
+const GATE_EVIDENCE_OUTPUT_MAX = 1024 * 1024
+
+const GateFailureAction = Object.freeze({
+  confirm: 'confirm',
+  executor: 'executor',
+  stopReview: 'stop-review',
+  stopRetries: 'stop-retries',
+})
+
+function decideGateFailure({
+  reviewOnly,
+  confirmationRuns,
+  executorRetries,
+  maxExecutorRetries,
+}) {
+  for (const [name, value] of Object.entries({
+    confirmationRuns,
+    executorRetries,
+    maxExecutorRetries,
+  })) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new TypeError(`${name} must be a non-negative integer`)
+    }
+  }
+  if (typeof reviewOnly !== 'boolean') throw new TypeError('reviewOnly must be a boolean')
+
+  if (confirmationRuns === 0) return GateFailureAction.confirm
+  if (reviewOnly) return GateFailureAction.stopReview
+  if (executorRetries >= maxExecutorRetries) return GateFailureAction.stopRetries
+  return GateFailureAction.executor
+}
+
+const PlanningAction = Object.freeze({
+  architect: 'architect',
+  stopRequest: 'stop-request',
+})
+
+function decidePlanningAction(requestIssues) {
+  if (!Array.isArray(requestIssues)) throw new TypeError('requestIssues must be an array')
+  return requestIssues.length ? PlanningAction.stopRequest : PlanningAction.architect
+}
+
+function canonicalAuthorityPaths(profileText) {
+  if (typeof profileText !== 'string') throw new TypeError('profileText must be a string')
+  const heading = profileText.match(/^## Canonical docs\s*$/m)
+  const tail = heading ? profileText.slice(heading.index + heading[0].length) : ''
+  const nextHeading = tail.search(/^##\s/m)
+  const section = nextHeading === -1 ? tail : tail.slice(0, nextHeading)
+  const paths = new Set(['.caw/CAW.md'])
+  for (const line of section.split('\n')) {
+    const match = line.match(/^\s*-\s+(?:`([^`]+)`|\[[^\]]+\]\(([^)]+)\)|(\S+))/)
+    if (!match) continue
+    const raw = match[1] || match[2] || match[3]
+    if (!raw || /^[a-z]+:\/\//i.test(raw)) continue
+    const path = match[2] ? linkTargetPath(raw) : raw
+    if (path) paths.add(path)
+  }
+  return paths
+}
+
+// A markdown link in `.caw/CAW.md` is written to be clicked from that file, so its target is
+// relative to `.caw/` — `[x](../docs/x.md)` means `docs/x.md`. Every role addresses the
+// repository from its root, as `.caw/agents/enumerator.md` tells it to. Taking the target
+// verbatim put `../docs/x.md` in the authority set, and a role quoting the same document by its
+// real path died on the schema. Measured on one install: an enumerator ($1.76) found two real
+// defects in the project's normative document, cited it correctly, and was refused
+// `"docs/center/sync-handler.md" is not .caw/CAW.md or listed under ## Canonical docs`.
+//
+// Both spellings survive, because both exist. A target that climbs out of `.caw/` can only have
+// meant `.caw/`-relative. Otherwise the root-relative reading wins, which is what every list
+// written before this read as and what the engine's own test fixed — unless only the
+// `.caw/`-relative file exists, which is the one case where the verbatim reading names nothing.
+function linkTargetPath(target) {
+  let value = String(target).trim().replace(/^<(.*)>$/, '$1').replace(/[?#].*$/, '')
+  if (!value) return null
+  if (value.startsWith('/')) value = value.replace(/^\/+/, '')
+  const literal = posix.normalize(value)
+  const fromProfile = posix.normalize(posix.join('.caw', value))
+  if (fromProfile.startsWith('../') || fromProfile === '..') return null
+  if (literal.startsWith('../') || literal === '..') return fromProfile
+  if (existsSync(fromProfile) && !existsSync(literal)) return fromProfile
+  return literal
+}
+
+const REVIEW_CRITERION_SECTIONS = new Map([
+  ['must cover', { label: 'Must cover', prefix: 'must-cover' }],
+  ['change', { label: 'Change', prefix: 'change' }],
+  ['done when', { label: 'Done when', prefix: 'done-when' }],
+])
+
+function extractReviewCriteria(spec) {
+  if (typeof spec !== 'string') throw new TypeError('spec must be a string')
+  const found = []
+  const counts = new Map()
+  let section = null
+  let pending = null
+
+  const flush = () => {
+    if (!pending) return
+    const count = (counts.get(section.prefix) || 0) + 1
+    counts.set(section.prefix, count)
+    found.push({
+      id: `${section.prefix}-${count}`,
+      section: section.label,
+      criterion: pending.trim(),
+    })
+    pending = null
+  }
+
+  for (const line of spec.replace(/\r\n|\r/g, '\n').split('\n')) {
+    const heading = line.match(/^##\s+(.+?)\s*$/)
+    if (heading) {
+      flush()
+      section = REVIEW_CRITERION_SECTIONS.get(heading[1].trim().toLowerCase()) || null
+      continue
+    }
+    if (!section) continue
+    const bullet = line.match(/^\s*-\s+(.+?)\s*$/)
+    if (bullet) {
+      flush()
+      pending = bullet[1]
+      continue
+    }
+    if (pending && line.trim()) pending += ` ${line.trim()}`
+    else if (!line.trim()) flush()
+  }
+  flush()
+  return found
+}
+
+function extractTaskTopology(spec) {
+  const surfaces = []
+  const transitions = []
+  let section = ''
+  let surface = null
+  for (const line of String(spec || '').split('\n')) {
+    const heading = line.match(/^##\s+(.+?)\s*$/)
+    if (heading) {
+      section = heading[1].trim().toLowerCase()
+      surface = null
+      continue
+    }
+    if (section === 'surfaces') {
+      const match = line.match(/^\s*-\s+`([^`]+)`\s+[—-]\s+(.+?)\s*$/)
+      if (match) surfaces.push({ id: match[1], responsibility: match[2] })
+      continue
+    }
+    if (section !== 'state machines') continue
+    const machine = line.match(/^\s*-\s+`([^`]+)`:\s+states\s+(.+?)\s*$/)
+    if (machine) {
+      surface = machine[1]
+      continue
+    }
+    const transition = line.match(/^\s+-\s+`([^`]+)`\s+--\s*(.+?)\s*-->\s*`([^`]+)`\s*$/)
+    if (!transition || !surface) continue
+    const row = { surface, from: transition[1], event: transition[2], to: transition[3] }
+    transitions.push({
+      id: `transition-${createHash('sha256').update(stableJson(row)).digest('hex').slice(0, 12)}`,
+      ...row,
+    })
+  }
+  return { criteria: extractReviewCriteria(spec), surfaces, transitions }
+}
+
+function buildTaskDossier({
+  spec = '', profile = '', open = [], files = [], diff = '', gateEvidence = null,
+  executorClaims = [], acceptanceCases = [],
+} = {}) {
+  const topology = extractTaskTopology(spec)
+  const values = {
+    spec,
+    contract: stableJson(topology),
+    profile,
+    open_findings: stableJson({ work_packages: groupFindings(open) }),
+    gate_evidence: stableJson(gateEvidence),
+    executor_claims: stableJson(executorClaims),
+    acceptance_cases: stableJson(acceptanceCases),
+    changed_files: files.join('\n'),
+    diff,
+  }
+  const labels = {
+    spec: 'Task spec', contract: 'Structured task contract', profile: 'Project profile',
+    open_findings: 'Open findings', gate_evidence: 'Engine-owned gate evidence',
+    executor_claims: 'Untrusted executor claims', acceptance_cases: 'Project acceptance cases',
+    changed_files: 'Changed files', diff: 'Bounded delivery diff',
+  }
+  const sections = []
+  const rendered = []
+  for (const name of Object.keys(TASK_DOSSIER_CAPS)) {
+    const source = String(values[name] ?? '')
+    const bounded = name === 'gate_evidence'
+      ? boundedGateEvidence(gateEvidence, source, TASK_DOSSIER_CAPS[name])
+      : boundedUtf8(source, TASK_DOSSIER_CAPS[name])
+    const included = Buffer.byteLength(bounded.text)
+    sections.push({
+      name,
+      source_bytes: Buffer.byteLength(source),
+      included_bytes: included,
+      truncated: bounded.truncated,
+      sha256: createHash('sha256').update(source).digest('hex'),
+    })
+    rendered.push(`## ${labels[name]}\n\n${bounded.text || '(none)'}` +
+      (bounded.truncated && !bounded.marked
+        ? `\n\n[truncated at ${TASK_DOSSIER_CAPS[name]} bytes]` : ''))
+  }
+  const header = 'Task dossier generated by CAW. Sections are bounded starting context; ' +
+    'repository reads remain available for checks the dossier cannot settle.\n\n'
+  const sourceText = header + rendered.join('\n\n')
+  const totalMarker = `\n\n[dossier truncated at ${TASK_DOSSIER_TOTAL_MAX} bytes]`
+  const total = Buffer.byteLength(sourceText) > TASK_DOSSIER_TOTAL_MAX
+    ? boundedUtf8(sourceText, TASK_DOSSIER_TOTAL_MAX - Buffer.byteLength(totalMarker))
+    : { text: sourceText, truncated: false }
+  return {
+    text: total.text + (total.truncated ? totalMarker : ''),
+    meta: {
+      version: 1,
+      total_source_bytes: Buffer.byteLength(sourceText),
+      total_included_bytes: Buffer.byteLength(total.text) +
+        (total.truncated ? Buffer.byteLength(totalMarker) : 0),
+      total_truncated: total.truncated,
+      sections,
+    },
+    topology,
+  }
+}
+
+// Criteria have had this since the census existed; surfaces and transitions never did. A
+// transition's id is a content hash — `transition-<12 hex>` from extractTaskTopology — and it
+// appears nowhere a reviewer reads: the spec's own `## State machines` section renders
+// `- `from` -- event --> `to`` with no id at all, and the only place the ids exist is the
+// dossier's `contract` JSON blob, under a 24 KiB cap.
+//
+// Measured on one install: asked for `transition_ids` and shown no ids, a reviewer built one out
+// of the readable form — `check-d-header-doc:<from>-><to>` — naming a transition that really does
+// exist in the spec. That is a contract the prompt did not state, not a hallucination.
+//
+// The blast radius is asymmetric, which is what makes it worth fixing rather than documenting.
+// reviewContractIssue walks the blocking slots only, so an approval with empty slots is never
+// asked for a transition id and serializes fine, while a REJECTION must produce one. The role
+// could express approval and not rejection — and a delivery with a real defect ended the run
+// with an engine diagnostic instead of a readable finding.
+// The receipt's metadata, then its output — head and tail — in the room that metadata leaves.
+// Serialising the whole receipt and cutting the JSON gave the output only what the metadata did
+// not use, and cut it from the wrong end. The receipt id and digests are unchanged, so the
+// reviewer and the executor still refer to the same engine-owned record.
+function boundedGateEvidence(receipt, source, cap) {
+  const output = receipt?.output?.retained
+  if (typeof output !== 'string' || Buffer.byteLength(source) <= cap) {
+    return boundedUtf8(source, cap)
+  }
+  const meta = stableJson({ ...receipt, output: { ...receipt.output, retained: '(rendered below)' } })
+  const header = `\n\nGate output (${receipt.output.bytes} bytes; the failure is usually at the end):\n\n`
+  const room = cap - Buffer.byteLength(meta) - Buffer.byteLength(header)
+  if (room < 1024) return boundedUtf8(source, cap)
+  const shaped = boundedUtf8HeadTail(output, room)
+  return { text: `${meta}${header}${shaped.text}`, truncated: shaped.truncated, marked: true }
+}
+
+function renderTaskTopology(topology) {
+  const surfaces = (topology?.surfaces || []).map((surface) =>
+    `- ${surface.id} — ${surface.responsibility}`)
+  const transitions = (topology?.transitions || []).map((row) =>
+    `- ${row.id} [${row.surface}] ${row.from} -- ${row.event} --> ${row.to}`)
+  if (!surfaces.length && !transitions.length) return '(this task declares no topology)'
+  return [
+    ...(surfaces.length ? ['Surfaces:', ...surfaces] : []),
+    ...(transitions.length ? ['', 'Transitions:', ...transitions] : []),
+  ].join('\n')
+}
+
+function renderReviewCriteria(spec, additional = []) {
+  const criteria = [...extractReviewCriteria(spec), ...additional]
+  return criteria.length
+    ? criteria.map((item) => `- ${item.id} [${item.section}] ${item.criterion}`).join('\n')
+    : '(none — this spec has no Must cover, Change, or Done when bullets)'
+}
+
+function reviewCriteriaIssue(spec, rows, verdict, additional = [], priorOpen = []) {
+  if (!Array.isArray(rows)) return 'criteria must be an array'
+  const expected = [...extractReviewCriteria(spec), ...additional]
+  const byId = new Map(expected.map((item) => [item.id, item]))
+  const seen = new Set()
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return 'every criteria row must be an object'
+    }
+    if (seen.has(row.id)) return `duplicate criterion id ${JSON.stringify(row.id)}`
+    if (!byId.has(row.id)) return `unknown criterion id ${JSON.stringify(row.id)}`
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) {
+      return `${row.id} has empty evidence`
+    }
+    seen.add(row.id)
+  }
+
+  const missing = expected.filter((item) => !seen.has(item.id)).map((item) => item.id)
+  if (missing.length) return `missing criterion id(s): ${missing.join(', ')}`
+
+  const slotForState = { broken: 'broken', uncovered: 'uncovered', weak: 'weak' }
+  const carriedById = new Map((verdict?.carried || []).map((item) => [item?.id, item]))
+  // A blocking item binds to a non-met criterion by NAMING it: its `criterion_ids` holds the
+  // engine's own id, which the schema requires on every finding and reviewContractIssue checks
+  // against the census. Quoting the criterion text verbatim in free prose is the older binding,
+  // from before findings carried ids, and it is still accepted — but it is no longer the only way.
+  //
+  // It had become the one thing standing between a reviewer and a rejection. A substring match
+  // over prose is a constraint a role has to satisfy while writing a finding about something
+  // else, and measured on a third install it could not: four runs stopped on
+  // `<id> is weak but no weak item quotes its exact criterion`, $56.64 in all, two `review`
+  // commands produced no verdict at all, and the repair call — handed the rejected value and,
+  // since 82bebcd, the exact text to copy — answered by breaking the same rule on a different
+  // criterion. An approval leaves every slot empty and is never asked, so the reviewer that
+  // found nothing could say so, and the one that found a real defect (a days-to-Duration overflow
+  // yielding a negative retention period with no error) could not. The id is what the finding
+  // already says; requiring prose to repeat it was requiring the rejection to be written twice.
+  const namesCriterion = (item, id, criterion) =>
+    (Array.isArray(item?.criterion_ids) && item.criterion_ids.includes(id)) ||
+    Boolean(item?.evidence?.includes(criterion))
+  for (const row of rows) {
+    if (row.state === 'met') continue
+    const criterion = byId.get(row.id).criterion
+    const slot = slotForState[row.state]
+    const items = verdict?.[slot]
+    const newItemQuotes = Array.isArray(items) &&
+      items.some((item) => namesCriterion(item, row.id, criterion))
+    const openCarriedQuotes = priorOpen.some((item) => {
+      const disposition = carriedById.get(item?.id)
+      if (disposition?.state !== 'open') return false
+      // Three ways, and the third is why this list is three long. The stored item's own ids are
+      // what it was RAISED against, and which criterion an open item blocks can change between
+      // rounds — the tree moved, and the reviewer is judging it now. Until the disposition could
+      // carry ids of its own, saying so needed the criterion's text verbatim inside the
+      // disposition's evidence: exactly the constraint df33fab removed for a new finding, left
+      // standing for a carried one, while `.caw/agents/reviewer.md` forbids raising a duplicate
+      // instead. Measured on one install, that was a closed door: three consecutive rejections
+      // on a resumed task with twelve open items, $43.40, no verdict once — seven criteria marked
+      // weak, all three blocking slots empty, and none of the twelve dispositions able to say why.
+      return namesCriterion(item, row.id, criterion) ||
+        (Array.isArray(disposition.criterion_ids) &&
+          disposition.criterion_ids.includes(row.id)) ||
+        Boolean(disposition.evidence?.includes(criterion))
+    })
+    if (!newItemQuotes && !openCarriedQuotes) {
+      // Names the id first, because naming the id is what satisfies the check, and the text
+      // second for a role that chose to quote. Naming only the text was tried: on a third install
+      // the repair call received it and broke the same rule on another criterion.
+      return `${row.id} is ${row.state} but no ${slot} item names it; ` +
+        `list ${JSON.stringify(row.id)} in the criterion_ids of the ${slot} item that shows it ` +
+        `(or quote its text verbatim in that item's evidence: ${JSON.stringify(criterion)})`
+    }
+  }
+
+  for (const item of verdict?.uncovered || []) {
+    if (!expected.some((criterion) => namesCriterion(item, criterion.id, criterion.criterion))) {
+      return 'an uncovered item names no Must cover, Change, or Done when criterion; list its id ' +
+        'in criterion_ids or quote its exact text'
+    }
+  }
+  return null
+}
+
+function evidenceRefIssue(ref, sources) {
+  if (typeof ref !== 'string' || !ref.length || Buffer.byteLength(ref) > 2048) {
+    return 'evidence reference must be a non-empty string of at most 2048 bytes'
+  }
+  const [kind, value] = ref.split(/:(.*)/s, 2)
+  if (!value) return `invalid evidence reference ${JSON.stringify(ref)}`
+  const known = {
+    'gate-receipt': sources.receipts,
+    'gate-check': sources.checks,
+    'gate-artifact': sources.artifacts,
+    'executor-claim': sources.claims,
+    'executor-mutation': sources.mutations || new Set(),
+    'review-mutation': sources.reviewMutations || new Set(),
+  }
+  if (known[kind]) {
+    if (!known[kind].has(value)) return `unknown ${kind} evidence reference ${value}`
+    return null
+  }
+  if (kind === 'repository') {
+    if (isAbsolute(value) || value.includes('\\') || value.split('/').some((part) =>
+      part === '..' || part === '.')) {
+      return `unsafe repository evidence reference ${value}`
+    }
+    return null
+  }
+  if (kind === 'review-experiment' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    return null
+  }
+  return `unsupported evidence reference kind ${kind}`
+}
+
+// The shape a property key must have, named once so the schema, the prompt, the role file and
+// the diagnostic all say the same thing. It used to live only in the regex below: the schema
+// described the field as a "stable project-independent key", the role file said "one stable
+// `property_key`", and nothing said which characters. For a word like "key" snake_case is the
+// first choice, and it was the one refused. Measured on one install: four reviewer calls in a
+// row, $12.67, each returning keys like `assertion_cannot_distinguish_value_source` and each
+// refused with `has invalid property_key` — a diagnostic that named the field and not the rule,
+// so the repair call could not fix what it was not told. $11.51 of executor work sat green in
+// the tree with nothing able to judge it.
+const PROPERTY_KEY_PATTERN = /^[a-z][a-z0-9.-]{0,127}$/
+const PROPERTY_KEY_RULE = 'lowercase letters, digits, dots and hyphens, starting with a letter, ' +
+  'at most 128 characters, e.g. `replay.refused-batch-stays-refused`'
+
+// Case, underscores and spaces are notation, not identity: `assertion_cannot_distinguish` and
+// `assertion-cannot-distinguish` name one property, and a reviewer that writes one in round 1 and
+// the other in round 2 must not split one defect into two work packages. So the key is
+// normalised rather than the pattern widened — widening would make both spellings valid and
+// different. Anything still outside the pattern after this is refused, with the rule named.
+function normalizePropertyKeys(verdict) {
+  for (const slot of SLOTS) {
+    for (const item of verdict?.[slot] || []) {
+      if (typeof item?.property_key !== 'string') continue
+      item.property_key = item.property_key.trim().toLowerCase()
+        .replace(/[_\s]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '')
+    }
+  }
+  return verdict
+}
+
+function reviewContractIssue(verdict, { criteria = [], surfaces = [], transitions = [],
+  receipt = null, claims = [], mutations = [] } = {}) {
+  const criterionIds = new Set(criteria.map((row) => row.id))
+  const surfaceIds = new Set(surfaces.map((row) => row.id))
+  const transitionById = new Map(transitions.map((row) => [row.id, row]))
+  const sources = {
+    receipts: new Set(receipt?.receipt_id ? [receipt.receipt_id] : []),
+    checks: new Set((receipt?.manifest?.checks || []).map((row) => row.id)),
+    artifacts: new Set((receipt?.artifacts || []).map((row) => row.id)),
+    claims: new Set(claims.map((row) => row.id)),
+    // Only a mutation the engine itself ran and saw turn the gate red. Unlike a claim it is
+    // trusted evidence: the executor proposed it, but the measurement is the engine's.
+    mutations: new Set(mutations.filter((row) => row.source !== 'reviewer' && row.state === 'caught')
+      .map((row) => row.id)),
+    // The same, for a reviewer's own captured mutation replayed against the new delivery.
+    reviewMutations: new Set(mutations.filter((row) => row.source === 'reviewer' &&
+      row.state === 'caught').map((row) => row.id)),
+  }
+  const survivedReview = new Set(mutations.filter((row) => row.source === 'reviewer' &&
+    row.state === 'survived').map((row) => row.id))
+  const checkRefs = (refs, label, requireTrusted = false) => {
+    if (!Array.isArray(refs) || !refs.length) return `${label} has no evidence_refs`
+    if (new Set(refs).size !== refs.length) return `${label} has duplicate evidence_refs`
+    for (const ref of refs) {
+      const issue = evidenceRefIssue(ref, sources)
+      if (issue) return `${label}: ${issue}`
+    }
+    if (requireTrusted && refs.every((ref) => ref.startsWith('executor-claim:'))) {
+      return `${label} relies only on untrusted executor claims`
+    }
+    return null
+  }
+  for (const row of verdict.criteria || []) {
+    const issue = checkRefs(row.evidence_refs, `criterion ${row.id}`, row.state === 'met')
+    if (issue) return issue
+  }
+  for (const row of verdict.carried || []) {
+    const issue = checkRefs(row.evidence_refs, `carried finding ${row.id}`)
+    if (issue) return issue
+    // The finding's own experiment, replayed by the engine on this delivery, still passes the
+    // gate. A closure would contradict the one measurement that bears on it directly.
+    if (row.state === 'closed' && survivedReview.has(row.id)) {
+      return `carried finding ${row.id} cannot be closed: the engine replayed its mutation on this` +
+        ' delivery and the gate stayed green'
+    }
+  }
+  for (const slot of SLOTS) {
+    for (const [index, item] of (verdict[slot] || []).entries()) {
+      const label = `${slot}[${index}]`
+      if (!PROPERTY_KEY_PATTERN.test(item.property_key)) {
+        return `${label} has invalid property_key ${JSON.stringify(item.property_key)}; ` +
+          `use ${PROPERTY_KEY_RULE}`
+      }
+      for (const [name, values] of Object.entries({
+        criterion_ids: item.criterion_ids,
+        surface_ids: item.surface_ids,
+        transition_ids: item.transition_ids,
+      })) {
+        if (new Set(values).size !== values.length) return `${label} has duplicate ${name}`
+      }
+      if (criterionIds.size && !item.criterion_ids.length) {
+        return `${label} is not linked to a criterion`
+      }
+      for (const id of item.criterion_ids) {
+        if (!criterionIds.has(id)) return `${label} names unknown criterion ${id}`
+      }
+      for (const id of item.surface_ids) {
+        if (!surfaceIds.has(id)) return `${label} names unknown surface ${id}`
+      }
+      for (const id of item.transition_ids) {
+        const transition = transitionById.get(id)
+        if (!transition) return `${label} names unknown transition ${id}`
+        if (!item.surface_ids.includes(transition.surface)) {
+          return `${label} does not include surface ${transition.surface} for transition ${id}`
+        }
+      }
+      const issue = checkRefs(item.evidence_refs, label)
+      if (issue) return issue
+    }
+  }
+  return null
+}
+
+function bindFindingCriteria(verdict, criteria) {
+  const byId = new Map(criteria.map((row) => [row.id, row]))
+  for (const slot of SLOTS) {
+    for (const item of verdict[slot] || []) {
+      if (item.criterion_ids?.length) continue
+      item.criterion_ids = (verdict.criteria || []).filter((row) =>
+        row.state === slot && item.evidence.includes(byId.get(row.id)?.criterion || '\0'))
+        .map((row) => row.id)
+    }
+  }
+  return verdict
+}
+
+function findingGroupSignature(item) {
+  if (!item?.property_key) return `legacy:${item?.id || createHash('sha256').update(stableJson(item)).digest('hex')}`
+  return stableJson({
+    property_key: item.property_key,
+    criterion_ids: [...(item.criterion_ids || [])].sort(),
+    surface_ids: [...(item.surface_ids || [])].sort(),
+    transition_ids: [...(item.transition_ids || [])].sort(),
+  })
+}
+
+function groupFindings(items = []) {
+  const groups = new Map()
+  for (const item of items) {
+    const signature = findingGroupSignature(item)
+    if (!groups.has(signature)) {
+      groups.set(signature, {
+        id: `wp-${createHash('sha256').update(signature).digest('hex').slice(0, 12)}`,
+        property_key: item.property_key || null,
+        criterion_ids: [...(item.criterion_ids || [])].sort(),
+        surface_ids: [...(item.surface_ids || [])].sort(),
+        transition_ids: [...(item.transition_ids || [])].sort(),
+        members: [],
+      })
+    }
+    groups.get(signature).members.push(item)
+  }
+  return [...groups.values()]
+}
 
 // A hung child used to block a run forever: `spawnSync` was called with no timeout at all.
 // Thirty minutes is roughly three times the longest call ever observed here — measured across
@@ -160,11 +737,10 @@ const MAX_GATE_RETRIES = 2 // red-gate attempts, which buy no review and spend n
 // call across a run, which nothing records today; until something does, this number is a
 // guess with a stated basis rather than a measurement.
 //
-// The gate is deliberately left without one. How long a suite runs is a property of the
-// project — one install measures 3:20, another's is seconds — so the tool has no basis to pick
-// that bound, and a wrong guess turns a passing suite into a failed run. When it is needed the
-// shape is known: a profile field, and a gate that runs out of time is `did not run` (exit 75),
-// not red.
+// Gate timeouts live in the project profile. How long a suite runs is a property of the project
+// — one install measures 3:20, another's is seconds — so the engine does not invent a default.
+// When configured, a timeout is its own state: the gate was killed before it produced a verdict,
+// which is neither red nor the gate's explicit exit-75 refusal.
 //
 // The override is an environment variable and NOT a profile field, and the distinction is the
 // one drawn just above. A suite's duration is a property of the project, so it would belong in
@@ -179,6 +755,7 @@ const MAX_GATE_RETRIES = 2 // red-gate attempts, which buy no review and spend n
 // — which breaks the byte-identity every install checks its version by. The measurement was
 // blocked by the thing that makes installs verifiable.
 const AGENT_TIMEOUT_DEFAULT_MS = 30 * 60 * 1000
+const GATE_TIMEOUT_MAX_MS = 2_147_483_647
 const AGENT_TIMEOUT_MS = (() => {
   const raw = process.env.CAW_AGENT_TIMEOUT_MS
   if (raw === undefined || raw.trim() === '') return AGENT_TIMEOUT_DEFAULT_MS
@@ -313,9 +890,106 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.1.0'
+const VERSION = '0.2.0-dev'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
+const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
+  request: 256,
+  planning: 16,
+  task: 16,
+  unknownCost: 256,
+  role: 128,
+})
+
+function resolveProviderBudgets(fields = {}) {
+  const read = (key, fallback) => {
+    const raw = fields[key]
+    if (raw === undefined || raw === '') return fallback
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new TypeError(`${key} must be a positive whole number`)
+    }
+    return value
+  }
+  return {
+    request_calls: read('budget_request_calls', PROVIDER_BUDGET_DEFAULTS.request),
+    planning_calls: read('budget_planning_calls', PROVIDER_BUDGET_DEFAULTS.planning),
+    task_calls: read('budget_task_calls', PROVIDER_BUDGET_DEFAULTS.task),
+    unknown_cost_calls: read('budget_unknown_cost_calls', PROVIDER_BUDGET_DEFAULTS.unknownCost),
+    role_calls: Object.fromEntries(ROLES.map((role) => [role,
+      read(`budget_${role.replaceAll('-', '_')}_calls`, PROVIDER_BUDGET_DEFAULTS.role)])),
+  }
+}
+
+let providerBudgetState = {
+  command: null,
+  phase: null,
+  task: null,
+  request_calls: 0,
+  planning_calls: 0,
+  task_calls: 0,
+  unknown_cost_calls: 0,
+  role_calls: Object.fromEntries(ROLES.map((role) => [role, 0])),
+  limits: null,
+}
+
+function providerBudgetSnapshot() {
+  return {
+    command: providerBudgetState.command,
+    phase: providerBudgetState.phase,
+    task: providerBudgetState.task,
+    limits: providerBudgetState.limits,
+    consumed: {
+      request_calls: providerBudgetState.request_calls,
+      planning_calls: providerBudgetState.planning_calls,
+      task_calls: providerBudgetState.task_calls,
+      unknown_cost_calls: providerBudgetState.unknown_cost_calls,
+      role_calls: { ...providerBudgetState.role_calls },
+    },
+  }
+}
+
+function setProviderBudgetPhase(phase, task = null) {
+  providerBudgetState.phase = phase
+  if (task !== providerBudgetState.task) {
+    providerBudgetState.task = task
+    providerBudgetState.task_calls = 0
+  }
+}
+
+function providerBudgetIssue(role, limits) {
+  const checks = [
+    ['budget_request_calls', providerBudgetState.request_calls, limits.request_calls],
+    ...(providerBudgetState.phase === 'planning'
+      ? [['budget_planning_calls', providerBudgetState.planning_calls, limits.planning_calls]] : []),
+    ...(providerBudgetState.task
+      ? [['budget_task_calls', providerBudgetState.task_calls, limits.task_calls]] : []),
+    [`budget_${role.replaceAll('-', '_')}_calls`, providerBudgetState.role_calls[role],
+      limits.role_calls[role]],
+    ['budget_unknown_cost_calls', providerBudgetState.unknown_cost_calls,
+      limits.unknown_cost_calls],
+  ]
+  const reached = checks.find(([, used, limit]) => used >= limit)
+  return reached
+    ? `${reached[0]} reached (${reached[1]}/${reached[2]}); no ${role} provider call was started`
+    : null
+}
+
+function reserveProviderBudget(role, limits) {
+  const issue = providerBudgetIssue(role, limits)
+  if (issue) throw new Error(issue)
+  providerBudgetState.limits = limits
+  providerBudgetState.request_calls += 1
+  if (providerBudgetState.phase === 'planning') providerBudgetState.planning_calls += 1
+  if (providerBudgetState.task) providerBudgetState.task_calls += 1
+  providerBudgetState.role_calls[role] += 1
+}
+
+function settleProviderBudget(attempt, cost) {
+  if (attempt.budgetSettled) return
+  attempt.budgetSettled = true
+  if (cost === null || cost === undefined) providerBudgetState.unknown_cost_calls += 1
+}
 const LEGACY_RUNTIME_FIELDS = [
   'model_architect', 'model_executor', 'model_reviewer', 'effort', 'permission_mode',
 ]
@@ -345,7 +1019,7 @@ function providerLaunch(executable, platformName = process.platform, providerId 
 }
 
 const ADAPTER_KEYS = [
-  'apiVersion', 'id', 'features', 'resolveExecutable', 'versionInvocation',
+  'apiVersion', 'id', 'vendor', 'features', 'resolveExecutable', 'versionInvocation',
   'mechanismAvailable', 'verifyGuaranteeProbe', 'describe', 'buildInvocation', 'buildProbeInvocation',
   'decodeSuccess', 'decodeFailure',
 ]
@@ -354,6 +1028,49 @@ const PROBE_REASON_MAX = 8 * 1024
 const PROBE_REASON_VALUE_MAX = 3 * 1024
 const PROBE_REASON_SUMMARY_MAX = 320
 const PROBE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+
+function adapterImplementationDigest(directory, adapterName = 'adapter') {
+  const hash = createHash('sha256')
+  const walk = (current, prefix = '') => {
+    for (const name of readdirSync(current).sort()) {
+      // Legacy releases could ship probe evidence beside adapter.mjs. Evidence is an output of
+      // the implementation and contains its digest, so including it would be circular. Current
+      // machine-local evidence lives under Git's private caw/probes path.
+      const path = join(current, name)
+      const item = lstatSync(path)
+      const relativePath = prefix ? `${prefix}/${name}` : name
+      if (item.isSymbolicLink()) {
+        throw new Error(`adapter ${adapterName} contains unsupported symlink ${relativePath}`)
+      }
+      if (!prefix && name === 'probes') {
+        if (!item.isDirectory()) {
+          throw new Error(`adapter ${adapterName} has malformed legacy probes evidence`)
+        }
+        for (const evidenceName of readdirSync(path)) {
+          const evidence = lstatSync(join(path, evidenceName))
+          if (!evidenceName.endsWith('.json') || !evidence.isFile() || evidence.isSymbolicLink()) {
+            throw new Error(`adapter ${adapterName} has unsupported probes entry ${evidenceName}`)
+          }
+        }
+        continue
+      }
+      if (item.isDirectory()) {
+        walk(path, relativePath)
+        continue
+      }
+      if (!item.isFile()) {
+        throw new Error(`adapter ${adapterName} contains unsupported entry ${relativePath}`)
+      }
+      const bytes = readFileSync(path)
+      // Length prefixes make the stream unambiguous without depending on platform path syntax.
+      hash.update(`${Buffer.byteLength(relativePath)}:${relativePath}:`)
+      hash.update(`${item.mode & 0o777}:${bytes.length}:`)
+      hash.update(bytes)
+    }
+  }
+  walk(directory)
+  return hash.digest('hex')
+}
 
 async function discoverAdapters() {
   const root = resolve('.caw/adapters')
@@ -367,22 +1084,27 @@ async function discoverAdapters() {
     if (!existsSync(modulePath) || !inside(canonicalRoot, realpathSync(modulePath))) {
       die(`adapter ${name} is missing its trusted adapter.mjs`)
     }
-    const source = readFileSync(modulePath)
-    const digest = createHash('sha256').update(source).digest('hex')
+    let digest
+    try { digest = adapterImplementationDigest(directory, name) }
+    catch (error) { die(error?.message || String(error)) }
     let adapter
     try { adapter = (await import(`${pathToFileURL(modulePath).href}?sha256=${digest}`)).default }
     catch (error) { die(`adapter ${name} failed to load: ${error?.message || error}`) }
     if (!adapter || typeof adapter !== 'object') die(`adapter ${name} has no default contract object`)
     const extra = Object.keys(adapter).filter((key) => !ADAPTER_KEYS.includes(key))
     const missing = ADAPTER_KEYS.filter((key) => !Object.prototype.hasOwnProperty.call(adapter, key))
-    const versionMismatch = adapter.apiVersion !== 2
+    const versionMismatch = adapter.apiVersion !== 3
     if (extra.length || missing.length || versionMismatch || adapter.id !== name) {
       die(`adapter ${name} has malformed contract` +
-        `${versionMismatch ? `; API version is ${JSON.stringify(adapter.apiVersion)}, expected 2` : ''}` +
+        `${versionMismatch ? `; API version is ${JSON.stringify(adapter.apiVersion)}, expected 3` : ''}` +
         `${missing.length ? `; missing ${missing.join(', ')}` : ''}` +
         `${extra.length ? `; unknown ${extra.join(', ')}` : ''}`)
     }
-    for (const fn of ADAPTER_KEYS.filter((key) => !['apiVersion', 'id', 'features'].includes(key))) {
+    if (typeof adapter.vendor !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(adapter.vendor)) {
+      die(`adapter ${name}.vendor must be a stable lowercase vendor id`)
+    }
+    for (const fn of ADAPTER_KEYS.filter((key) =>
+      !['apiVersion', 'id', 'vendor', 'features'].includes(key))) {
       if (typeof adapter[fn] !== 'function') die(`adapter ${name}.${fn} must be a function`)
     }
     if (adapters.has(name)) die(`duplicate adapter id ${name}`)
@@ -464,6 +1186,60 @@ function localProbeRoot() {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim())
   } catch { return null }
+}
+
+function localRoleSmokeRoot() {
+  try {
+    return resolve(execFileSync('git', ['rev-parse', '--git-path', 'caw/role-smoke'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim())
+  } catch { return null }
+}
+
+function engineDigest() {
+  return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex')
+}
+
+function roleSmokeKey(role, binding, provider) {
+  return {
+    version: 1,
+    role,
+    provider: binding.provider,
+    model: binding.model,
+    reasoning: binding.reasoning,
+    adapter_digest: provider.adapter.digest,
+    cli_version: provider.cliVersion,
+    executable: canonicalExecutable(provider.executable),
+    engine_digest: engineDigest(),
+  }
+}
+
+function currentRoleSmoke(role, binding, provider) {
+  const root = localRoleSmokeRoot()
+  if (!root) return null
+  const path = join(root, `${role}.json`)
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > PROBE_ATTESTATION_MAX) return null
+    const value = JSON.parse(readFileSync(path, 'utf8'))
+    const key = roleSmokeKey(role, binding, provider)
+    return value.green === true && Object.entries(key).every(([name, expected]) =>
+      value[name] === expected) ? value : null
+  } catch { return null }
+}
+
+function writeRoleSmoke(role, value) {
+  const root = localRoleSmokeRoot()
+  if (!root) die('role smoke evidence requires a Git repository')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const target = join(root, `${role}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+  if (bytes.length > PROBE_ATTESTATION_MAX) die('role smoke evidence exceeds its storage bound')
+  writeFileSync(temp, bytes, { mode: 0o600, flag: 'wx' })
+  renameSync(temp, target)
+  try { chmodSync(root, 0o700); chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  return target
 }
 
 // What an attestation is allowed to be about. `cli_version` is deliberately NOT here, and that
@@ -566,6 +1342,35 @@ function boundedUtf8(value, maxBytes) {
   let end = Math.min(text.length, maxBytes)
   while (end > 0 && Buffer.byteLength(text.slice(0, end)) > maxBytes) end -= 1
   return { text: text.slice(0, end), truncated: true }
+}
+
+function boundedUtf8Tail(value, maxBytes) {
+  const text = String(value)
+  if (Buffer.byteLength(text) <= maxBytes) return text
+  let start = Math.max(0, text.length - maxBytes)
+  while (start < text.length && Buffer.byteLength(text.slice(start)) > maxBytes) start += 1
+  return text.slice(start)
+}
+
+// For command output, where the verdict is at the end. A gate prints the step that failed and its
+// error last, so a head-only bound keeps the preamble and drops the one line anyone needs.
+// Measured on one install: a red fast gate wrote 78,908 bytes, its located compile error sat at
+// byte 78,601, and the executor's dossier kept the first 24 KB — CAW self-tests, build warnings,
+// half a lint report. Two executor variants spent 3 and 9 retries against a red gate whose cause
+// they were never shown; it was one stray `!`. A small head stays, because the start of a log
+// says which command and which configuration produced it; the rest of the budget is the tail, and
+// the marker says exactly how much was cut from where.
+function boundedUtf8HeadTail(value, maxBytes, headBytes = Math.floor(maxBytes / 8)) {
+  const text = String(value)
+  const total = Buffer.byteLength(text)
+  if (total <= maxBytes) return { text, truncated: false, elidedBytes: 0 }
+  const markerFor = (elided) => `\n[… ${elided} bytes elided from the middle …]\n`
+  const markerMax = Buffer.byteLength(markerFor(total))
+  const head = boundedUtf8(text, Math.max(0, Math.min(headBytes, maxBytes - markerMax))).text
+  const tailBudget = Math.max(0, maxBytes - Buffer.byteLength(head) - markerMax)
+  const tail = boundedUtf8Tail(text, tailBudget)
+  const elided = total - Buffer.byteLength(head) - Buffer.byteLength(tail)
+  return { text: `${head}${markerFor(elided)}${tail}`, truncated: true, elidedBytes: elided }
 }
 
 function decodedProbeAnswer(decoded) {
@@ -799,13 +1604,22 @@ function validateDescriptor(role, descriptor) {
   }
   exact(descriptor, ['features', 'guarantees'], `${role} adapter descriptor`)
   exact(descriptor.features,
-    ['schemaTransport', 'resultTransport', 'reportsCost', 'reportsCacheCounters', 'reportsModels'],
+    ['schemaTransport', 'resultTransport', 'reportsCost', 'reportsCacheCounters', 'reportsModels',
+      'modelSelection', 'reasoningLevels'],
     `${role} features`)
   if (!['inline', 'file'].includes(descriptor.features.schemaTransport)) {
     die(`${role} adapter has unsupported schema transport ${descriptor.features.schemaTransport}`)
   }
   if (!['stdout', 'file'].includes(descriptor.features.resultTransport)) {
     die(`${role} adapter has unsupported result transport ${descriptor.features.resultTransport}`)
+  }
+  if (descriptor.features.modelSelection !== 'explicit-id') {
+    die(`${role} adapter must support explicit model ids`)
+  }
+  if (!Array.isArray(descriptor.features.reasoningLevels) ||
+      descriptor.features.reasoningLevels.some((level) => !REASONING.has(level)) ||
+      new Set(descriptor.features.reasoningLevels).size !== descriptor.features.reasoningLevels.length) {
+    die(`${role} adapter has malformed reasoningLevels`)
   }
   exact(descriptor.guarantees,
     ['repositoryRead', 'directEdit', 'shellExecution', 'externalToolAccess', 'writeScope',
@@ -917,7 +1731,50 @@ function compareGuarantees(role, descriptor, provider, missingEvidence = null) {
   }
 }
 
-function preflightRuntime(f) {
+function reviewIndependence(mode, authorRole, reviewerRole, recordedAuthor = undefined) {
+  const participant = (role) => {
+    const binding = resolvedRuntime.value.roles[role]
+    const adapter = adapters.get(binding.provider)
+    return {
+      role,
+      provider: binding.provider,
+      vendor: adapter?.vendor || binding.provider,
+      model: binding.model,
+    }
+  }
+  const authorAdapter = recordedAuthor && adapters.get(recordedAuthor.provider)
+  const author = recordedAuthor === undefined ? participant(authorRole) : {
+    role: authorRole,
+    provider: recordedAuthor?.provider || null,
+    // Older records can borrow vendor identity only from the exact adapter they used.
+    vendor: recordedAuthor?.vendor || (authorAdapter?.digest === recordedAuthor?.adapter_digest
+      ? authorAdapter?.vendor : null) || null,
+    model: recordedAuthor?.requested?.model || null,
+  }
+  const reviewer = participant(reviewerRole)
+  const scope = authorRole === 'architect' ? 'planning' : 'task'
+  if (mode === 'human-review') {
+    return {
+      scope, mode, author, reviewer: { kind: 'human', role: reviewerRole }, satisfied: true,
+      reason: 'Automated approval is disabled; a signed human attestation is required.',
+    }
+  }
+  const authorKnown = Boolean(author.vendor && author.model)
+  const satisfied = mode === 'same-provider'
+    || (mode === 'different-model' && authorKnown &&
+      (author.vendor !== reviewer.vendor || author.model !== reviewer.model))
+    || (mode === 'cross-vendor' && authorKnown && author.vendor !== reviewer.vendor)
+  return {
+    scope, mode, author, reviewer, satisfied,
+    reason: satisfied ? '' : !authorKnown
+      ? 'The recorded author is unknown; run a fresh executor round or use signed human review.'
+      : mode === 'cross-vendor'
+      ? 'Select adapters owned by different vendors.'
+      : 'Select a different model or a different vendor for the reviewer.',
+  }
+}
+
+function preflightRuntime(f, skipRoleSmoke = false) {
   if (!resolvedRuntime) resolvedRuntime = loadRuntime(f)
   if (!resolvedRuntime.providers) {
     resolvedRuntime.providers = new Map()
@@ -942,9 +1799,12 @@ function preflightRuntime(f) {
     for (const role of ROLES) {
       const binding = resolvedRuntime.value.roles[role]
       const provider = resolvedRuntime.providers.get(binding.provider)
-      compareGuarantees(role,
-        provider.adapter.describe({ role, cliVersion: provider.cliVersion }), provider,
-        missingEvidence)
+      const descriptor = provider.adapter.describe({ role, cliVersion: provider.cliVersion })
+      compareGuarantees(role, descriptor, provider, missingEvidence)
+      if (!descriptor.features.reasoningLevels.includes(binding.reasoning)) {
+        die(`${role} requests reasoning=${binding.reasoning}, but adapter ${binding.provider} ` +
+          `supports ${descriptor.features.reasoningLevels.join(', ')}`)
+      }
     }
     if (missingEvidence.length) {
       const providers = [...new Set(missingEvidence.map((entry) => entry.provider))]
@@ -954,6 +1814,31 @@ function preflightRuntime(f) {
           `  Run: node caw.mjs probe ${provider}`).join('\n'))
     }
   }
+  if (f.require_role_smoke && !skipRoleSmoke) {
+    const missingSmoke = ROLES.filter((role) => {
+      const binding = resolvedRuntime.value.roles[role]
+      return !currentRoleSmoke(role, binding, resolvedRuntime.providers.get(binding.provider))
+    })
+    if (missingSmoke.length) {
+      die('runtime lacks role smoke evidence for the exact model/reasoning binding:\n' +
+        missingSmoke.map((role) => `  - ${role}`).join('\n') +
+        '\n  Recovery: node caw.mjs smoke all')
+    }
+  }
+  const independence = [
+    reviewIndependence(f.planning_independence, 'architect', 'plan-reviewer'),
+    // A review-only invocation judges the saved author, resolved in runTask, not a future executor.
+    ...(providerBudgetState.command === 'review' ? []
+      : [reviewIndependence(f.task_independence, 'executor', 'reviewer')]),
+  ]
+  const independenceFailure = independence.find((entry) => !entry.satisfied)
+  if (independenceFailure) {
+    die(`${independenceFailure.scope} independence requires ${independenceFailure.mode}; actual pair is ` +
+      `${independenceFailure.author.vendor}/${independenceFailure.author.model} -> ` +
+      `${independenceFailure.reviewer.vendor}/${independenceFailure.reviewer.model}. ` +
+      independenceFailure.reason)
+  }
+  resolvedRuntime.independence = independence
   if (!resolvedRuntime.printed) {
     say(`runtime ${resolvedRuntime.digest}`)
     for (const role of ROLES) {
@@ -963,6 +1848,13 @@ function preflightRuntime(f) {
         ` adapter=${provider.adapter.digest.slice(0, 12)} CLI=${provider.cliVersion}`)
     }
     for (const line of observedProbeDrift) say(line)
+    for (const entry of independence) {
+      const reviewerLabel = entry.reviewer.kind === 'human'
+        ? 'signed-human-attestation'
+        : `${entry.reviewer.vendor}/${entry.reviewer.model}`
+      say(`  ${entry.scope} independence: ${entry.mode} — ${entry.author.vendor}/${entry.author.model}` +
+        ` -> ${reviewerLabel}`)
+    }
     resolvedRuntime.printed = true
   }
   printRuntimeResiduals({ runtime: resolvedRuntime.value })
@@ -997,8 +1889,63 @@ const TASK = {
     read: { type: 'array', items: { type: 'string' } },
     change: { type: 'array', items: { type: 'string' } },
     done_when: { type: 'array', items: { type: 'string' } },
+    gate_checks: {
+      type: 'array',
+      description: 'stable check ids the task gate must report as passed before review',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'stable kebab-case gate check id' },
+          description: { type: 'string' },
+        },
+        required: ['id', 'description'],
+      },
+    },
+    surfaces: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'stable kebab-case surface id' },
+          responsibility: { type: 'string', description: 'one independently changeable responsibility' },
+        },
+        required: ['id', 'responsibility'],
+      },
+    },
+    state_machines: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          surface: { type: 'string', description: 'id of exactly one surface in this task' },
+          states: { type: 'array', minItems: 2, items: { type: 'string' } },
+          transitions: {
+            type: 'array', minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                from: { type: 'string' }, event: { type: 'string' }, to: { type: 'string' },
+              },
+              required: ['from', 'event', 'to'],
+            },
+          },
+        },
+        required: ['surface', 'states', 'transitions'],
+      },
+    },
+    indivisible_reason: {
+      type: 'string',
+      description: 'empty for one surface; for several surfaces, why they cannot be separate tasks',
+    },
+    executor_budget: {
+      type: 'string', enum: EXECUTOR_BUDGET_CLASSES,
+      description: 'small for one bounded local surface, normal for an ordinary feature, large ' +
+        'for cross-layer, database, authorization, security, credential, or migration work. ' +
+        'The engine may raise this proposal but never lower it.',
+    },
   },
-  required: ['slug', 'title', 'read', 'change', 'done_when'],
+  required: ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
+    'indivisible_reason', 'executor_budget'],
 }
 
 // One shape for every blocking slot of a task verdict. `where` and `fix` are what the executor
@@ -1011,13 +1958,36 @@ const REVIEW_ITEM = {
   properties: {
     where: { type: 'string', description: 'path, and a line number or a symbol' },
     fix: { type: 'string', description: 'the concrete change to make. One item, one change.' },
+    criterion_ids: {
+      type: 'array', items: { type: 'string' },
+      description: 'engine criterion ids whose property this finding blocks',
+    },
+    surface_ids: {
+      type: 'array', items: { type: 'string' },
+      description: 'engine surface ids involved in the same root cause',
+    },
+    transition_ids: {
+      type: 'array', items: { type: 'string' },
+      description: 'engine transition ids involved in the same root cause',
+    },
+    property_key: {
+      type: 'string',
+      description: 'stable project-independent key for the violated property; not prose ' +
+        'similarity. Lowercase letters, digits, dots and hyphens, starting with a letter, e.g. ' +
+        'replay.refused-batch-stays-refused',
+    },
     evidence: {
       type: 'string',
       description: 'what you ran, mutated or quoted to establish this — on the tree in front ' +
         'of you, naming it. Not an argument that it is probably so.',
     },
+    evidence_refs: {
+      type: 'array', items: { type: 'string' },
+      description: 'stable receipt, check, artifact, claim, repository, or experiment references',
+    },
   },
-  required: ['where', 'fix', 'evidence'],
+  required: ['where', 'fix', 'criterion_ids', 'surface_ids', 'transition_ids', 'property_key',
+    'evidence', 'evidence_refs'],
 }
 
 // A block must NAME what cannot be done: the refusal prints it as the reason and a human acts on
@@ -1035,8 +2005,23 @@ const NO_BLOCK = new Set([
   'nothing blocked', 'nothing blocked me', 'nothing to report', 'nothing blocked this',
   'ok', 'done', 'completed', 'complete', 'success',
 ])
+// Quoting is unwrapped before anything is judged. A role writing `""` for "nothing" is writing
+// the empty string in the notation it was thinking in, not a reason, and neither is `"none"`.
+// Measured on one install: an executor returned `blocked` as exactly two quote characters on a
+// complete delivery whose gate was green — status success, terminal_reason completed, summary,
+// claims and notes all present — and this predicate read those two characters as a reason. The
+// branch it guards runs before the gate, so the delivery went to a blocked patch with no gate
+// and no reviewer, under a message telling the operator to clear the tree.
+const unquotedBlocker = (s) => {
+  let t = String(s || '').trim()
+  for (;;) {
+    const m = t.match(/^(["'`])([\s\S]*)\1$/)
+    if (!m) return t
+    t = m[2].trim()
+  }
+}
 const blocked = (s) => {
-  const t = (s || '').trim().toLowerCase().replace(/[.!]+$/, '').replace(/\s+/g, ' ')
+  const t = unquotedBlocker(s).toLowerCase().replace(/[.!]+$/, '').replace(/\s+/g, ' ')
   return t && !/^[-\u2013\u2014]+$/.test(t) && !NO_BLOCK.has(t) ? s : ''
 }
 
@@ -1107,8 +2092,14 @@ const SCHEMA = closeSchema({
           properties: {
             case: { type: 'string', description: 'a case, state, input or surface the request implies' },
             task: { type: 'string', description: 'slug of the task that handles it' },
+            acceptance_criteria: {
+              type: 'array', minItems: 1,
+              items: { type: 'string' },
+              description: 'one or more exact done_when strings from that task which make this ' +
+                'case checkable on the final tree',
+            },
           },
-          required: ['case', 'task'],
+          required: ['case', 'task', 'acceptance_criteria'],
         },
       },
       blocked: {
@@ -1137,6 +2128,22 @@ const SCHEMA = closeSchema({
   planReview: {
     type: 'object',
     properties: {
+      relations: {
+        type: 'array',
+        description: 'exactly one disposition for every engine-assigned relation id',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned relation id' },
+            state: { type: 'string', enum: ['covered', 'uncovered'] },
+            evidence: {
+              type: 'string',
+              description: 'why the linked acceptance criteria do or do not establish this case',
+            },
+          },
+          required: ['id', 'state', 'evidence'],
+        },
+      },
       uncovered: {
         type: 'array', items: { type: 'string' },
         description: 'a case the request implies that no task handles',
@@ -1159,8 +2166,30 @@ const SCHEMA = closeSchema({
           'This goes to the human, not to another round. List every one you can see: the run ' +
           'ends on the first anyway, so a question left out costs the human a whole run to find.',
       },
+      carried: {
+        type: 'array',
+        description: 'exactly one row for every earlier hole the engine hands you by id; empty ' +
+          'when it hands you none',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned id of the earlier hole' },
+            state: {
+              type: 'string', enum: ['closed', 'open', 'withdrawn'],
+              description: 'closed — the specs now close it. open — they do not. withdrawn — it ' +
+                'was wrong when raised, and you are retracting it.',
+            },
+            evidence: {
+              type: 'string',
+              description: 'what in the specs in front of you decides THIS state; "fixed" is not one',
+            },
+          },
+          required: ['id', 'state', 'evidence'],
+        },
+      },
     },
-    required: ['uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable'],
+    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable',
+      'carried'],
   },
 
   // A source is an address the engine can resolve, not a model's assertion that it looked
@@ -1187,8 +2216,27 @@ const SCHEMA = closeSchema({
           required: ['case', 'source'],
         },
       },
+      request_issues: {
+        type: 'array',
+        description: 'every request/profile/canonical-doc conflict or product question the ' +
+          'request assumes settled but project authority does not settle. Empty when the ' +
+          'request is ready for an architect.',
+        items: {
+          type: 'object',
+          properties: {
+            issue: { type: 'string' },
+            request_source: POPULATION_SOURCE_SCHEMA,
+            authority_sources: {
+              type: 'array', minItems: 1, items: POPULATION_SOURCE_SCHEMA,
+              description: 'exact profile or canonical-document excerpts that conflict with, ' +
+                'or fail to settle, the request premise',
+            },
+          },
+          required: ['issue', 'request_source', 'authority_sources'],
+        },
+      },
     },
-    required: ['cases'],
+    required: ['cases', 'request_issues'],
   },
 
   // Typed slots, for the reason stated over `planReview` and against the measurement that the
@@ -1216,6 +2264,32 @@ const SCHEMA = closeSchema({
   verdict: {
     type: 'object',
     properties: {
+      criteria: {
+        type: 'array',
+        description: 'the atomic review census: exactly one row for every engine-listed Must ' +
+          'cover, Change, and Done when criterion. Missing, duplicate, or unknown ids invalidate ' +
+          'the response.',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'the engine-assigned criterion id' },
+            state: {
+              type: 'string', enum: ['met', 'broken', 'uncovered', 'weak'],
+              description: 'met only when the shipped consumer and meaningful verification ' +
+                'establish the criterion; otherwise name the blocking slot that carries it',
+            },
+            evidence: {
+              type: 'string',
+              description: 'what was traced, read, or experimentally checked for this criterion',
+            },
+            evidence_refs: {
+              type: 'array', items: { type: 'string' },
+              description: 'stable references for the evidence used in this disposition',
+            },
+          },
+          required: ['id', 'state', 'evidence', 'evidence_refs'],
+        },
+      },
       // Empty on round 1 — there is nothing to carry. From round 2 on it must hold one entry
       // per item this task still has open, and the loop refuses a verdict that skips any.
       carried: {
@@ -1234,8 +2308,15 @@ const SCHEMA = closeSchema({
               description: 'what you ran or read to decide THIS state, on the tree in front of ' +
                 'you. Closing your own item is a claim like any other; "addressed" is not one.',
             },
+            evidence_refs: { type: 'array', items: { type: 'string' } },
+            criterion_ids: {
+              type: 'array', items: { type: 'string' },
+              description: 'engine criterion ids this open item blocks NOW, beyond the ones it ' +
+                'was raised with. Empty unless this entry is the blocking item for a criterion ' +
+                'it was not raised against; meaningless on closed and withdrawn.',
+            },
           },
-          required: ['id', 'state', 'evidence'],
+          required: ['id', 'state', 'evidence', 'evidence_refs', 'criterion_ids'],
         },
       },
       broken: {
@@ -1244,7 +2325,7 @@ const SCHEMA = closeSchema({
       },
       uncovered: {
         type: 'array', items: REVIEW_ITEM,
-        description: "a line of the spec's `## Done when` or `## Must cover` that the tree does " +
+        description: "a line of the spec's `## Must cover`, `## Change`, or `## Done when` that the tree does " +
           'not meet. Quote the line in `evidence`.',
       },
       weak: {
@@ -1280,13 +2361,54 @@ const SCHEMA = closeSchema({
           'here everything you would otherwise be tempted to block on "while we are here".',
       },
     },
-    required: ['carried', 'broken', 'uncovered', 'weak', 'noted'],
+    required: ['criteria', 'carried', 'broken', 'uncovered', 'weak', 'noted'],
   },
   delivery: {
     type: 'object',
     properties: {
       summary: { type: 'string' },
       notes: { type: 'array', items: { type: 'string' } },
+      claims: {
+        type: 'array',
+        description: 'untrusted executor-reported checks. The engine retains them as navigation ' +
+          'hints and never upgrades them into gate evidence. Use an empty array rather than ' +
+          'inventing criterion or acceptance-case ids; the engine gate supplies acceptance proof.',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            criterion_ids: { type: 'array', items: { type: 'string' } },
+            acceptance_case_ids: { type: 'array', items: { type: 'string' } },
+            command: { type: 'string' },
+            selector: { type: 'string' },
+            result: { type: 'string', enum: ['passed', 'failed', 'not-run'] },
+            summary: { type: 'string' },
+            artifact_refs: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['id', 'criterion_ids', 'acceptance_case_ids', 'command', 'selector',
+            'result', 'summary', 'artifact_refs'],
+        },
+      },
+      mutations: {
+        type: 'array',
+        description: 'mutations of the shipped code your tests must catch. The engine applies ' +
+          'each one to a disposable copy of your delivery, runs the fast gate outside your ' +
+          'write boundary and reports it caught (gate red) or survived (gate green). `find` ' +
+          'must occur exactly once in `path`; it is replaced by `replace`. A survived mutation ' +
+          `comes back to you before any reviewer sees the delivery. At most ${EXECUTOR_MUTATIONS_MAX}.`,
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            criterion_ids: { type: 'array', items: { type: 'string' } },
+            path: { type: 'string' },
+            find: { type: 'string' },
+            replace: { type: 'string' },
+            breaks: { type: 'string' },
+          },
+          required: ['id', 'criterion_ids', 'path', 'find', 'replace', 'breaks'],
+        },
+      },
       blocked: {
         type: 'string',
         description: 'THE EMPTY STRING when you did the task. Fill it only to name what ' +
@@ -1294,8 +2416,159 @@ const SCHEMA = closeSchema({
           'placeholder: anything here stops the run.',
       },
     },
-    required: ['summary', 'notes', 'blocked'],
+    required: ['summary', 'notes', 'claims', 'mutations', 'blocked'],
   },
+})
+
+const PROJECT_POLICY_OUTPUT_SCHEMAS = Object.freeze({
+  planning: closeSchema({
+    type: 'object',
+    properties: {
+      issues: { type: 'array', items: { type: 'string' } },
+      instructions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['issues', 'instructions'],
+  }),
+  review: closeSchema({
+    type: 'object',
+    properties: {
+      criteria: {
+        type: 'array', items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            section: { type: 'string' },
+            criterion: { type: 'string' },
+          },
+          required: ['id', 'section', 'criterion'],
+        },
+      },
+      instructions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['criteria', 'instructions'],
+  }),
+  gate: closeSchema({
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['continue', 'stop'] },
+      reason: { type: 'string' },
+    },
+    required: ['action', 'reason'],
+  }),
+  commit: closeSchema({
+    type: 'object',
+    properties: { subject: { type: 'string' } },
+    required: ['subject'],
+  }),
+})
+
+const PROJECT_POLICY_V2_PLANNING_REQUEST_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    issues: { type: 'array', items: { type: 'string' } },
+    instructions: { type: 'array', items: { type: 'string' } },
+    risk: {
+      type: 'object',
+      properties: {
+        class: { type: 'string' },
+        population_requirement: { type: 'string', enum: ['none', 'sample', 'complete'] },
+        require_full_gate_baseline: { type: 'boolean' },
+      },
+      required: ['class', 'population_requirement', 'require_full_gate_baseline'],
+    },
+  },
+  required: ['issues', 'instructions', 'risk'],
+})
+
+const PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    issues: { type: 'array', items: { type: 'string' } },
+    instructions: { type: 'array', items: { type: 'string' } },
+    attestation: {
+      type: 'object',
+      properties: {
+        state: { type: 'string', enum: ['none', 'sample', 'complete'] },
+        population_digest: { type: 'string' },
+        evidence: { type: 'string' },
+      },
+      required: ['state', 'population_digest', 'evidence'],
+    },
+  },
+  required: ['issues', 'instructions', 'attestation'],
+})
+
+const PROJECT_POLICY_V2_GATE_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['continue', 'stop', 'retry'] },
+    reason: { type: 'string' },
+    classification: {
+      type: 'string', enum: ['defect', 'flaky', 'infrastructure', 'unknown'],
+    },
+    baseline_inputs_digest: { type: 'string' },
+  },
+  required: ['action', 'reason'],
+})
+
+const PROJECT_POLICY_V3_ACCEPTANCE_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    cases: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          criterion_ids: { type: 'array', minItems: 1, items: { type: 'string' } },
+          surface_id: { type: 'string' },
+          transition_id: { type: 'string' },
+          production_consumer: { type: 'string' },
+          scenario: { type: 'string' },
+          observable: { type: 'string' },
+          mutation: { type: 'string' },
+          evidence_kind: { type: 'string' },
+          selector: { type: 'string' },
+        },
+        required: ['id', 'criterion_ids', 'surface_id', 'transition_id', 'production_consumer',
+          'scenario', 'observable', 'mutation', 'evidence_kind', 'selector'],
+      },
+    },
+  },
+  required: ['cases'],
+})
+
+const GATE_EVIDENCE_MANIFEST_SCHEMA = closeSchema({
+  type: 'object',
+  properties: {
+    version: { type: 'number', enum: [1] },
+    checks: {
+      type: 'array', maxItems: GATE_EVIDENCE_CHECKS_MAX,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          criterion_ids: { type: 'array', items: { type: 'string' } },
+          acceptance_case_ids: { type: 'array', items: { type: 'string' } },
+          selector: { type: 'string' },
+          evidence_kind: { type: 'string' },
+          state: { type: 'string', enum: ['passed', 'failed', 'skipped'] },
+          summary: { type: 'string' },
+          artifacts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { id: { type: 'string' }, path: { type: 'string' } },
+              required: ['id', 'path'],
+            },
+          },
+        },
+        required: ['id', 'criterion_ids', 'acceptance_case_ids', 'selector', 'evidence_kind', 'state',
+          'summary', 'artifacts'],
+      },
+    },
+  },
+  required: ['version', 'checks'],
 })
 
 // ---------------------------------------------------------------- infrastructure
@@ -1326,10 +2599,12 @@ const ENGINE_DIAGNOSTIC_MAX = 16 * 1024
 // but make a pathological queue bounded and say how much evidence was not retained.
 const WEAK_VERIFICATION_EVENTS_RETAINED = 32
 const ROUND_STATE_MAX = 8 * 1024 * 1024
+const REVIEW_PRIOR_NOTED_MAX = 12 * 1024
 const BLOCKED_PATCH_MAX = 64 * 1024 * 1024
 const DIVERGED_SPEC_MAX = 1024 * 1024
 const REVIEW_SURFACE_MAX = 2 * 1024 * 1024 * 1024
 const REVIEW_SURFACE_PARENT = join(tmpdir(), 'caw-review-surfaces')
+const WEAK_CONTROL_TIMEOUT_DEFAULT_MS = 5000
 const ADAPTER_TRANSPORT_MAX = 64 * 1024 * 1024
 const ADAPTER_TRANSPORT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const ADAPTER_TRANSPORT_MAX_COUNT = 3
@@ -1337,7 +2612,114 @@ const ADAPTER_TRANSPORT_PARENT = join(tmpdir(), 'caw-adapter-transports')
 const INVOCATION_SCRATCH_PARENT = join(tmpdir(), 'caw-invocation-scratch')
 const ACTIVE_REVIEW_SURFACES = new Map()
 const ACTIVE_INVOCATION_SCRATCH = new Set()
+const PROJECT_POLICY_MANIFEST = join('.caw', 'project', 'manifest.json')
+const PROJECT_POLICY_STAGES = ['planning', 'review', 'gate', 'commit', 'acceptance']
+const PROJECT_POLICY_OUTPUT_MAX = 256 * 1024
+const PROJECT_POLICY_INPUT_MAX = 1024 * 1024
+const PROJECT_POLICY_FILES_MAX = 2 * 1024 * 1024
+const PROJECT_POLICY_TIMEOUT_DEFAULT_MS = 5000
+const PROJECT_POLICY_TIMEOUT_MAX_MS = 60000
+const PROJECT_GATE_RETRIES_MAX = 2
+const PROJECT_POLICY_SCRATCH_PARENT = join(tmpdir(), 'caw-project-policies')
+const GATE_EVIDENCE_SCRATCH_PARENT = join(tmpdir(), 'caw-gate-evidence')
+const POPULATION_CACHE_VERSION = 1
+const POPULATION_CACHE_MAX = 20
+const POPULATION_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+const POPULATION_CACHE_FILE_MAX = 8 * 1024 * 1024
+const TASK_AUDIT_MAX = 16 * 1024 * 1024
+let projectPolicySet = null
+let activePopulationCertification = null
 let runRecord = null
+
+function gitPrivatePath(...parts) {
+  const raw = execFileSync('git', ['rev-parse', '--git-path', parts.join('/')], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim()
+  if (!raw) throw new Error(`Git returned no private path for ${parts.join('/')}`)
+  return resolve(raw)
+}
+
+function compactRunMetrics(manifest) {
+  const calls = Array.isArray(manifest?.calls) ? manifest.calls : []
+  const policyCalls = Array.isArray(manifest?.policy_calls) ? manifest.policy_calls : []
+  const certifications = Array.isArray(manifest?.certifications) ? manifest.certifications : []
+  const countBy = (rows, key) => Object.fromEntries([...rows.reduce((map, row) => {
+    const value = row?.[key] ?? 'unknown'
+    map.set(value, (map.get(value) || 0) + 1)
+    return map
+  }, new Map())].sort(([a], [b]) => String(a).localeCompare(String(b))))
+  const duration = (rows) => rows.reduce((sum, row) =>
+    sum + (Number.isFinite(row?.duration_ms) ? row.duration_ms : 0), 0)
+  const usage = (rows) => {
+    const fields = {
+      input_tokens: (row) => row?.tokens?.input,
+      cached_read_tokens: (row) => row?.tokens?.cachedRead,
+      uncached_input_tokens: (row) => Number.isFinite(row?.tokens?.input) &&
+        Number.isFinite(row?.tokens?.cachedRead)
+        ? Math.max(0, row.tokens.input - row.tokens.cachedRead) : null,
+      output_tokens: (row) => row?.tokens?.output,
+      reasoning_tokens: (row) => row?.tokens?.reasoning,
+      prompt_bytes: (row) => row?.prompt?.bytes,
+      provider_event_count: (row) => row?.telemetry?.eventCount,
+      provider_tool_event_count: (row) => row?.telemetry?.toolEventCount,
+      provider_event_bytes: (row) => row?.telemetry?.eventBytes,
+    }
+    return Object.fromEntries(Object.entries(fields).map(([name, read]) => {
+      const values = rows.map(read)
+      return [name, {
+        observed: values.reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0),
+        unknown_calls: values.filter((value) => !Number.isFinite(value)).length,
+      }]
+    }))
+  }
+  const scopes = [...calls.reduce((map, call) => {
+    const scope = {
+      task: call?.task || null,
+      round: Number.isSafeInteger(call?.round) ? call.round : null,
+      role: call?.role || 'unknown',
+    }
+    const key = stableJson(scope)
+    if (!map.has(key)) map.set(key, { ...scope, calls: [] })
+    map.get(key).calls.push(call)
+    return map
+  }, new Map()).values()].map((scope) => ({
+    task: scope.task, round: scope.round, role: scope.role,
+    calls: scope.calls.length, usage: usage(scope.calls),
+  })).sort((a, b) => stableJson(a).localeCompare(stableJson(b)))
+  return {
+    version: 2,
+    run_id: manifest?.run_id || null,
+    started_at: manifest?.started_at || null,
+    updated_at: manifest?.updated_at || null,
+    status: manifest?.status || 'unknown',
+    provider_calls: calls.length,
+    provider_calls_by_role: countBy(calls, 'role'),
+    provider_calls_by_status: countBy(calls, 'status'),
+    usage_states: countBy(calls, 'usage_state'),
+    provider_usage: usage(calls),
+    provider_usage_by_scope: scopes,
+    provider_duration_ms: duration(calls),
+    policy_calls: policyCalls.length,
+    policy_duration_ms: duration(policyCalls),
+    certifications: countBy(certifications, 'state'),
+  }
+}
+
+function exportRunMetrics(runPath) {
+  const manifestPath = join(runPath, 'manifest.json')
+  if (!existsSync(manifestPath)) return false
+  let manifest
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
+  catch { return false }
+  let root
+  try { root = gitPrivatePath('caw', 'metrics') }
+  catch { root = resolve(LOG_DIR, 'metrics') }
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const target = join(root, 'runs.jsonl')
+  appendFileSync(target, `${JSON.stringify(compactRunMetrics(manifest))}\n`, { mode: 0o600 })
+  try { chmodSync(target, 0o600) } catch { /* platform does not expose POSIX modes */ }
+  return true
+}
 
 function writeRunManifest(status) {
   if (!runRecord) return
@@ -1345,15 +2727,40 @@ function writeRunManifest(status) {
     run_id: runRecord.id,
     engine_digest: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
     runtime_digest: resolvedRuntime.digest,
+    review_independence: resolvedRuntime.independence || [],
     started_at: runRecord.startedAt,
     updated_at: new Date().toISOString(),
     status,
     timeout_ms: AGENT_TIMEOUT_MS,
+    provider_budgets: providerBudgetSnapshot(),
     calls: runRecord.calls,
+    stages: runRecord.stages || [],
     diagnostics: runRecord.diagnostics,
+    gate_evidence: runRecord.gateEvidence || [],
+    certifications: runRecord.certifications || [],
+    audits: runRecord.audits || [],
+    ...(projectPolicySet?.manifestDigest ? {
+      project_policies: {
+        api_version: projectPolicySet.apiVersion,
+        manifest_digest: projectPolicySet.manifestDigest,
+        policies: Object.fromEntries(Object.entries(projectPolicySet.policies)
+          .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+      },
+      policy_calls: runRecord.policyCalls || [],
+    } : {}),
     ...(runRecord.population === undefined ? {} : {
       population: runRecord.population,
       population_counts: runRecord.populationCounts,
+    }),
+    ...(runRecord.populationCache === undefined ? {} : {
+      population_cache: runRecord.populationCache,
+    }),
+    ...(runRecord.planningCache === undefined ? {} : {
+      planning_cache: runRecord.planningCache,
+    }),
+    ...(runRecord.risk === undefined ? {} : { risk: runRecord.risk }),
+    ...(runRecord.fullGateBaseline === undefined ? {} : {
+      full_gate_baseline: runRecord.fullGateBaseline,
     }),
     ...(runRecord.weakVerification === undefined ? {} : {
       weak_verification: runRecord.weakVerification,
@@ -1376,7 +2783,8 @@ function pruneRunRecords(now = Date.now()) {
   const maxAge = 30 * 24 * 60 * 60 * 1000
   records.forEach((entry, index) => {
     if (index >= 20 || now - entry.stat.mtimeMs > maxAge) {
-      rmSync(entry.path, { recursive: true, force: true })
+      try { exportRunMetrics(entry.path) } catch { /* retention cleanup must remain available */ }
+      removeTree(entry.path)
     }
   })
 }
@@ -1390,26 +2798,118 @@ function beginRunRecord() {
   const id = `run-${stamp}-${process.pid}-${nonce}`
   const path = join(LOG_DIR, id)
   mkdirSync(path, { mode: 0o700 })
-  runRecord = { id, path, startedAt: new Date().toISOString(), calls: [], diagnostics: [] }
+  runRecord = { id, path, startedAt: new Date().toISOString(), calls: [], diagnostics: [], stages: [] }
   writeRunManifest('active')
   say(`run record: ${id}`)
   return runRecord
 }
 
-function recordProviderCall(role, provider, result) {
+function recordStage(kind, name, startedMs, state, detail = {}) {
+  const run = beginRunRecord()
+  run.stages.push({
+    kind,
+    name,
+    state,
+    duration_ms: Math.max(0, Date.now() - startedMs),
+    ...detail,
+  })
+  writeRunManifest(state === 'success' || state === 'green' ? 'active' : 'failed')
+}
+
+function beginProviderAttempt(role, provider, binding, invocation, budgetLimits, promptMetrics = {}) {
+  reserveProviderBudget(role, budgetLimits)
   const run = beginRunRecord()
   const index = String(run.calls.length + 1).padStart(3, '0')
+  const attemptId = `provider-${index}`
+  const startedAt = new Date().toISOString()
+  const name = `attempt-${index}-${role}.json`
+  const inputBytes = Buffer.byteLength(invocation.input || '')
+  const usageEstimate = {
+    input_tokens: Math.ceil(inputBytes / 4),
+    output_tokens: null,
+    method: 'utf8-bytes-div-4',
+    input_bytes: inputBytes,
+  }
   const body = {
+    attempt_id: attemptId,
+    status: 'started',
+    started_at: startedAt,
+    role,
+    provider: provider.adapter.id,
+    adapter_digest: provider.adapter.digest,
+    cli_version: provider.cliVersion,
+    runtime_digest: resolvedRuntime.digest,
+    requested: {
+      model: binding.model,
+      reasoning: binding.reasoning,
+      native: invocation.requestedNative || null,
+    },
+    usage_estimate: usageEstimate,
+    prompt: {
+      bytes: promptMetrics.promptBytes ?? null,
+      instructions_bytes: promptMetrics.instructionsBytes ?? null,
+      dossier: promptMetrics.dossier ?? null,
+      executor_budget: promptMetrics.executorBudget ?? null,
+    },
+    task: promptMetrics.task ?? null,
+    round: promptMetrics.round ?? null,
+    pass: promptMetrics.pass ?? null,
+  }
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
+  const entry = {
+    attempt_id: attemptId,
+    attempt_file: name,
+    role,
+    provider: provider.adapter.id,
+    status: 'started',
+    usage_state: 'unknown',
+    started_at: startedAt,
+    task: body.task,
+    round: body.round,
+    pass: body.pass,
+  }
+  run.calls.push(entry)
+  writeRunManifest('active')
+  return { id: attemptId, index, startedAt, startedMs: Date.now(), entry,
+    usageEstimate, prompt: body.prompt, budgetSettled: false }
+}
+
+function providerUsageState(result) {
+  const tokenValues = Object.values(result.tokens || {})
+  const anyTokens = tokenValues.some((value) => typeof value === 'number')
+  const allTokens = tokenValues.length > 0 && tokenValues.every((value) => typeof value === 'number')
+  if (result.cost !== null && allTokens) return 'reported'
+  if (result.cost !== null || anyTokens) return 'partial'
+  return 'unknown'
+}
+
+function recordProviderCall(role, provider, result, attempt) {
+  const run = beginRunRecord()
+  const index = attempt.index
+  const usageState = providerUsageState(result)
+  settleProviderBudget(attempt, result.cost)
+  const body = {
+    attempt_id: attempt.id,
+    status: 'success',
+    started_at: attempt.startedAt,
+    completed_at: new Date().toISOString(),
     role,
     provider: result.provider,
+    task: attempt.entry.task,
+    round: attempt.entry.round,
+    pass: attempt.entry.pass,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
     runtime_digest: resolvedRuntime.digest,
     requested: result.requested,
     models: result.models,
     tokens: result.tokens,
+    telemetry: result.telemetry,
+    prompt: attempt.prompt,
     cost: result.cost,
     duration_ms: result.durationMs,
+    usage_state: usageState,
     final_response: result.finalResponse,
   }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
@@ -1418,20 +2918,58 @@ function recordProviderCall(role, provider, result) {
   }
   const name = `call-${index}-${role}.json`
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
-  run.calls.push({ file: name, role, provider: result.provider, bytes: bytes.length, status: 'success' })
+  Object.assign(attempt.entry, {
+    file: name,
+    provider: result.provider,
+    bytes: bytes.length,
+    status: 'success',
+    usage_state: usageState,
+    tokens: result.tokens,
+    telemetry: result.telemetry,
+    prompt: attempt.prompt,
+    duration_ms: result.durationMs ?? (Date.now() - attempt.startedMs),
+    completed_at: new Date().toISOString(),
+  })
+  recordStage('provider', role, attempt.startedMs, 'success', { attempt_id: attempt.id })
   writeRunManifest('active')
 }
 
-function recordProviderFailure(role, provider, result) {
+function recordProviderFailure(role, provider, result, attempt, failureKind = 'provider-failure',
+  observed = null) {
   const run = beginRunRecord()
-  const index = String(run.calls.length + 1).padStart(3, '0')
+  const index = attempt.index
   const raw = `${result.stdout || ''}\n${result.stderr || ''}`
+  const usageState = observed ? providerUsageState(observed)
+    : attempt.usageEstimate ? 'estimated' : 'unknown'
+  settleProviderBudget(attempt, observed?.cost ?? null)
+  const terminalStatus = failureKind === 'interrupted' ? 'interrupted' : 'failure'
   const body = {
+    attempt_id: attempt.id,
+    status: terminalStatus,
+    failure_kind: failureKind,
+    started_at: attempt.startedAt,
+    completed_at: new Date().toISOString(),
     role,
     provider: provider.adapter.id,
+    task: attempt.entry.task,
+    round: attempt.entry.round,
+    pass: attempt.entry.pass,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
-    status: result.status,
+    exit_status: result.status,
+    signal: result.signal || null,
+    error_code: result.error?.code || null,
+    usage_state: usageState,
+    ...(!observed && attempt.usageEstimate ? { usage_estimate: attempt.usageEstimate } : {}),
+    ...(observed ? {
+      requested: observed.requested,
+      models: observed.models,
+      tokens: observed.tokens,
+      telemetry: observed.telemetry,
+      prompt: attempt.prompt,
+      cost: observed.cost,
+      duration_ms: observed.durationMs,
+    } : {}),
     bytes: Buffer.byteLength(raw),
     sha256: createHash('sha256').update(raw).digest('hex'),
     first: raw.slice(0, 8192),
@@ -1440,21 +2978,76 @@ function recordProviderFailure(role, provider, result) {
   const name = `failure-${index}-${role}.json`
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
-  run.calls.push({ file: name, role, provider: provider.adapter.id, bytes: bytes.length, status: 'failure' })
+  Object.assign(attempt.entry, {
+    file: name,
+    bytes: bytes.length,
+    status: terminalStatus,
+    failure_kind: failureKind,
+    usage_state: usageState,
+    ...(observed ? {
+      tokens: observed.tokens,
+      telemetry: observed.telemetry,
+      prompt: attempt.prompt,
+    } : {}),
+    duration_ms: Date.now() - attempt.startedMs,
+    completed_at: new Date().toISOString(),
+  })
+  recordStage('provider', role, attempt.startedMs, terminalStatus, { attempt_id: attempt.id })
   writeRunManifest('failed')
 }
 
-function recordEngineDiagnostic(role, kind, diagnostic) {
+function markInterruptedProviderAttempts(reason) {
+  if (!runRecord) return
+  const completedAt = new Date().toISOString()
+  for (const call of runRecord.calls) {
+    if (call.status !== 'started') continue
+    let hasEstimate = false
+    try {
+      const attempt = JSON.parse(readFileSync(join(runRecord.path, call.attempt_file), 'utf8'))
+      hasEstimate = Boolean(attempt.usage_estimate)
+    } catch { /* an interrupted pre-write remains unknown */ }
+    providerBudgetState.unknown_cost_calls += 1
+    Object.assign(call, {
+      status: 'interrupted',
+      failure_kind: reason,
+      usage_state: hasEstimate ? 'estimated' : 'unknown',
+      completed_at: completedAt,
+    })
+    const startedMs = Date.parse(call.started_at)
+    runRecord.stages.push({
+      kind: 'provider', name: call.role, state: 'interrupted',
+      duration_ms: Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : null,
+      attempt_id: call.attempt_id,
+    })
+  }
+}
+
+function failProviderAttempt(attempt, failureKind, cost = null) {
+  settleProviderBudget(attempt, cost)
+  Object.assign(attempt.entry, {
+    status: 'failure',
+    failure_kind: failureKind,
+    usage_state: 'unknown',
+    duration_ms: Date.now() - attempt.startedMs,
+    completed_at: new Date().toISOString(),
+  })
+  recordStage('provider', attempt.entry.role, attempt.startedMs, 'failure', {
+    attempt_id: attempt.id,
+  })
+  writeRunManifest('failed')
+}
+
+function recordEngineDiagnostic(role, kind, diagnostic, attemptId = null) {
   const run = beginRunRecord()
   const index = String(run.diagnostics.length + 1).padStart(3, '0')
-  const body = { role, kind, ...diagnostic }
+  const body = { role, kind, attempt_id: attemptId, ...diagnostic }
   const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
   if (bytes.length > ENGINE_DIAGNOSTIC_MAX) {
     throw new Error(`${role} ${kind} diagnostic is ${bytes.length} bytes; limit is ${ENGINE_DIAGNOSTIC_MAX}`)
   }
   const name = `diagnostic-${index}-${role}-${kind}.json`
   writePrivateFile(join(run.path, name), bytes, ENGINE_DIAGNOSTIC_MAX)
-  run.diagnostics.push({ file: name, role, kind, bytes: bytes.length })
+  run.diagnostics.push({ file: name, role, kind, attempt_id: attemptId, bytes: bytes.length })
   writeRunManifest('active')
 }
 
@@ -1482,6 +3075,24 @@ function recordWeakVerification(task, round, verification, status = 'active') {
   if (!verification) return
   const run = beginRunRecord()
   const baseline = verification.baseline || {}
+  const retainPatch = (entry, index, kind) => {
+    if (typeof entry?.patch !== 'string') return entry
+    const patch = entry.patch
+    const name = `weak-${taskArtifactBase(task)}-round-${round}-${kind}-${index + 1}.patch`
+    writePrivateFile(join(run.path, name), Buffer.from(patch), REVIEW_PATCH_MAX)
+    delete entry.patch
+    entry.patch_file = name
+    // The run it lives in. An open weak finding keeps this event, and the engine replays the
+    // patch against later deliveries, possibly from another invocation and so another run.
+    entry.patch_run = run.id
+    entry.patch_bytes = Buffer.byteLength(patch)
+    entry.patch_sha256 = createHash('sha256').update(patch).digest('hex')
+    return entry
+  }
+  ;(verification.mutations || []).forEach((entry, index) =>
+    retainPatch(entry, index, 'mutation'))
+  ;(verification.failures || []).forEach((entry, index) =>
+    retainPatch(entry, index, 'unavailable'))
   const events = [{
     task,
     round,
@@ -1498,9 +3109,261 @@ function recordWeakVerification(task, round, verification, status = 'active') {
     ...mutation,
     gate_output: typeof mutation.gate_output === 'string'
       ? mutation.gate_output.slice(-8000) : '',
+  })), ...(verification.failures || []).map((failure) => ({
+    task,
+    round,
+    kind: 'mutation-unavailable',
+    ...failure,
   }))]
   run.weakVerification = retainWeakVerificationEvents(run.weakVerification, events)
   writeRunManifest(status)
+}
+
+function recordTaskCertification({ task, round, criteria, open, author, reviewer, reviewSurface,
+  reviewBaseline, weakVerification, gateReceipt = null, acceptanceCases = [], executorClaims = [],
+  topology = null }) {
+  const run = beginRunRecord()
+  const population = activePopulationCertification || {
+    state: 'unknown', source: 'no-plan-population-record', digest: null,
+  }
+  const limitations = []
+  if (!['sample', 'complete'].includes(population.state)) {
+    limitations.push(`population-${population.state}`)
+  }
+  if (!author) limitations.push('author-runtime-unobserved')
+  if (weakVerification?.state?.startsWith('unverified')) {
+    limitations.push(weakVerification.state)
+  }
+  const state = open.length ? 'rejected' : limitations.length ? 'limited' : 'approved'
+  const body = {
+    version: 3,
+    task,
+    round,
+    state,
+    limitations,
+    created_at: new Date().toISOString(),
+    delivery_digest: deliveryDigest(),
+    independence: resolvedRuntime.independence?.find((entry) => entry.scope === 'task') || null,
+    author: author || { kind: 'human-or-prior-unobserved' },
+    reviewer,
+    population,
+    criteria,
+    acceptance_cases: acceptanceCases,
+    executor_claims: executorClaims,
+    gate_receipt: gateReceipt,
+    open_item_ids: open.map((item) => item.id),
+    // The census ids were already here; the topology they belong to was not. A blocking finding
+    // must name surface and transition ids, and a transition id is a content hash derived from
+    // the spec — so the record that says what was judged could not say what those ids meant, and
+    // an install checking one afterwards had to re-derive the whole topology by lifting the
+    // engine's own hashing out of caw.mjs and replaying it over the audit's spec string. The
+    // links each open item carries travel with it for the same reason: `open_item_ids` alone
+    // cannot answer which criterion, surface or transition a finding was about.
+    topology: topology ? { surfaces: topology.surfaces, transitions: topology.transitions } : null,
+    open_items: open.map((item) => ({
+      id: item.id,
+      slot: item.slot,
+      round: item.round,
+      criterion_ids: [...(item.criterion_ids || [])],
+      surface_ids: [...(item.surface_ids || [])],
+      transition_ids: [...(item.transition_ids || [])],
+      property_key: item.property_key || null,
+      work_package_id: item.work_package_id || null,
+    })),
+    review_surface: {
+      surface_id: reviewSurface?.id || null,
+      baseline_commit: reviewBaseline || null,
+    },
+    weak_verification: weakVerification,
+    project_policies: projectPolicySnapshot(),
+  }
+  const name = `certification-${taskArtifactBase(task)}-round-${round}.json`
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  writePrivateFile(join(run.path, name), bytes, FINAL_VALUE_MAX)
+  run.certifications ||= []
+  run.certifications.push({
+    file: name, task, round, state, limitations, bytes: bytes.length,
+  })
+  writeRunManifest(state === 'rejected' ? 'failed' : 'active')
+  return body
+}
+
+function writeTaskAudit(body) {
+  const root = gitPrivatePath('caw', 'audit')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+  if (bytes.length > TASK_AUDIT_MAX) {
+    throw new Error(`task audit record is ${bytes.length} bytes; limit is ${TASK_AUDIT_MAX}`)
+  }
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  const name = `pending-${digest}.json`
+  writePrivateFile(join(root, name), bytes, TASK_AUDIT_MAX)
+  const run = beginRunRecord()
+  run.audits ||= []
+  const entry = {
+    task: body.task,
+    state: 'pending-commit',
+    digest,
+    file: name,
+    bytes: bytes.length,
+  }
+  run.audits.push(entry)
+  writeRunManifest('active')
+  return { root, path: join(root, name), digest, entry }
+}
+
+function finalizeTaskAudit(audit, commitHash) {
+  const name = `${commitHash}.json`
+  const target = join(audit.root, name)
+  renameSync(audit.path, target)
+  Object.assign(audit.entry, { state: 'committed', commit: commitHash, file: name })
+  writeRunManifest('active')
+  return target
+}
+
+// A role returning invalid canonical output is the one event this engine keeps nothing about.
+// Everything durable a task produces is written at its commit: the public commit carries the
+// spec verbatim, and writeTaskAudit above carries the private record. A task stopped by a
+// contract failure reaches neither. What holds the diagnostic is the run record and the
+// `.caw-logs/` transcript, and both are swept by the same newest-twenty rotation —
+// pruneRunRecords keeps 20 or 30 days, the operator log guard keeps 20, and what survives that
+// is compactRunMetrics, which is payload-free counters with no path, message, role contract or
+// rejected value anywhere in it.
+//
+// Measured on one install: a Codex executor stopped a task at `$.claims: backlog-verify-002
+// names unknown acceptance case id(s): plan-case-807ef9c3078b`. Neither the spec slug nor that
+// case id exists anywhere in that repository's history — the task never committed, so the rule
+// that a spec lives verbatim in the commit that built it never engaged, and the spec was gone
+// from the queue. The log holding the diagnostic sat at position 20 of 22, one pipeline run
+// from deletion, and was rescued by hand. A failure nobody can re-derive cannot be fixed
+// against: a later run of the same backlog item draws different case ids and need not
+// reproduce it at all.
+//
+// So this is written beside the audit rather than inside the run record it would die with, and
+// it carries the spec, because the spec is the thing that dies first.
+const CONTRACT_FAILURE_MAX = 4 * 1024 * 1024
+const CONTRACT_FAILURE_VALUE_MAX = 1024 * 1024
+const CONTRACT_FAILURE_SPEC_MAX = 1024 * 1024
+
+// Which spec is in flight, so the record can carry it. Planning failures have no task and say
+// so rather than guessing one from a queue they were about to write.
+let activeTaskContract = null
+// A planning failure has no spec to lose and loses the request instead: `plan` writes nothing
+// until the architect and plan-reviewer both return, so a role contract failure there leaves
+// the queue empty and the request only in a terminal. Measured on another install at $6.04.
+let activeRequest = null
+
+function setActiveTaskContract(task) {
+  if (!task) { activeTaskContract = null; return }
+  let spec = null
+  try { spec = taskSpecText(task) } catch { spec = null }
+  activeTaskContract = { task, spec }
+}
+
+function contractFailureRuntime(role) {
+  if (!resolvedRuntime?.value?.roles?.[role]) return null
+  const binding = resolvedRuntime.value.roles[role]
+  const provider = resolvedRuntime.providers?.get(binding.provider) || null
+  return {
+    runtime_digest: resolvedRuntime.digest || null,
+    provider: binding.provider,
+    model: binding.model,
+    reasoning: binding.reasoning,
+    adapter_digest: provider?.adapter?.implementationDigest || null,
+    cli_version: provider?.cliVersion || null,
+  }
+}
+
+// One writer for the records that outlive the rotation: a stopped run's only durable trace.
+// A repository this cannot reach is one where the refusal still has to print, so every failure
+// here returns null rather than becoming the reason the operator never sees what stopped the run.
+function retainStopRecord(directory, label, body) {
+  let root
+  try { root = gitPrivatePath('caw', directory) } catch { return null }
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`)
+    if (bytes.length > CONTRACT_FAILURE_MAX) return null
+    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+    const stamp = body.created_at.replace(/[-:.]/g, '')
+    const target = join(root, `${stamp}-${label}-${digest}.json`)
+    const temp = `${target}.tmp-${process.pid}`
+    writeFileSync(temp, bytes, { mode: 0o600 })
+    renameSync(temp, target)
+    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+    return target
+  } catch { return null }
+}
+
+function activeSpecRecord() {
+  const spec = activeTaskContract?.spec
+    ? boundedUtf8(activeTaskContract.spec, CONTRACT_FAILURE_SPEC_MAX)
+    : null
+  return {
+    task: activeTaskContract?.task || null,
+    request: activeRequest,
+    spec: spec?.text ?? null,
+    spec_truncated: spec?.truncated ?? false,
+  }
+}
+
+function recordContractFailure(error) {
+  if (!(error instanceof CanonicalOutputError)) return null
+  try {
+    const rejected = boundedUtf8(
+      error.value === undefined ? 'undefined' : JSON.stringify(error.value, null, 2) ?? 'null',
+      CONTRACT_FAILURE_VALUE_MAX)
+    const body = {
+      version: 1,
+      created_at: new Date().toISOString(),
+      command: providerBudgetState.command || null,
+      role: error.role,
+      path: error.path,
+      detail: error.detail,
+      attempt_id: error.attemptId || null,
+      runtime: contractFailureRuntime(error.role),
+      // The spec, verbatim, because the commit that would have carried it never happened.
+      ...activeSpecRecord(),
+      rejected_value: rejected.text,
+      rejected_value_truncated: rejected.truncated,
+      // Every repair attempt this run already recorded for the role, so a failure that survived
+      // its own repair is visible as that rather than as one bad draw.
+      diagnostics: (runRecord?.diagnostics || []).filter((row) => row.role === error.role),
+      run_id: runRecord?.id || null,
+      // Where the transcript still is, for as long as the rotation above leaves it there.
+      run_record: runRecord?.path || null,
+    }
+    return retainStopRecord('contract-failures', error.role, body)
+  } catch { return null }
+}
+
+// An executor that stops on `blocked` returned a VALID response, so the contract-failure record
+// above never sees it — and it is the same kind of loss. The task does not commit, the reason is
+// printed once, and the only structured copy of what the role said is the run record under the
+// newest-twenty rotation. Measured on one install, that copy was the only evidence that settled
+// whether a misrouted delivery was a real blocker or two quote characters, and it was found by
+// knowing where to look rather than by being told.
+function recordExecutorStop(ex, kept) {
+  try {
+    const value = boundedUtf8(JSON.stringify(ex, null, 2) ?? 'null', CONTRACT_FAILURE_VALUE_MAX)
+    const body = {
+      version: 1,
+      created_at: new Date().toISOString(),
+      command: providerBudgetState.command || null,
+      role: 'executor',
+      reason: ex?.blocked ?? null,
+      attempt_id: runtimeIdentity(ex)?.attempt_id || null,
+      runtime: contractFailureRuntime('executor'),
+      ...activeSpecRecord(),
+      response: value.text,
+      response_truncated: value.truncated,
+      blocked_patch: kept?.path || null,
+      blocked_patch_unverified: kept?.unverified || null,
+      run_id: runRecord?.id || null,
+      run_record: runRecord?.path || null,
+    }
+    return retainStopRecord('executor-stops', 'executor', body)
+  } catch { return null }
 }
 
 // `.caw-tasks/` holds three kinds of file and only one of them is work to run. `PLAN.md` is
@@ -1509,6 +3372,163 @@ function recordWeakVerification(task, round, verification, status = 'active') {
 // excluded by NAME rather than by a `NNN_slug.md` pattern, because a ticket is a spec a human
 // wrote and named, and a pattern would silently drop the ones that do not match it.
 const PLAN = join(QUEUE_DIR, 'PLAN.md')
+const RISK_RECORD = join(QUEUE_DIR, '.risk.json')
+const RISK_RECORD_MAX = 64 * 1024
+
+function validateRiskRecord(value) {
+  exactObjectKeys(value, [
+    'version', 'class', 'population_requirement', 'require_full_gate_baseline',
+    'population_attestation', 'population_digest', 'evidence', 'policy_id', 'policy_digest',
+    'full_gate_baseline',
+  ], 'risk record')
+  if (value.version !== 1) throw new Error('risk record version must be 1')
+  if (!/^[a-z][a-z0-9.-]{0,63}$/.test(value.class) ||
+      !/^[a-z][a-z0-9.-]{0,63}$/.test(value.policy_id)) {
+    throw new Error('risk record class or policy id is invalid')
+  }
+  if (!['none', 'sample', 'complete'].includes(value.population_requirement) ||
+      !['none', 'sample', 'complete'].includes(value.population_attestation)) {
+    throw new Error('risk record population state is invalid')
+  }
+  if (typeof value.require_full_gate_baseline !== 'boolean' ||
+      !/^[0-9a-f]{64}$/.test(value.population_digest) ||
+      !/^[0-9a-f]{64}$/.test(value.policy_digest) || typeof value.evidence !== 'string') {
+    throw new Error('risk record fields are invalid')
+  }
+  if (value.full_gate_baseline !== null) {
+    exactObjectKeys(value.full_gate_baseline,
+      ['head', 'tree_digest', 'gate', 'state', 'inputs_digest', 'project_inputs_digest'],
+      'risk full-gate baseline')
+    const baseline = {
+      inputs_digest: null,
+      project_inputs_digest: null,
+      ...value.full_gate_baseline,
+    }
+    if (!/^[0-9a-f]{40}$/.test(baseline.head) ||
+        !/^[0-9a-f]{64}$/.test(baseline.tree_digest) ||
+        typeof baseline.gate !== 'string' || baseline.state !== 'green' ||
+        !(baseline.inputs_digest === null || /^[0-9a-f]{64}$/.test(baseline.inputs_digest)) ||
+        !(baseline.project_inputs_digest === null ||
+          /^[0-9a-f]{64}$/.test(baseline.project_inputs_digest))) {
+      throw new Error('risk full-gate baseline is invalid')
+    }
+    value = { ...value, full_gate_baseline: baseline }
+  }
+  return value
+}
+
+function writeRiskRecord(risk) {
+  const value = validateRiskRecord({ version: 1, full_gate_baseline: null, ...risk })
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+  if (bytes.length > RISK_RECORD_MAX) throw new Error('risk record exceeds its size limit')
+  mkdirSync(QUEUE_DIR, { recursive: true, mode: 0o700 })
+  const temp = `${RISK_RECORD}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, RISK_RECORD)
+  try { chmodSync(RISK_RECORD, 0o600) } catch { /* platform does not expose POSIX modes */ }
+}
+
+function readRiskRecord() {
+  if (!existsSync(RISK_RECORD)) return null
+  const stat = lstatSync(RISK_RECORD)
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > RISK_RECORD_MAX) {
+    throw new Error(`${RISK_RECORD} is not a bounded regular file`)
+  }
+  let value
+  try { value = JSON.parse(readFileSync(RISK_RECORD, 'utf8')) }
+  catch (error) { throw new Error(`${RISK_RECORD} is invalid JSON: ${error.message}`) }
+  return validateRiskRecord(value)
+}
+
+function clearRiskRecord() {
+  try { unlinkSync(RISK_RECORD) } catch { /* absent */ }
+}
+
+const RISK_PLAN_FIELD_NAMES = [
+  'risk_class', 'risk_population_requirement', 'risk_population_attestation',
+  'risk_population_digest', 'risk_require_full_gate_baseline', 'risk_policy_id',
+  'risk_policy_digest',
+]
+
+const riskPlanFields = (risk) => ({
+  risk_class: risk.class,
+  risk_population_requirement: risk.population_requirement,
+  risk_population_attestation: risk.population_attestation,
+  risk_population_digest: risk.population_digest,
+  risk_require_full_gate_baseline: String(risk.require_full_gate_baseline),
+  risk_policy_id: risk.policy_id,
+  risk_policy_digest: risk.policy_digest,
+})
+
+function syncPlanRisk(risk) {
+  if (!existsSync(PLAN)) return
+  let text = readFileSync(PLAN, 'utf8')
+  if (!risk) {
+    for (const name of RISK_PLAN_FIELD_NAMES) {
+      text = text.replace(new RegExp(`^${name}:.*\\n?`, 'm'), '')
+    }
+    text = text.replace(
+      /^## Project risk attestation\n\n```json\n[\s\S]*?\n```\n*/m,
+      '',
+    )
+    writeFileSync(PLAN, text)
+    return
+  }
+  const fields = riskPlanFields(risk)
+  for (const [name, value] of Object.entries(fields)) {
+    const line = `${name}: ${value}`
+    if (new RegExp(`^${name}:`, 'm').test(text)) {
+      text = text.replace(new RegExp(`^${name}:.*$`, 'm'), line)
+    } else {
+      const frontmatterEnd = text.indexOf('\n---', 4)
+      if (frontmatterEnd < 0) throw new Error(`${PLAN} has no closing frontmatter delimiter`)
+      text = `${text.slice(0, frontmatterEnd)}\n${line}${text.slice(frontmatterEnd)}`
+    }
+  }
+  const section = [
+    '## Project risk attestation', '',
+    '```json', JSON.stringify(risk, null, 2), '```', '',
+  ].join('\n')
+  if (/^## Project risk attestation$/m.test(text)) {
+    text = text.replace(
+      /^## Project risk attestation\n\n```json\n[\s\S]*?\n```\n*/m,
+      section,
+    )
+  } else {
+    const marker = text.match(/^## (?:Population,|Tasks,)/m)?.[0]
+    text = marker ? text.replace(marker, `${section}${marker}`) : `${text.trimEnd()}\n\n${section}`
+  }
+  writeFileSync(PLAN, text)
+}
+
+function applyRiskPopulationCertification(risk) {
+  activePopulationCertification = {
+    ...activePopulationCertification,
+    ...(risk.population_attestation === 'complete' ? { state: 'complete' } : {}),
+    project_attestation: {
+      state: risk.population_attestation,
+      evidence: risk.evidence,
+      policy_id: risk.policy_id,
+      policy_digest: risk.policy_digest,
+    },
+  }
+}
+
+function requireCurrentRiskPolicy(risk) {
+  const planningPolicy = projectPolicySet?.policies?.planning
+  if (!planningPolicy || planningPolicy.digest !== risk.policy_digest) {
+    die('project risk policy changed or disappeared after attestation; run review-specs again')
+  }
+  return planningPolicy
+}
+
+function requireMatchingPlanRisk(planText, risk) {
+  if (!/^risk_class:\s*\S+/m.test(planText || '')) return
+  const planField = (name) => planText.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim()
+  const mismatch = Object.entries(riskPlanFields(risk))
+    .find(([name, value]) => planField(name) !== value)
+  if (mismatch) die(`${PLAN} and ${RISK_RECORD} disagree at ${mismatch[0]}; run review-specs again`)
+}
 
 // Where a task's review history waits between invocations, so that a run stopping to ask the
 // human is not the same event as the run forgetting what it asked. One file per spec, created
@@ -1540,6 +3560,21 @@ function readRoundState(file) {
     else if (typeof s.spent === 'number') {
       s.accounting = normalizeAccounting(s.spent)
       s.runtime_provenance = 'legacy-unknown'
+    }
+    if ((s.state_version || 0) < 5) {
+      for (const item of s.history) {
+        item.evidence_refs ||= []
+        item.criterion_ids ||= []
+        item.surface_ids ||= []
+        item.transition_ids ||= []
+        item.property_key ||= null
+        item.work_package_id ||= groupFindings([item])[0].id
+      }
+      s.state_version = 5
+    }
+    if ((s.state_version || 0) < 6) {
+      s.gate_fact = null
+      s.state_version = 6
     }
     return s
   } catch (error) {
@@ -1585,9 +3620,16 @@ function specDigest(text) {
 
 const APPROVED_HEAD = '## Approved — the queue as it was judged'
 
-// Returns null when the plan carries no such section: every plan approved before this existed,
-// and every hand-written ticket, which has no PLAN.md at all. Both must stay silent rather than
-// read as tampering.
+const approvedSpecLines = (specs) => specs.map((s) =>
+  `- ${s}  ${specDigest(readFileSync(join(QUEUE_DIR, s), 'utf8'))}`)
+
+function withApprovedDigests(text, specs) {
+  return `${text.split(APPROVED_HEAD)[0].trimEnd()}\n\n${APPROVED_HEAD}\n\n` +
+    `${approvedSpecLines(specs).join('\n')}\n`
+}
+
+// Returns null when an artifact predates recorded queue digests. That legacy state stays silent
+// rather than being reported as tampering.
 function approvedDigests(plan) {
   const after = plan.split(APPROVED_HEAD)[1]
   if (after === undefined) return null
@@ -1634,6 +3676,21 @@ const noticeNotesLog = () => {
 // count and a date at the start of every plan and build, and what to do about it is a decision
 // this tool has no standing to make on a project's behalf. The notice repeating until someone
 // deals with it is the correct pressure, and `rm` is the whole remedy.
+
+// What `autopilot` reads to answer a stop, written only when it asked for one. A stop's prose is
+// for a person; this is the same fact as data: which kind of stop, on which task, from which role.
+// The first record wins — a stop that dies on its way out is still the stop it was — and a run
+// that dies without writing one is `unknown`, which autopilot hands to the human.
+let stopRecordWritten = false
+function writeStopRecord(kind, fields = {}) {
+  const target = process.env.CAW_STOP_RECORD
+  if (!target || stopRecordWritten) return
+  stopRecordWritten = true
+  try {
+    writeFileSync(target, `${JSON.stringify({ version: 1, kind, command: process.argv[2] || null, ...fields })}\n`,
+      { mode: 0o600 })
+  } catch { /* the stop itself still has to be reported */ }
+}
 
 const die = (msg) => {
   console.error(`\ncaw: ${msg}\n`)
@@ -1684,6 +3741,152 @@ function profile(preflight = true) {
   // direction: gate() treats an empty command as green, so every task would pass a gate
   // that never ran and be committed on it.
   if (!f.gate_fast) die('.caw/CAW.md sets no gate_fast — refusing to run a pipeline with no gate')
+  for (const key of ['gate_fast_timeout_ms', 'gate_batch_timeout_ms', 'gate_full_timeout_ms']) {
+    if (f[key] === undefined || f[key] === '') {
+      f[key] = null
+      continue
+    }
+    const ms = Number(f[key])
+    if (!Number.isSafeInteger(ms) || ms <= 0 || ms > GATE_TIMEOUT_MAX_MS) {
+      die(`.caw/CAW.md ${key} must be a positive whole number of milliseconds no greater than ` +
+        `${GATE_TIMEOUT_MAX_MS} — got "${f[key]}"`)
+    }
+    f[key] = ms
+  }
+  for (const [key, maximum] of [
+    ['executor_max_tool_events', EXECUTOR_TOOL_EVENT_LIMIT_MAX],
+    ['executor_max_event_bytes', EXECUTOR_EVENT_BYTE_LIMIT_MAX],
+  ]) {
+    if (f[key] === undefined || f[key] === '') {
+      f[key] = null
+      continue
+    }
+    const value = Number(f[key])
+    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+      die(`.caw/CAW.md ${key} must be a positive whole number no greater than ${maximum}`)
+    }
+    f[key] = value
+  }
+  const adaptiveExecutorKeys = EXECUTOR_BUDGET_CLASSES.flatMap((name) => [
+    [`executor_budget_${name}_tool_events`, EXECUTOR_TOOL_EVENT_LIMIT_MAX],
+    [`executor_budget_${name}_event_bytes`, EXECUTOR_EVENT_BYTE_LIMIT_MAX],
+  ])
+  const configuredAdaptiveKeys = adaptiveExecutorKeys.filter(([key]) =>
+    f[key] !== undefined && f[key] !== '')
+  if (configuredAdaptiveKeys.length && configuredAdaptiveKeys.length !== adaptiveExecutorKeys.length) {
+    const missing = adaptiveExecutorKeys.filter(([key]) =>
+      f[key] === undefined || f[key] === '').map(([key]) => key)
+    die(`adaptive executor budgets require all six class limits; missing ${missing.join(', ')}`)
+  }
+  if (configuredAdaptiveKeys.length &&
+      (f.executor_max_tool_events || f.executor_max_event_bytes)) {
+    die('adaptive executor budgets cannot be combined with executor_max_tool_events or ' +
+        'executor_max_event_bytes')
+  }
+  if (configuredAdaptiveKeys.length) {
+    for (const [key, maximum] of adaptiveExecutorKeys) {
+      const value = Number(f[key])
+      if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+        die(`.caw/CAW.md ${key} must be a positive whole number no greater than ${maximum}`)
+      }
+      f[key] = value
+    }
+    for (const dimension of ['tool_events', 'event_bytes']) {
+      const values = EXECUTOR_BUDGET_CLASSES.map((name) =>
+        f[`executor_budget_${name}_${dimension}`])
+      if (values.some((value, index) => index > 0 && value < values[index - 1])) {
+        die(`adaptive executor ${dimension} limits must be monotonic: small <= normal <= large`)
+      }
+    }
+    f.executor_budgets = Object.fromEntries(EXECUTOR_BUDGET_CLASSES.map((name) => [name, {
+      tool_events: f[`executor_budget_${name}_tool_events`],
+      event_bytes: f[`executor_budget_${name}_event_bytes`],
+    }]))
+  } else {
+    f.executor_budgets = null
+  }
+  if (f.gate_unavailable_review === undefined || f.gate_unavailable_review === '') {
+    f.gate_unavailable_review = false
+  } else if (!['true', 'false'].includes(f.gate_unavailable_review)) {
+    die('.caw/CAW.md gate_unavailable_review must be true or false')
+  } else {
+    f.gate_unavailable_review = f.gate_unavailable_review === 'true'
+  }
+  f.index_format = f.index_format || 'text-v0'
+  if (!['text-v0', 'json-v1'].includes(f.index_format)) {
+    die(`.caw/CAW.md index_format must be text-v0 or json-v1 — got "${f.index_format}"`)
+  }
+  f.index_audience = f.index_audience || 'enumerator'
+  if (!['enumerator', 'planning'].includes(f.index_audience)) {
+    die(`.caw/CAW.md index_audience must be enumerator or planning — got "${f.index_audience}"`)
+  }
+  f.builtin_index = f.builtin_index || ''
+  if (!['', 'request-v1'].includes(f.builtin_index)) {
+    die(`.caw/CAW.md builtin_index must be empty or request-v1 — got "${f.builtin_index}"`)
+  }
+  f.pipeline_mode = f.pipeline_mode || 'strict'
+  if (!PIPELINE_MODES.has(f.pipeline_mode)) {
+    die(`.caw/CAW.md pipeline_mode must be fast, standard, or strict — got "${f.pipeline_mode}"`)
+  }
+  const defaultPlanRounds = f.pipeline_mode === 'strict' ? MAX_PLAN_ROUNDS : 1
+  if (f.planning_max_rounds === undefined || f.planning_max_rounds === '') {
+    f.planning_max_rounds = defaultPlanRounds
+  } else {
+    const rounds = Number(f.planning_max_rounds)
+    if (!Number.isSafeInteger(rounds) || rounds < 1 || rounds > MAX_PLAN_ROUNDS) {
+      die(`.caw/CAW.md planning_max_rounds must be a whole number from 1 to ${MAX_PLAN_ROUNDS}`)
+    }
+    f.planning_max_rounds = rounds
+  }
+  const weakControls = ['weak_source_probe_cmd', 'weak_positive_control_cmd']
+    .filter((key) => Boolean(f[key]))
+  if (weakControls.length === 1) {
+    die('.caw/CAW.md must configure weak_source_probe_cmd and weak_positive_control_cmd together')
+  }
+  for (const key of ['planning_independence', 'task_independence']) {
+    f[key] = f[key] || 'same-provider'
+    if (!['same-provider', 'different-model', 'cross-vendor', 'human-review'].includes(f[key])) {
+      die(`.caw/CAW.md ${key} must be same-provider, different-model, cross-vendor, or ` +
+        `human-review — got "${f[key]}"`)
+    }
+  }
+  if (f.review_challenger_passes === undefined || f.review_challenger_passes === '') {
+    f.review_challenger_passes = DEFAULT_REVIEW_CHALLENGER_PASSES
+  } else {
+    const passes = Number(f.review_challenger_passes)
+    if (!Number.isSafeInteger(passes) || passes < 0 || passes > MAX_REVIEW_CHALLENGER_PASSES) {
+      die(`.caw/CAW.md review_challenger_passes must be a whole number from 0 to ` +
+        `${MAX_REVIEW_CHALLENGER_PASSES} — got "${f.review_challenger_passes}"`)
+    }
+    f.review_challenger_passes = passes
+  }
+  f.review_challenger_policy = f.review_challenger_policy ||
+    (f.pipeline_mode === 'strict' ? 'fixed' : 'risk')
+  if (!['fixed', 'risk'].includes(f.review_challenger_policy)) {
+    die(`.caw/CAW.md review_challenger_policy must be fixed or risk — got ` +
+      `"${f.review_challenger_policy}"`)
+  }
+  if (f.review_challenger_file_threshold === undefined || f.review_challenger_file_threshold === '') {
+    f.review_challenger_file_threshold = 8
+  } else {
+    const threshold = Number(f.review_challenger_file_threshold)
+    if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > 1000) {
+      die('.caw/CAW.md review_challenger_file_threshold must be a positive whole number')
+    }
+    f.review_challenger_file_threshold = threshold
+  }
+  if (f.require_role_smoke === undefined || f.require_role_smoke === '') {
+    f.require_role_smoke = false
+  } else if (!['true', 'false'].includes(f.require_role_smoke)) {
+    die(`.caw/CAW.md require_role_smoke must be true or false — got "${f.require_role_smoke}"`)
+  } else {
+    f.require_role_smoke = f.require_role_smoke === 'true'
+  }
+  try {
+    f.provider_budgets = resolveProviderBudgets(f)
+    providerBudgetState.limits = f.provider_budgets
+  }
+  catch (error) { die(`.caw/CAW.md ${error?.message || error}`) }
   legacyQueueRefusal()
   if (preflight) preflightRuntime(f)
   return { f, text }
@@ -1759,23 +3962,122 @@ function deliveryDigest() {
   return hash.digest('hex')
 }
 
-function ignoredReadDenials(deliveryRoot, dependencies) {
-  const allowed = dependencies.map((d) => resolve(deliveryRoot, d.entry))
+function deliverySnapshotDigest() {
+  const hash = createHash('sha256')
+  const listed = new Set()
+  const collect = (args) => {
+    let raw = ''
+    try { raw = execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }) }
+    catch { return }
+    for (const path of raw.split('\0').filter(Boolean)) listed.add(path)
+  }
+  collect(['ls-tree', '-rz', '--name-only', 'HEAD'])
+  collect(['ls-files', '-z', '--cached', '--others', '--exclude-standard'])
+  for (const path of [...listed].sort()) {
+    if (path.startsWith(`${QUEUE_DIR}/`) || path.startsWith(`${LOG_DIR}/`)) continue
+    hash.update(`\0${path}\0`)
+    if (!existsSync(path)) {
+      hash.update('missing\0')
+      continue
+    }
+    const stat = lstatSync(path)
+    hash.update(`${stat.mode & 0o7777}\0`)
+    if (stat.isSymbolicLink()) hash.update(`symlink\0${readlinkSync(path)}`)
+    else if (stat.isFile()) hash.update(readFileSync(path))
+    else if (stat.isDirectory()) {
+      try { hash.update(`gitlink\0${execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()}`) }
+      catch { hash.update('directory\0') }
+    } else hash.update(`other\0${stat.mode}`)
+  }
+  return hash.digest('hex')
+}
+
+function ignoredReadDenials(deliveryRoot) {
   const raw = surfaceGit(deliveryRoot, 'status', '--ignored', '--porcelain=v1', '-z')
   const out = []
   for (const record of raw.split('\0').filter(Boolean)) {
     if (!record.startsWith('!! ')) continue
     const lexical = resolve(deliveryRoot, record.slice(3).replace(/\/$/, ''))
-    if (allowed.some((root) => inside(root, lexical))) continue
     if (existsSync(lexical)) out.push(realpathSync(lexical))
   }
   return [...new Set(out)]
 }
 
+// A dependency tree is executable test input, and modern runners also use it for transient
+// state. Vite, for example, bundles its config into node_modules/.vite-temp before it imports
+// it. Pointing the surface at the delivery dependency tree and making that target read-only
+// therefore prevents the test process from starting at all. Copy the ignored tree into the
+// engine-owned surface and make the copy owner-writable. `verbatimSymlinks` keeps relative
+// package links relative to the copied tree instead of resolving them back into delivery.
+function stageReviewDependency(source, target) {
+  cpSync(source, target, {
+    recursive: true,
+    preserveTimestamps: true,
+    verbatimSymlinks: true,
+  })
+  const pending = [target]
+  while (pending.length) {
+    const path = pending.pop()
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) continue
+    chmodSync(path, (stat.mode & 0o7777) | (stat.isDirectory() ? 0o700 : 0o600))
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) pending.push(join(path, name))
+    }
+  }
+}
+
+// Some dependency managers make cached directories read-only. Removing one of CAW's own
+// temporary trees then fails because unlinking a child requires write permission on its parent.
+// Restore owner access on directories only, never follow symlinks, and retry the removal.
+function removeTree(path) {
+  try {
+    rmSync(path, { recursive: true, force: true })
+    return
+  } catch (error) {
+    if (!['EACCES', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) throw error
+  }
+  const pending = [path]
+  while (pending.length) {
+    const current = pending.pop()
+    let stat
+    try { stat = lstatSync(current) } catch { continue }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) continue
+    try { chmodSync(current, (stat.mode & 0o7777) | 0o700) } catch { /* no POSIX modes */ }
+    let names = []
+    try { names = readdirSync(current) } catch { continue }
+    for (const name of names) pending.push(join(current, name))
+  }
+  rmSync(path, { recursive: true, force: true })
+}
+
 function removeReviewSurface(surface) {
   if (!surface) return
   ACTIVE_REVIEW_SURFACES.delete(surface.parent)
-  try { rmSync(surface.parent, { recursive: true, force: true }) } catch { /* retained by the OS */ }
+  try { removeTree(surface.parent) } catch { /* retained by the OS */ }
+}
+
+// Three sweeps share one temp parent each with every other CAW process on the machine, and each
+// used to assume it was alone. Two assumptions broke. An entry can VANISH between readdir and
+// lstat — another process pruned or finished it — and the sweep threw ENOENT out of whatever
+// command had started, before that command did anything: measured as a flaky failure of the
+// engine's own suite, whose test files run as parallel processes. And an entry can be YOUNG: a
+// creator makes the directory first and writes its manifest a moment later, and a sweep landing
+// in that window read "missing manifest" and removed a live sibling's directory — for an adapter
+// transport, one holding a copied credential mid-call. One owner running builds on several
+// projects at once is the configuration that meets both.
+const PRUNE_CREATION_GRACE_MS = 60 * 1000
+
+function pruneEntryStat(path) {
+  try { return lstatSync(path) }
+  catch (error) {
+    if (error?.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function youngEntry(stat, now = Date.now()) {
+  return Boolean(stat) && now - stat.mtimeMs < PRUNE_CREATION_GRACE_MS
 }
 
 function pruneInvocationScratch() {
@@ -1784,20 +4086,21 @@ function pruneInvocationScratch() {
   for (const name of readdirSync(INVOCATION_SCRATCH_PARENT)) {
     if (!name.startsWith('scratch-')) continue
     const parent = join(INVOCATION_SCRATCH_PARENT, name)
+    const stat = pruneEntryStat(parent)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try {
-      const stat = lstatSync(parent)
-      if (!stat.isDirectory() || stat.isSymbolicLink()) continue
       manifest = JSON.parse(readFileSync(join(parent, 'manifest.json'), 'utf8'))
     } catch {
-      rmSync(parent, { recursive: true, force: true })
+      if (youngEntry(stat)) continue
+      removeTree(parent)
       continue
     }
     let alive = false
     if (Number.isInteger(manifest?.pid)) {
       try { process.kill(manifest.pid, 0); alive = true } catch { /* dead creator */ }
     }
-    if (!alive) rmSync(parent, { recursive: true, force: true })
+    if (!alive) removeTree(parent)
   }
 }
 
@@ -1824,7 +4127,7 @@ function removeInvocationScratch(scratch) {
   const canonicalParent = realpathSync(INVOCATION_SCRATCH_PARENT)
   const canonical = realpathSync(scratch.parent)
   if (!inside(canonicalParent, canonical)) throw new Error('invocation scratch leaves its dedicated parent')
-  rmSync(canonical, { recursive: true, force: true })
+  removeTree(canonical)
 }
 
 function apparentSurfaceBytes(root) {
@@ -1853,7 +4156,7 @@ function removeAdapterTransport(path) {
   const parent = realpathSync(ADAPTER_TRANSPORT_PARENT)
   const canonical = realpathSync(path)
   if (!inside(parent, canonical)) throw new Error('adapter transport leaves its retention parent')
-  rmSync(canonical, { recursive: true, force: true })
+  removeTree(canonical)
 }
 
 function scrubTransportSensitivePath(root, entry) {
@@ -1887,8 +4190,8 @@ function pruneAdapterTransports(now = Date.now()) {
   for (const name of readdirSync(ADAPTER_TRANSPORT_PARENT)) {
     const root = adapterTransportPath(name)
     if (!root) continue
-    const stat = lstatSync(root)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+    const stat = pruneEntryStat(root)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try {
       const manifestStat = lstatSync(join(root, 'manifest.json'))
@@ -1903,6 +4206,7 @@ function pruneAdapterTransports(now = Date.now()) {
         throw new Error('invalid manifest fields')
       }
     } catch {
+      if (youngEntry(stat, now)) continue
       removeAdapterTransport(root)
       say(`  pruned adapter transport ${name}: missing or malformed manifest`)
       continue
@@ -1953,7 +4257,7 @@ function writeSurfaceManifest(surface, state, reason = '') {
     reason: reason.slice(0, 2000),
     apparent_bytes: apparentSurfaceBytes(surface.parent),
     scratch_root: surface.scratchRoot && relative(surface.parent, surface.scratchRoot),
-    dependency_symlinks: surface.dependencies.map((dependency) => dependency.entry),
+    dependency_copies: surface.dependencies.map((dependency) => dependency.entry),
     ...(surface.weakGate ? { weak_gate: surface.weakGate } : {}),
   }
   writeFileSync(join(surface.parent, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, {
@@ -1976,11 +4280,14 @@ function pruneReviewSurfaces(now = Date.now()) {
   const retained = []
   for (const name of readdirSync(REVIEW_SURFACE_PARENT)) {
     const parent = join(REVIEW_SURFACE_PARENT, name)
-    const stat = lstatSync(parent)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+    const stat = pruneEntryStat(parent)
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue
     let manifest
     try { manifest = JSON.parse(readFileSync(join(parent, 'manifest.json'), 'utf8')) }
-    catch { manifest = { state: 'failure', created_at: new Date(stat.mtimeMs).toISOString() } }
+    catch {
+      if (youngEntry(stat, now)) continue
+      manifest = { state: 'failure', created_at: new Date(stat.mtimeMs).toISOString() }
+    }
     if (manifest.state === 'active') {
       let alive = false
       try { process.kill(manifest.pid, 0); alive = true } catch { /* dead creator */ }
@@ -1998,14 +4305,42 @@ function pruneReviewSurfaces(now = Date.now()) {
       : index >= 3 ? 'outside newest 3 failed surfaces'
       : null
     if (!reason) return
-    const canonical = realpathSync(entry.parent)
+    let canonical
+    try { canonical = realpathSync(entry.parent) }
+    catch (error) {
+      if (error?.code === 'ENOENT') return
+      throw error
+    }
     if (!inside(realpathSync(REVIEW_SURFACE_PARENT), canonical)) return
-    rmSync(canonical, { recursive: true, force: true })
+    removeTree(canonical)
     say(`  pruned review surface ${entry.name}: ${reason}`)
   })
 }
 
-function createReviewSurface(f) {
+// Keep evidence beside the writable Git and provider roots, so the existing outer boundary
+// grants reads but denies overwrites, chmod and removal. Never expose the rest of the run log.
+function stageReviewGateArtifacts(surface, receipt) {
+  if (!receipt?.artifacts?.length) return []
+  if (!runRecord) throw new Error('gate artifacts have no owning run record')
+  const root = join(surface.parent, 'gate-evidence')
+  mkdirSync(root, { mode: 0o700 })
+  return receipt.artifacts.map((artifact, index) => {
+    const source = gateEvidenceArtifactPath(resolve(runRecord.path), artifact.private_file)
+    if (source.size !== artifact.bytes || source.size > GATE_EVIDENCE_ARTIFACT_MAX) {
+      throw new Error(`retained gate artifact ${artifact.id} changed size`)
+    }
+    const bytes = readFileSync(source.path)
+    if (bytes.length !== artifact.bytes ||
+        createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+      throw new Error(`retained gate artifact ${artifact.id} changed after the gate`)
+    }
+    const path = join(root, `artifact-${String(index + 1).padStart(3, '0')}.bin`)
+    writePrivateFile(path, bytes, GATE_EVIDENCE_ARTIFACT_MAX)
+    return { id: artifact.id, path, bytes: bytes.length, sha256: artifact.sha256 }
+  })
+}
+
+function createReviewSurface(f, gateReceipt = null) {
   const deliveryRoot = realpathSync(process.cwd())
   if (surfaceGit(deliveryRoot, 'ls-files', '--stage').split('\n')
     .some((line) => line.startsWith('160000 '))) {
@@ -2042,11 +4377,18 @@ function createReviewSurface(f) {
       const target = join(workingRoot, dependency.entry)
       if (existsSync(target)) die(`review dependency collides with delivery content: ${dependency.entry}`)
       mkdirSync(dirname(target), { recursive: true })
-      symlinkSync(dependency.canonical, target, 'dir')
+      const projectedBytes = apparentSurfaceBytes(parent) + apparentSurfaceBytes(dependency.canonical)
+      if (projectedBytes > REVIEW_SURFACE_MAX) {
+        throw new Error(`review surface is at least ${projectedBytes} bytes; limit is ${REVIEW_SURFACE_MAX}`)
+      }
+      stageReviewDependency(dependency.canonical, target)
       const exclude = surfaceGit(workingRoot, 'rev-parse', '--git-path', 'info/exclude').trim()
       appendFileSync(join(workingRoot, exclude), `\n/${dependency.entry.replace(/\\/g, '/')}\n`)
     }
-    surface.deniedReadPaths = ignoredReadDenials(deliveryRoot, dependencies)
+    surface.gateArtifacts = stageReviewGateArtifacts(surface, gateReceipt)
+    // The reviewer reads and writes the private copy. The ignored source remains denied so an
+    // absolute path or a surviving absolute symlink cannot mutate the delivery dependency tree.
+    surface.deniedReadPaths = ignoredReadDenials(deliveryRoot)
     const bytes = apparentSurfaceBytes(parent)
     if (bytes > REVIEW_SURFACE_MAX) {
       throw new Error(`review surface is ${bytes} bytes; limit is ${REVIEW_SURFACE_MAX}`)
@@ -2067,18 +4409,33 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 process.once('exit', (code) => {
   for (const parent of ACTIVE_INVOCATION_SCRATCH) {
-    try { rmSync(parent, { recursive: true, force: true }) } catch { /* next command prunes it */ }
+    try { removeTree(parent) } catch { /* next command prunes it */ }
   }
   for (const surface of ACTIVE_REVIEW_SURFACES.values()) {
     retainReviewSurface(surface, 'interrupted', 'process exited before cleanup')
   }
   if (runRecord) {
-    try { writeRunManifest(code === 0 ? 'completed' : 'failed') } catch { /* preserve exit */ }
+    try {
+      markInterruptedProviderAttempts(code === 0 ? 'process-ended' : 'process-failed')
+      writeRunManifest(code === 0 ? 'completed' : 'failed')
+    } catch { /* preserve exit */ }
   }
 })
 
-function schemaFailure(role, path, message) {
-  die(`${role} returned invalid canonical output at ${path}: ${message}`)
+class CanonicalOutputError extends Error {
+  constructor(role, path, detail, value = null, attemptId = null) {
+    super(`${role} returned invalid canonical output at ${path}: ${detail}`)
+    this.name = 'CanonicalOutputError'
+    this.role = role
+    this.path = path
+    this.detail = detail
+    this.value = value
+    this.attemptId = attemptId
+  }
+}
+
+function schemaFailure(role, path, message, value = null, attemptId = null) {
+  throw new CanonicalOutputError(role, path, message, value, attemptId)
 }
 
 function canonicalIssue(schema, value, path = '$') {
@@ -2133,19 +4490,761 @@ function canonicalIssue(schema, value, path = '$') {
   return null
 }
 
+function exactObjectKeys(value, allowed, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`)
+  }
+  const extra = Object.keys(value).filter((key) => !allowed.includes(key))
+  if (extra.length) throw new TypeError(`${label} has unknown field(s): ${extra.join(', ')}`)
+}
+
+function projectPolicyTreeDigest(policyRoot) {
+  let bytes = 0
+  const hash = createHash('sha256')
+  const visit = (directory) => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name)
+      const stat = lstatSync(path)
+      const rel = relative(policyRoot, path).split(sep).join('/')
+      if (stat.isSymbolicLink()) throw new Error(`project policy tree contains symlink: ${rel}`)
+      if (stat.isDirectory()) {
+        hash.update(`directory\0${rel}\0${stat.mode & 0o777}\0`)
+        visit(path)
+      } else if (stat.isFile()) {
+        bytes += stat.size
+        if (bytes > PROJECT_POLICY_FILES_MAX) {
+          throw new Error(`project policy files exceed ${PROJECT_POLICY_FILES_MAX} bytes`)
+        }
+        hash.update(`file\0${rel}\0${stat.mode & 0o777}\0`)
+        hash.update(readFileSync(path))
+      } else {
+        throw new Error(`project policy tree contains unsupported entry: ${rel}`)
+      }
+    }
+  }
+  visit(policyRoot)
+  return hash.digest('hex')
+}
+
+function projectPolicyStateDigest(root = process.cwd()) {
+  const repositoryRoot = realpathSync(root)
+  const hash = createHash('sha256')
+  hash.update(`delivery\0${deliveryDigest()}\0head\0${headCommit() || ''}\0`)
+  const visit = (path) => {
+    const rel = relative(repositoryRoot, path).split(sep).join('/') || '.'
+    if (!existsSync(path)) {
+      hash.update(`missing\0${rel}\0`)
+      return
+    }
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) {
+      hash.update(`symlink\0${rel}\0${readlinkSync(path)}\0`)
+    } else if (stat.isDirectory()) {
+      hash.update(`directory\0${rel}\0${stat.mode & 0o777}\0`)
+      for (const name of readdirSync(path).sort()) visit(join(path, name))
+    } else if (stat.isFile()) {
+      hash.update(`file\0${rel}\0${stat.mode & 0o777}\0`)
+      hash.update(readFileSync(path))
+    } else {
+      hash.update(`other\0${rel}\0${stat.mode}\0`)
+    }
+  }
+  for (const path of ['caw.mjs', '.caw', QUEUE_DIR]) visit(join(repositoryRoot, path))
+  return hash.digest('hex')
+}
+
+function readProjectPolicies(root = process.cwd()) {
+  const repositoryRoot = realpathSync(root)
+  const manifestPath = join(repositoryRoot, PROJECT_POLICY_MANIFEST)
+  if (!existsSync(manifestPath)) {
+    return { apiVersion: null, manifestDigest: null, policies: {}, root: repositoryRoot }
+  }
+  const manifestStat = lstatSync(manifestPath)
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+    throw new Error(`${PROJECT_POLICY_MANIFEST} must be a regular file`)
+  }
+  if (manifestStat.size > PROJECT_POLICY_INPUT_MAX) {
+    throw new Error(`${PROJECT_POLICY_MANIFEST} exceeds ${PROJECT_POLICY_INPUT_MAX} bytes`)
+  }
+  let manifest
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
+  catch (error) { throw new Error(`${PROJECT_POLICY_MANIFEST} is invalid JSON: ${error.message}`) }
+  exactObjectKeys(manifest, ['api_version', 'policies'], 'project policy manifest')
+  if (![1, 2, 3].includes(manifest.api_version)) {
+    throw new Error('project policy api_version must be 1, 2 or 3')
+  }
+  exactObjectKeys(manifest.policies, PROJECT_POLICY_STAGES, 'project policy manifest.policies')
+  if (manifest.api_version < 3 && manifest.policies.acceptance !== undefined) {
+    throw new Error('project acceptance policy requires api_version 3')
+  }
+  const policyRoot = realpathSync(dirname(manifestPath))
+  const treeDigest = projectPolicyTreeDigest(policyRoot)
+  const policies = {}
+  for (const stage of PROJECT_POLICY_STAGES) {
+    const config = manifest.policies[stage]
+    if (config === undefined) continue
+    exactObjectKeys(config, ['id', 'command', 'timeout_ms'], `project ${stage} policy`)
+    if (typeof config.id !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(config.id)) {
+      throw new Error(`project ${stage} policy id is invalid`)
+    }
+    if (!Array.isArray(config.command) || !config.command.length || config.command.length > 16 ||
+        config.command.some((part) => typeof part !== 'string' || !part.length || part.length > 4096)) {
+      throw new Error(`project ${stage} policy command must contain 1-16 non-empty strings`)
+    }
+    const timeoutMs = config.timeout_ms ?? PROJECT_POLICY_TIMEOUT_DEFAULT_MS
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > PROJECT_POLICY_TIMEOUT_MAX_MS) {
+      throw new Error(`project ${stage} policy timeout_ms must be 1-${PROJECT_POLICY_TIMEOUT_MAX_MS}`)
+    }
+    policies[stage] = {
+      id: config.id,
+      command: [...config.command],
+      timeoutMs,
+      root: policyRoot,
+      digest: createHash('sha256').update(JSON.stringify({ stage, config, treeDigest })).digest('hex'),
+    }
+  }
+  return {
+    apiVersion: manifest.api_version,
+    manifestDigest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
+    policies,
+    root: repositoryRoot,
+  }
+}
+
+function resolvedPolicyCommand(policy, repositoryRoot) {
+  return policy.command.map((part, index) => {
+    const looksLikePath = part.startsWith('.') || part.includes('/') || part.includes('\\')
+    if (!looksLikePath) return part
+    const candidate = resolve(repositoryRoot, part)
+    if (!existsSync(candidate)) return part
+    const canonical = realpathSync(candidate)
+    if (!inside(policy.root, canonical)) {
+      throw new Error(`project policy command path leaves .caw/project: ${part}`)
+    }
+    const stat = lstatSync(canonical)
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`project policy command path is not a regular file: ${part}`)
+    }
+    return canonical
+  })
+}
+
+function projectPolicyOutputSchema(stage, apiVersion, context) {
+  if (apiVersion >= 2 && stage === 'planning') {
+    return context?.phase === 'population'
+      ? PROJECT_POLICY_V2_PLANNING_POPULATION_SCHEMA
+      : PROJECT_POLICY_V2_PLANNING_REQUEST_SCHEMA
+  }
+  if (apiVersion >= 2 && stage === 'gate') return PROJECT_POLICY_V2_GATE_SCHEMA
+  if (apiVersion === 3 && stage === 'acceptance') return PROJECT_POLICY_V3_ACCEPTANCE_SCHEMA
+  return PROJECT_POLICY_OUTPUT_SCHEMAS[stage]
+}
+
+function validateProjectPolicyOutput(stage, policy, output, apiVersion = 1, context = {}) {
+  const issue = canonicalIssue(projectPolicyOutputSchema(stage, apiVersion, context), output)
+  if (issue) throw new Error(`project ${stage} policy returned invalid output at ${issue.path}: ${issue.message}`)
+  const strings = stage === 'planning'
+    ? [...output.issues, ...output.instructions,
+      ...(apiVersion >= 2 && context?.phase !== 'population' ? [output.risk.class] : []),
+      ...(apiVersion >= 2 && context?.phase === 'population'
+        ? [output.attestation.population_digest, output.attestation.evidence] : [])]
+    : stage === 'review'
+      ? [...output.instructions, ...output.criteria.flatMap((row) =>
+          [row.id, row.section, row.criterion])]
+      : stage === 'gate' ? [output.reason]
+      : stage === 'acceptance' ? output.cases.flatMap((row) => [
+        row.id, ...row.criterion_ids, row.surface_id, row.transition_id,
+        row.production_consumer, row.scenario, row.observable, row.mutation,
+        row.evidence_kind, row.selector,
+      ])
+      : [output.subject]
+  if (strings.some((value) => Buffer.byteLength(value) > 8000)) {
+    throw new Error(`project ${stage} policy returned a string over 8000 bytes`)
+  }
+  if (stage === 'planning' && output.issues.some((value) => !value.trim())) {
+    throw new Error('project planning policy returned an empty issue')
+  }
+  if (['planning', 'review'].includes(stage) &&
+      output.instructions.some((value) => !value.trim())) {
+    throw new Error(`project ${stage} policy returned an empty instruction`)
+  }
+  if (stage === 'planning' && apiVersion >= 2 && context?.phase !== 'population' &&
+      !/^[a-z][a-z0-9.-]{0,63}$/.test(output.risk.class)) {
+    throw new Error('project planning policy returned an invalid risk class')
+  }
+  if (stage === 'planning' && apiVersion >= 2 && context?.phase === 'population') {
+    if (!/^[0-9a-f]{64}$/.test(output.attestation.population_digest)) {
+      throw new Error('project planning policy returned an invalid population digest')
+    }
+    if (output.attestation.state === 'complete' && !output.attestation.evidence.trim()) {
+      throw new Error('project planning policy must evidence a complete population attestation')
+    }
+  }
+  if (stage === 'gate' && apiVersion >= 2 && output.action === 'retry') {
+    if (context?.state !== 'red' || !context?.task) {
+      throw new Error('project gate policy may retry only a red fast task gate')
+    }
+    if (output.classification !== 'flaky' || !output.reason.trim()) {
+      throw new Error('project gate policy retry requires flaky classification and a reason')
+    }
+  }
+  if (stage === 'gate' && apiVersion >= 2 &&
+      output.baseline_inputs_digest !== undefined &&
+      !/^[0-9a-f]{64}$/.test(output.baseline_inputs_digest)) {
+    throw new Error('project gate policy returned an invalid baseline inputs digest')
+  }
+  if (stage === 'gate' && output.baseline_inputs_digest !== undefined &&
+      context?.kind !== 'full-baseline-inputs') {
+    throw new Error('project gate policy returned baseline inputs outside the cache-input phase')
+  }
+  if (stage === 'review') {
+    const ids = output.criteria.map((row) => row.id)
+    if (ids.some((id) => !/^[a-z][a-z0-9.-]{0,63}$/.test(id))) {
+      throw new Error('project review policy returned an invalid criterion id')
+    }
+    if (new Set(ids).size !== ids.length) {
+      throw new Error('project review policy returned duplicate criterion ids')
+    }
+    if (output.criteria.some((row) => !row.section.trim() || !row.criterion.trim())) {
+      throw new Error('project review policy returned an empty criterion')
+    }
+  }
+  if (stage === 'acceptance') {
+    const ids = output.cases.map((row) => row.id)
+    if (ids.some((id) => !/^[a-z][a-z0-9.-]{0,127}$/.test(id))) {
+      throw new Error('project acceptance policy returned an invalid case id')
+    }
+    if (new Set(ids).size !== ids.length) {
+      throw new Error('project acceptance policy returned duplicate case ids')
+    }
+    const criteria = new Set((context.criteria || []).map((row) => row.id))
+    const surfaces = new Map((context.surfaces || []).map((row) => [row.id, row]))
+    const transitions = new Map((context.transitions || []).map((row) => [row.id, row]))
+    for (const row of output.cases) {
+      if (new Set(row.criterion_ids).size !== row.criterion_ids.length) {
+        throw new Error(`project acceptance case ${row.id} contains duplicate criterion ids`)
+      }
+      for (const criterionId of row.criterion_ids) {
+        if (!criteria.has(criterionId)) {
+          throw new Error(`project acceptance case ${row.id} names unknown criterion ${criterionId}`)
+        }
+      }
+      if (!surfaces.has(row.surface_id)) {
+        throw new Error(`project acceptance case ${row.id} names unknown surface ${row.surface_id}`)
+      }
+      if (row.transition_id) {
+        const transition = transitions.get(row.transition_id)
+        if (!transition) {
+          throw new Error(`project acceptance case ${row.id} names unknown transition ${row.transition_id}`)
+        }
+        if (transition.surface !== row.surface_id) {
+          throw new Error(`project acceptance case ${row.id} links a transition from another surface`)
+        }
+      }
+      for (const [name, value] of Object.entries({
+        production_consumer: row.production_consumer,
+        scenario: row.scenario,
+        observable: row.observable,
+        mutation: row.mutation,
+        evidence_kind: row.evidence_kind,
+        selector: row.selector,
+      })) {
+        if (!value.trim()) throw new Error(`project acceptance case ${row.id} has empty ${name}`)
+      }
+      if (!/^[a-z][a-z0-9.-]{0,63}$/.test(row.evidence_kind)) {
+        throw new Error(`project acceptance case ${row.id} has invalid evidence_kind`)
+      }
+    }
+    const coveredCriteria = new Set(output.cases.flatMap((row) => row.criterion_ids))
+    const uncoveredCriteria = [...criteria].filter((id) => !coveredCriteria.has(id))
+    if (uncoveredCriteria.length) {
+      throw new Error(`project acceptance matrix does not cover criterion ids: ${uncoveredCriteria.join(', ')}`)
+    }
+    const coveredTransitions = new Set(output.cases.map((row) => row.transition_id).filter(Boolean))
+    const uncoveredTransitions = [...transitions.keys()].filter((id) => !coveredTransitions.has(id))
+    if (uncoveredTransitions.length) {
+      throw new Error(`project acceptance matrix does not cover transition ids: ${uncoveredTransitions.join(', ')}`)
+    }
+  }
+  if (stage === 'gate' && output.action === 'stop' && !output.reason.trim()) {
+    throw new Error('project gate policy must explain a stop action')
+  }
+  if (stage === 'commit' && (output.subject.includes('\n') || output.subject.length > 120)) {
+    throw new Error('project commit policy subject must be one line of at most 120 characters')
+  }
+}
+
+function recordProjectPolicyCall(policy, stage, startedAt, status, context = {}, apiVersion = 1,
+  output = null) {
+  const run = beginRunRecord()
+  run.policyCalls ||= []
+  run.policyCalls.push({
+    stage, id: policy.id, digest: policy.digest,
+    api_version: apiVersion,
+    ...(stage === 'planning' && context.phase ? { phase: context.phase } : {}),
+    ...(stage === 'gate' && output ? {
+      decision: {
+        action: output.action,
+        classification: output.classification || null,
+        reason: output.reason,
+        baseline_inputs_digest: output.baseline_inputs_digest || null,
+      },
+    } : {}),
+    duration_ms: Date.now() - startedAt, status,
+  })
+  run.stages.push({
+    kind: 'project-policy', name: stage, state: status,
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    policy_id: policy.id,
+  })
+  writeRunManifest(status === 'success' ? 'active' : 'failed')
+}
+
+function runProjectPolicy(stage, context, { record = true, set = projectPolicySet } = {}) {
+  const policy = set?.policies?.[stage]
+  if (!policy) return null
+  const apiVersion = set.apiVersion || 1
+  const request = `${JSON.stringify({ api_version: apiVersion, stage, context })}\n`
+  if (Buffer.byteLength(request) > PROJECT_POLICY_INPUT_MAX) {
+    throw new Error(`project ${stage} policy input exceeds ${PROJECT_POLICY_INPUT_MAX} bytes`)
+  }
+  const command = resolvedPolicyCommand(policy, set.root)
+  mkdirSync(PROJECT_POLICY_SCRATCH_PARENT, { recursive: true, mode: 0o700 })
+  const scratch = mkdtempSync(join(PROJECT_POLICY_SCRATCH_PARENT, `${stage}-`))
+  const startedAt = Date.now()
+  const before = projectPolicyStateDigest(set.root)
+  let callStatus = 'failure'
+  let policyOutput = null
+  try {
+    const pathValue = process.env.PATH || process.env.Path || ''
+    const env = {
+      PATH: pathValue,
+      ...(process.env.PATHEXT ? { PATHEXT: process.env.PATHEXT } : {}),
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
+      TMPDIR: scratch, TEMP: scratch, TMP: scratch,
+      CAW_POLICY_API_VERSION: String(apiVersion), CAW_POLICY_STAGE: stage,
+    }
+    const result = spawnSync(command[0], command.slice(1), {
+      cwd: scratch,
+      input: request,
+      encoding: 'utf8',
+      env,
+      shell: false,
+      timeout: policy.timeoutMs,
+      maxBuffer: PROJECT_POLICY_OUTPUT_MAX,
+      windowsHide: true,
+    })
+    if (projectPolicyStateDigest(set.root) !== before) {
+      throw new Error(`project ${stage} policy changed protected project state`)
+    }
+    if (result.error) {
+      const timedOut = result.error.code === 'ETIMEDOUT'
+      throw new Error(`project ${stage} policy ${timedOut ? 'timed out' : 'could not run'}: ${result.error.message}`)
+    }
+    if (result.status !== 0) {
+      const detail = `${result.stderr || ''}\n${result.stdout || ''}`.trim().slice(-8000)
+      throw new Error(`project ${stage} policy exited ${result.status}${detail ? `: ${detail}` : ''}`)
+    }
+    let output
+    try { output = JSON.parse(result.stdout) }
+    catch (error) { throw new Error(`project ${stage} policy returned invalid JSON: ${error.message}`) }
+    validateProjectPolicyOutput(stage, policy, output, set.apiVersion || 1, context)
+    policyOutput = output
+    callStatus = 'success'
+    return { output, policy }
+  } finally {
+    if (record) {
+      recordProjectPolicyCall(policy, stage, startedAt, callStatus, context, apiVersion, policyOutput)
+    }
+    removeTree(scratch)
+  }
+}
+
+function verifyProjectPolicies(set = readProjectPolicies()) {
+  if (!Object.keys(set.policies).length) {
+    say(`no project policies configured at ${PROJECT_POLICY_MANIFEST}`)
+    return
+  }
+  const samples = {
+    planning: { request: 'verify project policies', profile: '' },
+    review: { spec: '', files: [], criteria: [] },
+    gate: { command: 'verify', state: 'green', status: 0, output: '' },
+    commit: { title: 'Verify project policies', spec: '', files: [] },
+    acceptance: {
+      task: 'verify.md',
+      criteria: [{ id: 'done-when-1', section: 'Done when', criterion: 'verification passes' }],
+      surfaces: [{ id: 'verify-surface', responsibility: 'policy verification' }],
+      transitions: [{
+        id: 'transition-verify', surface: 'verify-surface', from: 'before',
+        event: 'verify', to: 'after',
+      }],
+    },
+  }
+  for (const stage of PROJECT_POLICY_STAGES) {
+    if (!set.policies[stage]) continue
+    if (stage === 'planning' && set.apiVersion >= 2) {
+      const requestResult = runProjectPolicy(stage, {
+        phase: 'request', ...samples.planning,
+      }, { record: false, set })
+      const populationDigest = createHash('sha256').update(stableJson([])).digest('hex')
+      runProjectPolicy(stage, {
+        phase: 'population', ...samples.planning,
+        risk: requestResult.output.risk,
+        population: {
+          state: 'none', returned: 0, repaired: 0, dropped: 0, retained: 0,
+          witness_withdrawn: false, digest: populationDigest, cases: [],
+        },
+      }, { record: false, set })
+      say(`${stage}: ${requestResult.policy.id} ${requestResult.policy.digest.slice(0, 12)} — valid (request, population)`)
+    } else if (stage === 'gate' && set.apiVersion >= 2) {
+      const result = runProjectPolicy(stage, samples.gate, { record: false, set })
+      runProjectPolicy(stage, {
+        ...samples.gate,
+        task: null,
+        kind: 'full-baseline-inputs',
+        state: 'not-run',
+        status: null,
+        known_inputs: { version: 1 },
+      }, { record: false, set })
+      say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid (gate, baseline-inputs)`)
+    } else {
+      const result = runProjectPolicy(stage, samples[stage], { record: false, set })
+      say(`${stage}: ${result.policy.id} ${result.policy.digest.slice(0, 12)} — valid`)
+    }
+  }
+}
+
+function appendPlanningPolicyInstructions(profileText, instructions, phase) {
+  if (!instructions.length) return profileText
+  return `${profileText.trimEnd()}\n\n## Project planning policy instructions` +
+    `${phase ? ` — ${phase}` : ''}\n\n` + instructions.map((item) => `- ${item}`).join('\n') + '\n'
+}
+
+function stopForPlanningPolicy(result, phase = '') {
+  if (result.output.issues.length) {
+    say(`\nproject planning policy ${result.policy.id}` +
+      `${phase ? ` (${phase})` : ''} stopped before ` +
+      `${phase === 'population' ? 'architect' : 'enumerator'}:`)
+    say(`  - ${result.output.issues.join('\n  - ')}`)
+    die('resolve the project policy issues, then run planning again. ' +
+      (phase === 'population'
+        ? 'The enumerator completed, but no architect or plan-reviewer call ran.'
+        : 'No provider call ran.'))
+  }
+}
+
+function applyPlanningPolicy(description, profileText) {
+  const apiVersion = projectPolicySet?.apiVersion || 1
+  const context = apiVersion === 2
+    ? { phase: 'request', request: description, profile: profileText }
+    : { request: description, profile: profileText }
+  const result = runProjectPolicy('planning', context)
+  if (!result) return { text: profileText, risk: null }
+  stopForPlanningPolicy(result, apiVersion === 2 ? 'request' : '')
+  return {
+    text: appendPlanningPolicyInstructions(profileText, result.output.instructions,
+      apiVersion === 2 ? 'request' : ''),
+    risk: apiVersion === 2 ? result.output.risk : null,
+  }
+}
+
+function applyPopulationPolicy(description, profileText, population, requestedRisk) {
+  if (!requestedRisk) return { text: profileText, risk: null }
+  const record = populationPlanRecord(population)
+  const result = runProjectPolicy('planning', {
+    phase: 'population',
+    request: description,
+    profile: profileText,
+    risk: requestedRisk,
+    population: {
+      ...record,
+      cases: population.map((item) => ({ case: item.case, source: item.source })),
+    },
+  })
+  if (!result) throw new Error('project planning policy disappeared before population attestation')
+  stopForPlanningPolicy(result, 'population')
+  const attestation = result.output.attestation
+  if (attestation.population_digest !== record.digest) {
+    throw new Error('project planning policy attested a different population digest')
+  }
+  if (record.state === 'none' && attestation.state !== 'none') {
+    throw new Error(`project planning policy attested ${attestation.state} for an empty population`)
+  }
+  if (record.state === 'sample' && attestation.state === 'none') {
+    throw new Error('project planning policy withdrew a non-empty population')
+  }
+  const ranks = { none: 0, sample: 1, complete: 2 }
+  if (ranks[attestation.state] < ranks[requestedRisk.population_requirement]) {
+    die(`project risk class ${requestedRisk.class} requires population ` +
+      `${requestedRisk.population_requirement}, but policy attested ${attestation.state}`)
+  }
+  const risk = {
+    ...requestedRisk,
+    population_attestation: attestation.state,
+    population_digest: attestation.population_digest,
+    evidence: attestation.evidence,
+    policy_id: result.policy.id,
+    policy_digest: result.policy.digest,
+  }
+  const run = beginRunRecord()
+  run.risk = risk
+  writeRunManifest('active')
+  return {
+    text: appendPlanningPolicyInstructions(profileText, result.output.instructions, 'population'),
+    risk,
+  }
+}
+
+function projectPolicySnapshot() {
+  if (!projectPolicySet?.manifestDigest) return null
+  const snapshot = {
+    api_version: projectPolicySet.apiVersion,
+    manifest_digest: projectPolicySet.manifestDigest,
+    policies: Object.fromEntries(Object.entries(projectPolicySet.policies)
+      .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+  }
+  return {
+    ...snapshot,
+    set_digest: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
+  }
+}
+
 function validateBlockedValue(role, value) {
   if (!Object.prototype.hasOwnProperty.call(value, 'blocked')) return
   const raw = value.blocked.trim()
-  if (raw && !blocked(raw)) {
-    schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder')
+  if (!raw || blocked(raw)) return
+  // The executor is the one role whose output is not its words. Its delivery is in the tree, and
+  // the gate and the reviewer exist to judge it; refusing the whole call over the notation of an
+  // empty field would stop exactly the work this field is meant to let through — a contract
+  // failure there has no repair, so it ends the run as surely as the misread blocker did. The
+  // placeholder is normalised, said out loud, and recorded, and the delivery goes on to be judged.
+  if (role === 'executor') {
+    say(`  executor wrote a placeholder in blocked (${JSON.stringify(value.blocked)}); ` +
+      'reading it as not blocked, so the delivery goes to the gate and the reviewer')
+    try {
+      recordEngineDiagnostic(role, 'blocked-placeholder', { value: boundedUtf8(value.blocked, 256).text })
+    } catch { /* the delivery must still be judged when the run record cannot be written */ }
+    value.blocked = ''
+    return
   }
+  schemaFailure(role, '$.blocked', 'use the empty string, not a placeholder', value)
+}
+
+function executorClaimsIssue(claims, criteria = [], acceptanceCases = []) {
+  if (!Array.isArray(claims)) return 'must be an array'
+  const criterionIds = new Set(criteria.map((row) => row.id))
+  const casesById = new Map(acceptanceCases.map((row) => [row.id, row]))
+  const seen = new Set()
+  for (const [index, claim] of claims.entries()) {
+    if (!/^[a-z][a-z0-9.-]{0,63}$/.test(claim.id || '')) return `[${index}].id is invalid`
+    if (seen.has(claim.id)) return `duplicate id ${JSON.stringify(claim.id)}`
+    seen.add(claim.id)
+    if (!claim.summary.trim()) return `${claim.id} has an empty summary`
+    if (claim.result !== 'not-run' && !claim.command.trim()) {
+      return `${claim.id} reports ${claim.result} without a command`
+    }
+    if (!claim.criterion_ids.length && !claim.acceptance_case_ids.length) {
+      return `${claim.id} is not linked to a criterion or acceptance case`
+    }
+    const unknownCriteria = claim.criterion_ids.filter((id) => !criterionIds.has(id))
+    if (unknownCriteria.length) return `${claim.id} names unknown criterion id(s): ${unknownCriteria.join(', ')}`
+    const unknownCases = claim.acceptance_case_ids.filter((id) => !casesById.has(id))
+    if (unknownCases.length) return `${claim.id} names unknown acceptance case id(s): ${unknownCases.join(', ')}`
+    const wrongSelectors = claim.acceptance_case_ids.filter((id) =>
+      casesById.get(id).selector !== claim.selector)
+    if (wrongSelectors.length) {
+      return `${claim.id} has the wrong selector for acceptance case id(s): ${wrongSelectors.join(', ')}`
+    }
+    if (new Set(claim.criterion_ids).size !== claim.criterion_ids.length ||
+        new Set(claim.acceptance_case_ids).size !== claim.acceptance_case_ids.length) {
+      return `${claim.id} repeats a linkage id`
+    }
+  }
+  return null
+}
+
+function planningId(kind, ...parts) {
+  return `${kind}-${createHash('sha256').update(stableJson(parts)).digest('hex').slice(0, 12)}`
+}
+
+function planningLedger(out) {
+  const tasks = (out.tasks || []).map((task) => ({
+    id: planningId('plan-task', task.slug),
+    slug: task.slug,
+    title: task.title || '',
+  }))
+  const taskBySlug = new Map(tasks.map((task) => [task.slug, task]))
+  const requirements = (out.tasks || []).flatMap((task) => {
+    const taskId = taskBySlug.get(task.slug)?.id || planningId('plan-task', task.slug)
+    const ordinary = ['read', 'change', 'done_when'].flatMap((section) =>
+      (task[section] || []).map((text) => ({
+        id: planningId('plan-requirement', task.slug, section, text),
+        task_id: taskId,
+        section,
+        text,
+      })))
+    const surfaces = (task.surfaces || []).map((surface) => ({
+      id: planningId('plan-requirement', task.slug, 'surface', surface.id, surface.responsibility),
+      task_id: taskId, section: 'surface', text: `${surface.id}: ${surface.responsibility}`,
+    }))
+    const transitions = (task.state_machines || []).flatMap((machine) =>
+      (machine.transitions || []).map((transition) => ({
+        id: planningId('plan-requirement', task.slug, 'state-transition', machine.surface,
+          transition.from, transition.event, transition.to),
+        task_id: taskId, section: 'state-transition',
+        text: `${machine.surface}: ${transition.from} --${transition.event}--> ${transition.to}`,
+      })))
+    return [...ordinary, ...surfaces, ...transitions]
+  })
+  const requirementByKey = new Map(requirements.map((row) =>
+    [`${row.task_id}\0${row.section}\0${row.text}`, row]))
+  const cases = (out.coverage || []).map((row) => ({
+    id: planningId('plan-case', row.case),
+    case: row.case,
+  }))
+  const relations = (out.coverage || []).map((row, index) => {
+    const task = taskBySlug.get(row.task)
+    const caseRow = cases[index]
+    const criterionIds = (row.acceptance_criteria || []).map((criterion) =>
+      requirementByKey.get(`${task?.id}\0done_when\0${criterion}`)?.id).filter(Boolean)
+    return {
+      id: planningId('plan-relation', caseRow.id, task?.id || row.task, [...criterionIds].sort()),
+      case_id: caseRow.id,
+      case: row.case,
+      task_id: task?.id || null,
+      task: row.task,
+      criterion_ids: criterionIds,
+    }
+  })
+  return { version: 1, tasks, requirements, cases, relations }
+}
+
+function executorBudgetFloor(taskOrSpec) {
+  const body = typeof taskOrSpec === 'string'
+    ? taskOrSpec
+    : JSON.stringify(taskOrSpec || {})
+  const riskBody = (typeof taskOrSpec === 'string'
+    ? taskOrSpec
+    : [
+        taskOrSpec?.title,
+        ...(taskOrSpec?.read || []), ...(taskOrSpec?.change || []),
+        ...(taskOrSpec?.done_when || []),
+        ...(taskOrSpec?.surfaces || []).flatMap((surface) =>
+          [surface.id, surface.responsibility]),
+        ...(taskOrSpec?.state_machines || []).flatMap((machine) => [
+          machine.surface,
+          ...(machine.transitions || []).map((transition) => transition.event),
+        ]),
+      ].filter(Boolean).join('\n'))
+    .split('\n')
+    .map((line) => line.replace(/\b(?:do not|don't|must not|never|without|no)\b.*$/i, ''))
+    .join('\n')
+  const surfaceCount = typeof taskOrSpec === 'string'
+    ? (body.split(/^## Surfaces\s*$/m)[1]?.split(/^## /m)[0]
+      ?.split('\n').filter((line) => /^-\s+`[^`]+`/.test(line)).length || 0)
+    : (taskOrSpec?.surfaces?.length || 0)
+  const transitionCount = typeof taskOrSpec === 'string'
+    ? (body.match(/^\s+-\s+`[^`]+`\s+--\s+.+\s+-->\s+`[^`]+`\s*$/gm)?.length || 0)
+    : (taskOrSpec?.state_machines || []).reduce((sum, machine) =>
+      sum + (machine.transitions?.length || 0), 0)
+  const sensitive = /\b(?:migration|database|schema|postgres|supabase|rls|row[- ]level security|authentication|authorization|credential|secret|security|permission|privilege|grant|access policy|security policy)\b/i
+    .test(riskBody)
+  if (surfaceCount > 1 || sensitive) {
+    return {
+      class: 'large',
+      reason: surfaceCount > 1
+        ? `${surfaceCount} indivisible surfaces make this cross-layer work`
+        : 'the task names database, authorization, security, credential, or migration work',
+    }
+  }
+  if (transitionCount >= 4) {
+    return { class: 'normal', reason: `${transitionCount} state transitions need a normal floor` }
+  }
+  return { class: 'small', reason: 'one non-sensitive surface with fewer than four transitions' }
+}
+
+function effectiveExecutorBudgetClass(requested, taskOrSpec) {
+  const proposed = requested || 'normal'
+  if (!EXECUTOR_BUDGET_RANK.has(proposed)) {
+    throw new TypeError(`executor_budget must be small, normal, or large — got ${JSON.stringify(proposed)}`)
+  }
+  const floor = executorBudgetFloor(taskOrSpec)
+  const effective = EXECUTOR_BUDGET_RANK.get(proposed) >= EXECUTOR_BUDGET_RANK.get(floor.class)
+    ? proposed : floor.class
+  return { requested: proposed, floor: floor.class, effective, reason: floor.reason }
+}
+
+function executorBudgetSelections(tasks) {
+  return (tasks || []).map((task) => ({
+    task: task.slug,
+    ...effectiveExecutorBudgetClass(task.executor_budget, task),
+  }))
 }
 
 function validatePlanRelations(out) {
   const slugs = out.tasks.map((task) => task.slug.trim())
   const unique = new Set(slugs)
   if (slugs.some((slug) => !slug)) schemaFailure('architect', '$.tasks', 'task slug must not be empty')
+  if (out.tasks.some((task) => task.slug !== task.slug.trim())) {
+    schemaFailure('architect', '$.tasks', 'task slugs must not contain surrounding whitespace')
+  }
   if (unique.size !== slugs.length) schemaFailure('architect', '$.tasks', 'task slugs must be unique')
+  for (const [taskIndex, task] of out.tasks.entries()) {
+    for (const section of ['read', 'change', 'done_when']) {
+      if (task[section].some((text) => !text.trim())) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].${section}`, 'requirements must not be empty')
+      }
+      if (new Set(task[section]).size !== task[section].length) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].${section}`,
+          'requirements must not be repeated')
+      }
+    }
+    const surfaceIds = task.surfaces.map((surface) => surface.id.trim())
+    if (surfaceIds.some((id) => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) ||
+        task.surfaces.some((surface) => !surface.responsibility.trim())) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].surfaces`,
+        'each surface needs a kebab-case id and a non-empty responsibility')
+    }
+    if (new Set(surfaceIds).size !== surfaceIds.length) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].surfaces`, 'surface ids must be unique')
+    }
+    if (surfaceIds.length > 1 && !task.indivisible_reason.trim()) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].indivisible_reason`,
+        'a task with unrelated surfaces must explain why they are indivisible')
+    }
+    if (surfaceIds.length === 1 && task.indivisible_reason.trim()) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].indivisible_reason`,
+        'must be empty when the task has one surface')
+    }
+    const machineSurfaces = task.state_machines.map((machine) => machine.surface.trim())
+    if (new Set(machineSurfaces).size !== machineSurfaces.length ||
+        machineSurfaces.some((surface) => !surfaceIds.includes(surface)) ||
+        surfaceIds.some((surface) => !machineSurfaces.includes(surface))) {
+      schemaFailure('architect', `$.tasks[${taskIndex}].state_machines`,
+        'every surface must have exactly one state machine and no unknown surface may appear')
+    }
+    for (const [machineIndex, machine] of task.state_machines.entries()) {
+      const states = machine.states.map((state) => state.trim())
+      if (states.some((state) => !state) || new Set(states).size !== states.length) {
+        schemaFailure('architect', `$.tasks[${taskIndex}].state_machines[${machineIndex}].states`,
+          'states must be non-empty and unique')
+      }
+      for (const [transitionIndex, transition] of machine.transitions.entries()) {
+        if (!states.includes(transition.from) || !states.includes(transition.to) ||
+            !transition.event.trim()) {
+          schemaFailure('architect',
+            `$.tasks[${taskIndex}].state_machines[${machineIndex}].transitions[${transitionIndex}]`,
+            'from and to must name declared states and event must be non-empty')
+        }
+      }
+    }
+  }
+  const globalSurfaces = out.tasks.flatMap((task) => task.surfaces.map((surface) => surface.id))
+  if (new Set(globalSurfaces).size !== globalSurfaces.length) {
+    schemaFailure('architect', '$.tasks',
+      'surface ids must be globally unique; shared surfaces belong in one explicitly indivisible task')
+  }
   const unknown = out.coverage.find((row) => !unique.has(row.task))
   if (unknown) {
     schemaFailure('architect', '$.coverage', `case ${JSON.stringify(unknown.case)} names unknown task ${JSON.stringify(unknown.task)}`)
@@ -2154,18 +5253,70 @@ function validatePlanRelations(out) {
   if (new Set(cases).size !== cases.length) {
     schemaFailure('architect', '$.coverage', 'each case must appear exactly once')
   }
+  const uncoveredTasks = slugs.filter((slug) => !out.coverage.some((row) => row.task === slug))
+  if (uncoveredTasks.length) {
+    schemaFailure('architect', '$.coverage',
+      `every task must handle at least one case; missing ${uncoveredTasks.join(', ')}`)
+  }
+  for (const [index, row] of out.coverage.entries()) {
+    if (!row.case.trim()) schemaFailure('architect', `$.coverage[${index}].case`, 'must not be empty')
+    if (!Array.isArray(row.acceptance_criteria) || !row.acceptance_criteria.length) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        'must name at least one done_when criterion')
+    }
+    if (new Set(row.acceptance_criteria).size !== row.acceptance_criteria.length) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        'must not repeat a criterion')
+    }
+    const task = out.tasks.find((candidate) => candidate.slug.trim() === row.task)
+    const unknownCriterion = row.acceptance_criteria.find((criterion) =>
+      !task.done_when.includes(criterion))
+    if (unknownCriterion !== undefined) {
+      schemaFailure('architect', `$.coverage[${index}].acceptance_criteria`,
+        `unknown done_when criterion ${JSON.stringify(unknownCriterion)} for task ${JSON.stringify(row.task)}`)
+    }
+  }
+  return planningLedger(out)
 }
 
-function validateCarriedSet(carried, open) {
+function planRelationIssue(ledger, rows) {
+  if (!Array.isArray(rows)) return 'relations must be an array'
+  const expected = new Map((ledger?.relations || []).map((relation) => [relation.id, relation]))
+  const seen = new Set()
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return 'every relation row must be an object'
+    }
+    if (seen.has(row.id)) return `duplicate relation id ${JSON.stringify(row.id)}`
+    if (!expected.has(row.id)) return `unknown relation id ${JSON.stringify(row.id)}`
+    if (!['covered', 'uncovered'].includes(row.state)) {
+      return `${row.id} has unknown state ${JSON.stringify(row.state)}`
+    }
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) {
+      return `${row.id} has empty evidence`
+    }
+    seen.add(row.id)
+  }
+  const missing = [...expected.keys()].filter((id) => !seen.has(id))
+  return missing.length ? `missing relation id(s): ${missing.join(', ')}` : null
+}
+
+function carriedSetIssue(carried, open) {
+  if (!Array.isArray(carried)) return 'must be an array'
   const expected = new Set(open.map((item) => item.id))
   const seen = new Set()
   for (const item of carried) {
-    if (seen.has(item.id)) schemaFailure('reviewer', '$.carried', `duplicate id ${JSON.stringify(item.id)}`)
-    if (!expected.has(item.id)) schemaFailure('reviewer', '$.carried', `unknown or settled id ${JSON.stringify(item.id)}`)
+    if (seen.has(item.id)) return `duplicate id ${JSON.stringify(item.id)}`
+    if (!expected.has(item.id)) return `unknown or settled id ${JSON.stringify(item.id)}`
     seen.add(item.id)
   }
   const missing = [...expected].filter((id) => !seen.has(id))
-  if (missing.length) schemaFailure('reviewer', '$.carried', `missing open id(s): ${missing.join(', ')}`)
+  return missing.length ? `missing open id(s): ${missing.join(', ')}` : null
+}
+
+function validateCarriedSet(carried, open) {
+  const issue = carriedSetIssue(carried, open)
+  if (issue) schemaFailure('reviewer', '$.carried', issue)
 }
 
 function validateCallResult(decoded, role, binding) {
@@ -2179,7 +5330,7 @@ function validateCallResult(decoded, role, binding) {
   }
   exact(decoded, ['canonical', 'finalResponse'], `${role} decoded result`)
   const result = decoded.canonical
-  exact(result, ['value', 'provider', 'requested', 'models', 'tokens', 'cost', 'durationMs'],
+  exact(result, ['value', 'provider', 'requested', 'models', 'tokens', 'telemetry', 'cost', 'durationMs'],
     `${role} canonical call result`)
   if (result.provider !== binding.provider) throw new Error(`${role} result provider does not match binding`)
   exact(result.requested, ['model', 'reasoning', 'native'], `${role}.requested`)
@@ -2198,6 +5349,12 @@ function validateCallResult(decoded, role, binding) {
   exact(result.tokens, ['input', 'output', 'cachedRead', 'cachedWritten', 'reasoning'], `${role}.tokens`)
   for (const value of Object.values(result.tokens)) {
     if (!(value === null || typeof value === 'number')) throw new Error(`${role}.tokens has invalid observation`)
+  }
+  exact(result.telemetry, ['eventCount', 'toolEventCount', 'eventBytes'], `${role}.telemetry`)
+  for (const [key, value] of Object.entries(result.telemetry)) {
+    if (!(value === null || (Number.isSafeInteger(value) && value >= 0))) {
+      throw new Error(`${role}.telemetry.${key} is invalid`)
+    }
   }
   if (result.cost !== null) {
     exact(result.cost, ['amount', 'currency'], `${role}.cost`)
@@ -2240,7 +5397,7 @@ function consumeInvocationTransport(invocation, resultTransport) {
     }
     return readFileSync(finalPath, 'utf8')
   } finally {
-    if (root) rmSync(root, { recursive: true, force: true })
+    if (root) removeTree(root)
   }
 }
 
@@ -2251,7 +5408,7 @@ function discardInvocationTransport(invocation) {
     const root = realpathSync(candidate)
     const transportParent = realpathSync(ADAPTER_TRANSPORT_PARENT)
     if (inside(transportParent, root) && root.split(/[\\/]/).pop().startsWith('transport-')) {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   } catch { /* an invalid transport is refused by the caller; never broaden cleanup */ }
 }
@@ -2275,6 +5432,9 @@ function recordMissingEnumeratorPopulation(role, reason, status = 'active') {
 }
 
 function agent(role, prompt, schema, f, spec, context = null) {
+  providerBudgetState.limits = f.provider_budgets
+  const budgetIssue = providerBudgetIssue(role, f.provider_budgets)
+  if (budgetIssue) die(budgetIssue)
   const binding = resolvedRuntime.value.roles[role]
   const provider = resolvedRuntime.providers.get(binding.provider)
   const descriptor = provider.adapter.describe({ role, cliVersion: provider.cliVersion })
@@ -2285,6 +5445,19 @@ function agent(role, prompt, schema, f, spec, context = null) {
   const scratchRoot = context?.scratchRoot || invocationScratch?.scratchRoot || null
   const env = { ...process.env, PWD: context?.workingRoot || process.cwd(), CAW_ROLE: role }
   if (spec) env.CAW_SPEC = spec
+  const executorBudget = role === 'executor' ? context?.executorBudget || null : null
+  if (executorBudget?.tool_events) {
+    env.CAW_EXECUTOR_MAX_TOOL_EVENTS = String(executorBudget.tool_events)
+  }
+  if (executorBudget?.event_bytes) {
+    env.CAW_EXECUTOR_MAX_EVENT_BYTES = String(executorBudget.event_bytes)
+  }
+  const gateProbe = role === 'executor' && context?.gateProbe
+    ? startGateProbe(f, spec, scratchRoot) : null
+  if (gateProbe) {
+    env.CAW_GATE_PROBE = gateProbe.command
+    prompt += gateProbeInstructions(gateProbe, f)
+  }
   const instructions = assembledInstructions(role, binding, provider, f.docs_language)
   const providerVector = providerLaunch(provider.executable, process.platform, binding.provider)
   let invocation
@@ -2311,7 +5484,15 @@ function agent(role, prompt, schema, f, spec, context = null) {
     die(`${role} adapter could not construct invocation: ${error?.message || error}`)
   }
 
-  beginRunRecord()
+  const attempt = beginProviderAttempt(role, provider, binding, invocation, f.provider_budgets, {
+    promptBytes: Buffer.byteLength(prompt || ''),
+    instructionsBytes: Buffer.byteLength(instructions),
+    dossier: context?.dossier || null,
+    executorBudget,
+    task: spec || null,
+    round: context?.round ?? null,
+    pass: context?.pass ?? null,
+  })
   process.stderr.write(`  · ${role} `)
   // The agent is the only long call in this script — the gates are seconds — so it is the
   // only one worth holding the machine awake for.
@@ -2331,13 +5512,24 @@ function agent(role, prompt, schema, f, spec, context = null) {
       env: invocation.env, cwd: invocation.cwd, timeout: AGENT_TIMEOUT_MS, killSignal: 'SIGKILL' })
   } finally {
     hold?.kill()
+    const probes = stopGateProbe(gateProbe)
+    if (probes?.length) {
+      try {
+        recordEngineDiagnostic(role, 'gate-probe', {
+          task: spec || null, requests: probes.length,
+          results: probes.slice(0, 32).map(({ state, status, duration_ms: duration, mutated, reason }) =>
+            ({ state, status, duration_ms: duration ?? null, mutated: Boolean(mutated), reason: reason || null })),
+        })
+      } catch { /* the executor's answer still has to be read */ }
+    }
   }
   // A timeout arrives as `r.error` as well, and answering it as a missing provider executable
   // would send the reader to fix a binary that ran fine and simply did not finish.
   if (r.error?.code === 'ETIMEDOUT') {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'call timed out')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'timeout')
+    writeStopRecord('role-timeout', { role, task: spec || null })
     die(`${role} did not finish within ${formatTimeout(AGENT_TIMEOUT_MS)} and was killed.\n` +
         `  Nothing came back, and whatever it spent is spent. If it was genuinely still working,\n` +
         `  the cap is what is wrong rather than the run: re-run it with a larger\n` +
@@ -2347,14 +5539,39 @@ function agent(role, prompt, schema, f, spec, context = null) {
   if (r.error) {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'call did not start')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'launch-error')
     die(`could not run "${bin}": ${r.error.message}`)
   }
   if (r.status !== 0) {
     discardInvocationTransport(invocation)
-    recordMissingEnumeratorPopulation(role, 'call failed')
-    recordProviderFailure(role, provider, r)
-    die(`${role} exited ${r.status}\n${provider.adapter.decodeFailure(r)}`)
+    const budgetExhausted = r.status === 86 &&
+      /CAW_EXECUTOR_BUDGET_EXHAUSTED/.test(`${r.stderr || ''}`)
+    const interrupted = Boolean(r.signal) || [130, 143].includes(r.status)
+    const failureText = provider.adapter.decodeFailure(r)
+    const expired = expiredCredentials(`${failureText}\n${r.stderr || ''}`)
+    recordMissingEnumeratorPopulation(role, interrupted ? 'call was interrupted' : 'call failed')
+    recordProviderFailure(role, provider, r, attempt,
+      budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted'
+        : expired ? 'credentials-expired' : 'nonzero-exit')
+    if (budgetExhausted) {
+      writeStopRecord('budget-exhausted', { role, task: spec || null })
+      die(`${role} reached its configured live budget and was stopped. Its partial edits remain ` +
+        `in the tree and the pre-call round state preserves recovery context.\n${r.stderr.trim()}`)
+    }
+    // Told apart from an ordinary failure because the answer is different and the operator
+    // cannot act on "exited 1". A credential outliving a task and not a queue is measured, not
+    // hypothetical: three installs reported it, once per queue on two of them, both times to a
+    // reviewer mid-build, and once to a plan-reviewer that took a finished enumerator and
+    // architect down with it. Nothing about the tree or the request is wrong when this fires.
+    if (expired) {
+      writeStopRecord('credentials-expired', { role, provider: binding.provider, task: spec || null })
+      die(`${role} could not authenticate: the provider says its credentials are expired or ` +
+        `rejected.\n  Nothing is wrong with the tree, the spec or the request — re-authenticate ` +
+        `the ${binding.provider} CLI and run the same command again.\n` +
+        `  A planning stage reuses whatever already answered, so the roles that finished are ` +
+        `not paid for twice.\n${failureText}`)
+    }
+    die(`${role} exited ${r.status}\n${failureText}`)
   }
   let decoded, result
   try {
@@ -2367,7 +5584,7 @@ function agent(role, prompt, schema, f, spec, context = null) {
   } catch (error) {
     discardInvocationTransport(invocation)
     recordMissingEnumeratorPopulation(role, 'response could not be decoded')
-    recordProviderFailure(role, provider, r)
+    recordProviderFailure(role, provider, r, attempt, 'decode-error')
     die(`${role} ${error?.message || error}`)
   }
   const callAccount = callAccounting(result.provider, result.cost, {
@@ -2379,25 +5596,41 @@ function agent(role, prompt, schema, f, spec, context = null) {
   const finalBytes = Buffer.byteLength(JSON.stringify(result.value))
   if (finalBytes > FINAL_VALUE_MAX) {
     recordMissingEnumeratorPopulation(role, 'response exceeded the canonical value limit', 'failed')
+    recordProviderFailure(role, provider, r, attempt, 'canonical-value-oversized', result)
     die(`${role} final canonical value is ${finalBytes} bytes; limit is ${FINAL_VALUE_MAX}`)
   }
   const canonicalProblem = canonicalIssue(schema, result.value, '$')
   if (canonicalProblem) {
     recordMissingEnumeratorPopulation(role, 'response failed schema validation', 'failed')
-    schemaFailure(role, canonicalProblem.path, canonicalProblem.message)
+    recordProviderFailure(role, provider, r, attempt, 'schema-validation', result)
+    removeInvocationScratch(invocationScratch)
+    schemaFailure(role, canonicalProblem.path, canonicalProblem.message, result.value, attempt.id)
   }
-  validateBlockedValue(role, result.value)
+  try { validateBlockedValue(role, result.value) }
+  catch (error) {
+    recordMissingEnumeratorPopulation(role, 'response failed blocked-value validation', 'failed')
+    recordProviderFailure(role, provider, r, attempt, 'blocked-value-validation', result)
+    removeInvocationScratch(invocationScratch)
+    if (error instanceof CanonicalOutputError) {
+      error.attemptId = attempt.id
+      throw error
+    }
+    die(error.message)
+  }
   valueRuntime.set(result.value, {
+    attempt_id: attempt.id,
     runtime_digest: resolvedRuntime.digest,
     provider: result.provider,
+    vendor: provider.adapter.vendor,
     adapter_digest: provider.adapter.digest,
     cli_version: provider.cliVersion,
     requested: result.requested,
     observed: { models: result.models, tokens: result.tokens, duration_ms: result.durationMs },
   })
-  try { recordProviderCall(role, provider, { ...result, finalResponse: decoded.finalResponse }) }
+  try { recordProviderCall(role, provider, { ...result, finalResponse: decoded.finalResponse }, attempt) }
   catch (error) {
     recordMissingEnumeratorPopulation(role, 'successful response could not be retained', 'failed')
+    failProviderAttempt(attempt, 'retention-error', result.cost)
     die(`${role} ${error?.message || error}`)
   }
   // The price stays first and keeps its shape, because it is what a reader looks for and what
@@ -2415,6 +5648,515 @@ function agent(role, prompt, schema, f, spec, context = null) {
   return result.value
 }
 
+// A planning stage holds every role's answer in memory until the whole stage succeeds, and pays
+// again for all of them when one dies. Measured on one install: `plan` completed the enumerator
+// ($2.08, 109 cases) and the architect ($2.70, specs built), then lost both when the plan-reviewer
+// died on `401 OAuth access token has expired`. The queue was empty afterwards and nothing under
+// `.git/caw/` carried that run — $4.78 spent for nothing, and a token expiring mid-stage is not
+// rare: it is the third such report.
+//
+// Persisting the draft in the queue was proposed and is the wrong shape twice over. Files on disk
+// do not make the next `plan` reuse anything — it starts from zero and overwrites them, so the
+// money is spent again — and `.caw-tasks/` means "the judged queue", which unjudged specs would
+// quietly stop being true. Reuse on exact identity is the mechanism this engine already has for
+// the enumerator, and this is that mechanism for the roles beside it: same private Git store,
+// same exact key, same cache-miss behaviour when anything at all differs.
+//
+// The key is the role's whole prompt, so the population it was given, the round's revision text
+// and any carried problems are all inside it. A repaired value is cached under the original
+// prompt: what is being reused is the accepted outcome of asking that question, not a draw.
+function planningValueCacheIdentity(role, prompt, schema, f) {
+  if (!planningCacheRoot('planning-cache')) return null
+  const binding = resolvedRuntime?.value?.roles?.[role]
+  const provider = binding && resolvedRuntime.providers?.get(binding.provider)
+  if (!binding || !provider) return null
+  const inputs = {
+    version: POPULATION_CACHE_VERSION,
+    role,
+    prompt_sha256: createHash('sha256').update(prompt).digest('hex'),
+    instructions_sha256: createHash('sha256').update(
+      assembledInstructions(role, binding, provider, f.docs_language)).digest('hex'),
+    schema_sha256: createHash('sha256').update(stableJson(schema)).digest('hex'),
+    engine_sha256: createHash('sha256').update(
+      readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    repository: { head: headCommit(), delivery_digest: deliveryDigest() },
+    runtime: {
+      digest: resolvedRuntime.digest,
+      provider: binding.provider,
+      vendor: provider.adapter.vendor,
+      model: binding.model,
+      reasoning: binding.reasoning,
+      adapter_digest: provider.adapter.digest,
+      cli_version: provider.cliVersion,
+    },
+    project_policy_digest: projectPolicySnapshot()?.set_digest || null,
+  }
+  return { key: createHash('sha256').update(stableJson(inputs)).digest('hex'), inputs }
+}
+
+function readPlanningValueCache(identity, schema) {
+  const root = identity && planningCacheRoot('planning-cache')
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > POPULATION_CACHE_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record,
+      ['version', 'key', 'created_at', 'inputs', 'value_digest', 'runtime', 'value'],
+      'planning cache')
+    // Re-validated on the way out. A record written by an engine whose schema has since changed
+    // must miss rather than hand a stale shape to the caller that is about to trust it.
+    if (record.version !== POPULATION_CACHE_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs) ||
+        record.value_digest !== createHash('sha256').update(stableJson(record.value)).digest('hex') ||
+        canonicalIssue(schema, record.value, '$')) return null
+    return record
+  } catch { return null }
+}
+
+function writePlanningValueCache(identity, value, runtime) {
+  const root = identity && planningCacheRoot('planning-cache')
+  if (!root) return null
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+    const { attempt_id: _attemptId, ...cacheRuntime } = runtime || {}
+    const record = {
+      version: POPULATION_CACHE_VERSION,
+      key: identity.key,
+      created_at: new Date().toISOString(),
+      inputs: identity.inputs,
+      value_digest: createHash('sha256').update(stableJson(value)).digest('hex'),
+      runtime: cacheRuntime,
+      value,
+    }
+    const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+    if (bytes.length > POPULATION_CACHE_FILE_MAX) return null
+    const target = join(root, `${identity.key}.json`)
+    const temp = `${target}.tmp-${process.pid}`
+    writeFileSync(temp, bytes, { mode: 0o600 })
+    renameSync(temp, target)
+    try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+    prunePopulationCache(root)
+    return record
+  } catch { return null }
+}
+
+function recordPlanningCache(entry) {
+  const run = beginRunRecord()
+  run.planningCache ||= []
+  run.planningCache.push(entry)
+  writeRunManifest('active')
+}
+
+// One repair prompt for every role that gets one. It hands back the exact validation path and
+// message, the original request, and the complete rejected value — a role cannot fix what it is
+// not shown, and a diagnostic alone leaves it guessing which part of a long answer was refused.
+// Narrow on purpose. A credentials answer given to an unrelated failure sends an operator to
+// re-authenticate over a defect in their own tree, which is worse than the generic message this
+// replaces. Every pattern here names an authentication outcome, never a bare status line.
+const EXPIRED_CREDENTIALS = [
+  /\b(?:oauth\s+)?(?:access\s+)?token\s+(?:has\s+)?expired\b/i,
+  /\bexpired\s+(?:oauth\s+)?(?:access\s+)?token\b/i,
+  /\bauthentication[_\s-]?error\b/i,
+  /\binvalid[_\s-]api[_\s-]key\b/i,
+  /\b401\b[^\n]{0,80}\b(?:unauthorized|auth|token|credential)/i,
+  /\b(?:unauthorized|credentials?)\b[^\n]{0,80}\b(?:expired|invalid|rejected)\b/i,
+  /\bplease\s+(?:re-?)?(?:run|login|log\s+in|authenticate)\b[^\n]{0,80}\blogin\b/i,
+]
+
+function expiredCredentials(text) {
+  const value = String(text || '')
+  return EXPIRED_CREDENTIALS.some((pattern) => pattern.test(value))
+}
+
+function canonicalRepairPrompt(role, prompt, problem, repair) {
+  return [
+    `Canonical repair ${repair} for ${role}.`,
+    '\n\nYour previous response failed the engine canonical validation at ',
+    `${problem.path}: ${problem.detail}.`,
+    '\nReturn one complete replacement value. Preserve everything valid in the rejected value;',
+    ' change only what is required to satisfy that exact diagnostic. Do not return a patch or',
+    ' an explanation.',
+    '\n\nOriginal request to this role:\n\n', prompt,
+    '\n\nRejected canonical value:\n\n', JSON.stringify(problem.value, null, 2),
+  ].join('')
+}
+
+// The delivery roles had no canonical repair at all: only architect and plan-reviewer did, and a
+// malformed answer from the executor or the reviewer ended the run. Measured on two installs —
+// a Codex executor stopped a task at `$.claims: ... names unknown acceptance case id(s)`, and a
+// reviewer's schema failures ended reviews outright — where the same bounded repair the planning
+// roles get would have cost one call instead of a whole round.
+//
+// `onRepair` exists because the reviewer owns an isolated surface it may have mutated before
+// answering: the retry has to start from the same baseline the first attempt did, or the second
+// answer describes a tree the first one changed.
+function canonicalRepairCall(role, prompt, schema, f, file, context, onRepair = null) {
+  let problem = null
+  for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
+    let value = null
+    try {
+      return agent(role, repair === 0 ? prompt : canonicalRepairPrompt(role, prompt, problem, repair),
+        schema, f, file, context)
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError) || error.role !== role) throw error
+      if (error.value === null) error.value = value
+      problem = error
+    }
+    recordEngineDiagnostic(role, 'canonical-validation', {
+      repair, path: problem.path, message: problem.detail,
+    }, problem.attemptId)
+    if (repair >= MAX_PLANNING_CANONICAL_REPAIRS) throw problem
+    say(`  ${role} canonical inconsistency; retrying once: ${problem.path} ${problem.detail}`)
+    if (onRepair) onRepair()
+  }
+  throw problem
+}
+
+function planningCanonicalCall(role, prompt, schema, f, validate = null) {
+  const cacheIdentity = planningValueCacheIdentity(role, prompt, schema, f)
+  const cached = readPlanningValueCache(cacheIdentity, schema)
+  if (cached) {
+    // Validated again here, not only against the schema on the way out: a cached value still has
+    // to satisfy the caller's semantic check, which depends on ledgers this run built.
+    try {
+      const validation = validate ? validate(cached.value) : null
+      valueRuntime.set(cached.value, cached.runtime)
+      recordPlanningCache({
+        role, state: 'hit', key: cacheIdentity.key, created_at: cached.created_at,
+      })
+      say(`  planning cache hit ${cacheIdentity.key.slice(0, 12)} — ${role} call skipped`)
+      return { value: cached.value, validation }
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError)) throw error
+      recordPlanningCache({ role, state: 'stale', key: cacheIdentity.key, detail: error.detail })
+      say(`  planning cache entry no longer satisfies this run's ledger; calling ${role}`)
+    }
+  } else if (cacheIdentity) {
+    recordPlanningCache({ role, state: 'miss', key: cacheIdentity.key })
+  }
+  let problem = null
+  for (let repair = 0; repair <= MAX_PLANNING_CANONICAL_REPAIRS; repair++) {
+    const repairPrompt = repair === 0 ? prompt
+      : canonicalRepairPrompt(role, prompt, problem, repair)
+    let value = null
+    try {
+      value = agent(role, repairPrompt, schema, f)
+      const validation = validate ? validate(value) : null
+      // Stored under the ORIGINAL prompt's key, including after a repair: the identity is the
+      // question this run asked, and the accepted answer is what a rerun would have to pay for.
+      if (cacheIdentity) {
+        const stored = writePlanningValueCache(cacheIdentity, value, runtimeIdentity(value))
+        if (stored) recordPlanningCache({
+          role, state: 'stored', key: cacheIdentity.key, created_at: stored.created_at,
+        })
+      }
+      return { value, validation }
+    } catch (error) {
+      if (!(error instanceof CanonicalOutputError) || error.role !== role) throw error
+      if (error.value === null) error.value = value
+      if (!error.attemptId && value) error.attemptId = runtimeIdentity(value)?.attempt_id || null
+      problem = error
+    }
+    recordEngineDiagnostic(role, 'canonical-validation', {
+      repair,
+      path: problem.path,
+      message: problem.detail,
+    }, problem.attemptId)
+    if (repair >= MAX_PLANNING_CANONICAL_REPAIRS) throw problem
+    say(`  ${role} canonical inconsistency; retrying once: ${problem.path} ${problem.detail}`)
+  }
+  throw problem
+}
+
+function gateEvidenceId(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error(`${label} must be a stable id of at most 128 characters`)
+  }
+  return value
+}
+
+function gateEvidenceArtifactPath(root, declaredPath) {
+  if (typeof declaredPath !== 'string' || !declaredPath.length || declaredPath.length > 1024 ||
+      declaredPath.includes('\0') || declaredPath.includes('\\') || isAbsolute(declaredPath)) {
+    throw new Error(`gate evidence artifact path is unsafe: ${JSON.stringify(declaredPath)}`)
+  }
+  const parts = declaredPath.split('/')
+  if (parts.some((part) => !part || part === '.' || part === '..')) {
+    throw new Error(`gate evidence artifact path is unsafe: ${JSON.stringify(declaredPath)}`)
+  }
+  let current = root
+  for (const part of parts) {
+    current = join(current, part)
+    if (!existsSync(current)) throw new Error(`gate evidence artifact is missing: ${declaredPath}`)
+    const stat = lstatSync(current)
+    if (stat.isSymbolicLink()) {
+      throw new Error(`gate evidence artifact path contains a symlink: ${declaredPath}`)
+    }
+  }
+  const stat = lstatSync(current)
+  if (!stat.isFile()) throw new Error(`gate evidence artifact is not a regular file: ${declaredPath}`)
+  const canonicalRoot = realpathSync(root)
+  const canonical = realpathSync(current)
+  if (!inside(canonicalRoot, canonical)) {
+    throw new Error(`gate evidence artifact leaves its private directory: ${declaredPath}`)
+  }
+  return { path: canonical, size: stat.size }
+}
+
+function collectGateEvidence(manifestPath, artifactsRoot, contract = {}) {
+  if (!existsSync(manifestPath)) return { present: false, checks: [], artifacts: [] }
+  const manifestStat = lstatSync(manifestPath)
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+    throw new Error('gate evidence manifest must be a regular file')
+  }
+  if (manifestStat.size > GATE_EVIDENCE_MANIFEST_MAX) {
+    throw new Error(`gate evidence manifest exceeds ${GATE_EVIDENCE_MANIFEST_MAX} bytes`)
+  }
+  let manifest
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) }
+  catch (error) { throw new Error(`gate evidence manifest is invalid JSON: ${error.message}`) }
+  const schemaProblem = canonicalIssue(GATE_EVIDENCE_MANIFEST_SCHEMA, manifest)
+  if (schemaProblem) {
+    throw new Error(`gate evidence manifest is invalid at ${schemaProblem.path}: ${schemaProblem.message}`)
+  }
+  if (manifest.checks.length > GATE_EVIDENCE_CHECKS_MAX) {
+    throw new Error(`gate evidence manifest has more than ${GATE_EVIDENCE_CHECKS_MAX} checks`)
+  }
+
+  const criteria = new Set((contract.criteria || []).map((row) => row.id))
+  const requiredCheckIds = new Set(contract.requiredCheckIds || [])
+  const acceptanceCases = new Map((contract.acceptanceCases || []).map((row) => [row.id, row]))
+  const checkIds = new Set()
+  const artifactIds = new Set()
+  const artifacts = []
+  let artifactBytes = 0
+  for (const check of manifest.checks) {
+    gateEvidenceId(check.id, 'gate evidence check id')
+    if (checkIds.has(check.id)) throw new Error(`duplicate gate evidence check id ${check.id}`)
+    checkIds.add(check.id)
+    if (!check.summary.trim()) throw new Error(`gate evidence check ${check.id} has an empty summary`)
+    if (!/^[a-z][a-z0-9.-]{0,63}$/.test(check.evidence_kind)) {
+      throw new Error(`gate evidence check ${check.id} has invalid evidence_kind`)
+    }
+    if ((criteria.size || acceptanceCases.size) && !requiredCheckIds.has(check.id) &&
+        !check.criterion_ids.length && !check.acceptance_case_ids.length) {
+      throw new Error(`gate evidence check ${check.id} is not linked to a criterion or acceptance case`)
+    }
+    for (const id of check.criterion_ids) {
+      if (!criteria.has(id)) throw new Error(`gate evidence check ${check.id} names unknown criterion ${id}`)
+    }
+    for (const id of check.acceptance_case_ids) {
+      if (!acceptanceCases.has(id)) {
+        throw new Error(`gate evidence check ${check.id} names unknown acceptance case ${id}`)
+      }
+      const acceptanceCase = acceptanceCases.get(id)
+      if (acceptanceCase.evidence_kind !== check.evidence_kind) {
+        throw new Error(`gate evidence check ${check.id} has the wrong evidence kind for ${id}`)
+      }
+      if (acceptanceCase.selector !== check.selector) {
+        throw new Error(`gate evidence check ${check.id} has the wrong selector for ${id}`)
+      }
+    }
+    if (new Set(check.criterion_ids).size !== check.criterion_ids.length ||
+        new Set(check.acceptance_case_ids).size !== check.acceptance_case_ids.length) {
+      throw new Error(`gate evidence check ${check.id} contains duplicate links`)
+    }
+    for (const artifact of check.artifacts) {
+      gateEvidenceId(artifact.id, 'gate evidence artifact id')
+      if (artifactIds.has(artifact.id)) throw new Error(`duplicate gate evidence artifact id ${artifact.id}`)
+      artifactIds.add(artifact.id)
+      if (artifactIds.size > GATE_EVIDENCE_ARTIFACTS_MAX) {
+        throw new Error(`gate evidence manifest has more than ${GATE_EVIDENCE_ARTIFACTS_MAX} artifacts`)
+      }
+      const source = gateEvidenceArtifactPath(artifactsRoot, artifact.path)
+      if (source.size > GATE_EVIDENCE_ARTIFACT_MAX) {
+        throw new Error(`gate evidence artifact ${artifact.id} exceeds ${GATE_EVIDENCE_ARTIFACT_MAX} bytes`)
+      }
+      artifactBytes += source.size
+      if (artifactBytes > GATE_EVIDENCE_ARTIFACTS_TOTAL_MAX) {
+        throw new Error(`gate evidence artifacts exceed ${GATE_EVIDENCE_ARTIFACTS_TOTAL_MAX} bytes`)
+      }
+      artifacts.push({
+        id: artifact.id,
+        declared_path: artifact.path,
+        source_path: source.path,
+        bytes: source.size,
+        sha256: createHash('sha256').update(readFileSync(source.path)).digest('hex'),
+      })
+    }
+  }
+  return { present: true, checks: manifest.checks, artifacts }
+}
+
+function taskSpecText(spec) {
+  if (!spec) return ''
+  if (existsSync(spec)) return readFileSync(spec, 'utf8')
+  const queued = join(QUEUE_DIR, spec)
+  return existsSync(queued) ? readFileSync(queued, 'utf8') : ''
+}
+
+function taskKey(spec, specText = null) {
+  if (!spec) return null
+  const body = specText ?? taskSpecText(spec)
+  const declared = body.match(/^task_key:\s*([a-z0-9][a-z0-9-]*)\s*$/m)?.[1]
+  if (declared) return declared
+  return spec.split(/[\\/]/).pop().replace(/^\d+_/, '').replace(/\.md$/, '')
+}
+
+function executorBudgetForSpec(f, specText) {
+  if (!f.executor_budgets) {
+    if (!f.executor_max_tool_events && !f.executor_max_event_bytes) return null
+    return {
+      mode: 'static', class: null, requested: null, floor: null,
+      reason: 'project-wide static executor limit',
+      tool_events: f.executor_max_tool_events,
+      event_bytes: f.executor_max_event_bytes,
+    }
+  }
+  const declared = specText.match(/^executor_budget:\s*(\S+)\s*$/m)?.[1] || 'normal'
+  const planningRequested = specText.match(/^executor_budget_requested:\s*(\S+)\s*$/m)?.[1] || null
+  const selected = effectiveExecutorBudgetClass(declared, specText)
+  const limits = f.executor_budgets[selected.effective]
+  return {
+    mode: 'adaptive', class: selected.effective, requested: selected.requested,
+    planning_requested: planningRequested,
+    floor: selected.floor, reason: selected.reason,
+    tool_events: limits.tool_events, event_bytes: limits.event_bytes,
+  }
+}
+
+function requiredGateChecks(spec, specText = null) {
+  if (!spec) return []
+  const body = specText ?? taskSpecText(spec)
+  const section = body.split(/^## /m).find((part) =>
+    part.toLowerCase().startsWith('required gate checks'))
+  if (!section) return []
+  const ids = section.split('\n').slice(1).flatMap((line) => {
+    const match = line.match(/^-\s+`([a-z][a-z0-9.-]{0,127})`(?:\s|$)/)
+    return match ? [match[1]] : []
+  })
+  return [...new Set(ids)]
+}
+
+function retainGateEvidence({ command, task, kind, deliveryDigest: digest, state, commandState,
+  status, commandStatus, durationMs, timeoutMs, rawOutput, evidence, error = null }) {
+  // Head and tail, for the reason boundedUtf8HeadTail gives: an xcodebuild-sized log passes this
+  // cap, and a head-only receipt would keep everything but the failure.
+  const bounded = boundedUtf8HeadTail(rawOutput, GATE_EVIDENCE_OUTPUT_MAX)
+  const receiptBase = {
+    version: 1,
+    owner: 'caw-engine',
+    task: task || null,
+    kind: kind || (task ? 'fast' : 'full'),
+    command: command || null,
+    delivery_digest: digest || null,
+    state,
+    command_state: commandState,
+    status,
+    command_status: commandStatus,
+    duration_ms: durationMs,
+    timeout_ms: timeoutMs,
+    output: {
+      bytes: Buffer.byteLength(rawOutput),
+      sha256: createHash('sha256').update(rawOutput).digest('hex'),
+      retained: bounded.text,
+      retained_bytes: Buffer.byteLength(bounded.text),
+      truncated: bounded.truncated,
+    },
+    manifest: { present: evidence.present, checks: evidence.checks, error },
+    artifacts: evidence.artifacts.map(({ source_path: _source, ...artifact }) => artifact),
+  }
+  const receiptId = createHash('sha256').update(stableJson(receiptBase)).digest('hex')
+  const receipt = { ...receiptBase, receipt_id: receiptId }
+  if (!resolvedRuntime) return receipt
+
+  const run = beginRunRecord()
+  run.gateEvidence ||= []
+  const index = String(run.gateEvidence.length + 1).padStart(3, '0')
+  receipt.artifacts.forEach((artifact, artifactIndex) => {
+    const source = evidence.artifacts[artifactIndex].source_path
+    const name = `gate-${index}-artifact-${String(artifactIndex + 1).padStart(3, '0')}.bin`
+    writePrivateFile(join(run.path, name), readFileSync(source), GATE_EVIDENCE_ARTIFACT_MAX)
+    artifact.private_file = name
+  })
+  const receiptName = `gate-${index}-receipt.json`
+  const bytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`)
+  writePrivateFile(join(run.path, receiptName), bytes, FINAL_VALUE_MAX)
+  run.gateEvidence.push({
+    file: receiptName,
+    receipt_id: receipt.receipt_id,
+    task: receipt.task,
+    kind: receipt.kind,
+    state: receipt.state,
+    delivery_digest: receipt.delivery_digest,
+    checks: receipt.manifest.checks.length,
+    artifacts: receipt.artifacts.length,
+    bytes: bytes.length,
+  })
+  writeRunManifest(state === 'green' ? 'active' : 'failed')
+  return receipt
+}
+
+// A gate is a process tree, and `spawnSync`'s timeout kills one process of it. Measured on
+// one iOS install: a timed-out gate lost its `bash -lc`, while the xcodebuild under it — stuck behind
+// a `| tee` after its simulator died — ran on for forty more minutes. The next weak-mutation gate
+// shared that simulator and derived data, went red in 36 seconds against the survivor, and was
+// scored `mutation-caught`: an orphan refuted a reviewer's finding.
+//
+// So the command runs in a process group of its own, and the whole group is stopped — SIGTERM,
+// then SIGKILL after a grace — on timeout, on a signal, and after the command exits, since
+// anything still in the group then is an orphan of a finished gate racing the next one.
+//
+// The group cannot simply be the engine's direct child, which is how the gate probe does it.
+// A detached child leaves the terminal's foreground group, so Ctrl-C would stop reaching the
+// gate; and the engine's own SIGINT handler cannot run while it is blocked in `spawnSync`, so
+// it could not pass the signal on. Nothing would stop the gate before its timeout. This runner
+// stays in the foreground group, receives what the engine cannot, and owns the group it starts.
+// It also stops the group if the engine dies outright, which no handler of the engine's can.
+const GATE_GROUP_STOP_GRACE_MS = 3000
+const GATE_GROUP_RUNNER = `
+const { spawn } = require('node:child_process')
+const { constants } = require('node:os')
+const [command, graceArg] = process.argv.slice(1)
+const grace = Number(graceArg)
+const group = process.platform !== 'win32'
+const parent = process.ppid
+const child = spawn('bash', ['-lc', command], { stdio: 'inherit', detached: group })
+const pause = new Int32Array(new SharedArrayBuffer(4))
+const live = () => { try { process.kill(-child.pid, 0); return true } catch { return false } }
+const stop = () => {
+  if (!child.pid) return
+  if (!group) { try { child.kill('SIGKILL') } catch {} return }
+  try { process.kill(-child.pid, 'SIGTERM') } catch { return }
+  const until = Date.now() + grace
+  while (live() && Date.now() < until) Atomics.wait(pause, 0, 0, 50)
+  try { process.kill(-child.pid, 'SIGKILL') } catch {}
+}
+let done = false
+const finish = (code) => { if (done) return; done = true; stop(); process.exit(code) }
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => finish(128 + constants.signals[signal]))
+child.on('error', (error) => { process.stderr.write('caw: gate could not start: ' + error.message + '\\n'); finish(127) })
+child.on('exit', (code, signal) => finish(code ?? 128 + (constants.signals[signal] || 0)))
+setInterval(() => { if (process.ppid !== parent) finish(129) }, 1000).unref()
+`
+
+// `spawnSync('bash', ['-lc', command], options)`, except that the timeout — and everything else
+// that ends the call — stops every process the command started. See GATE_GROUP_RUNNER.
+function spawnShellGroupSync(command, { timeoutMs = null, ...options } = {}) {
+  return spawnSync(process.execPath,
+    ['-e', GATE_GROUP_RUNNER, '--', command, String(GATE_GROUP_STOP_GRACE_MS)], {
+      ...options,
+      ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGTERM' } : {}),
+    })
+}
+
 // `spec`, when given, names the one spec whose task is being gated, and is exported to the
 // gate as CAW_SPEC. This script writes every spec of a plan into .caw-tasks/ before the build
 // starts and removes each only at its own task's commit, so a gate that reads .caw-tasks/ — one
@@ -2428,14 +6170,147 @@ function agent(role, prompt, schema, f, spec, context = null) {
 //
 // `status` is not redundant next to `ok`, and deleting it as such has already broken one
 // install for six days: 75 is the gate saying it did not run, and build() reads it.
-function gate(cmd, spec, cwd = undefined) {
-  if (!cmd) return { ok: true, out: '(none configured)' }
+function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
+  mkdirSync(GATE_EVIDENCE_SCRATCH_PARENT, { recursive: true, mode: 0o700 })
+  const evidenceScratch = mkdtempSync(join(GATE_EVIDENCE_SCRATCH_PARENT, 'gate-'))
+  const artifactsRoot = join(evidenceScratch, 'artifacts')
+  const manifestPath = join(evidenceScratch, 'manifest.json')
+  mkdirSync(artifactsRoot, { mode: 0o700 })
+  const task = context.task || spec || null
+  const kind = context.kind || (spec ? 'fast' : 'full')
+  const digest = context.deliveryDigest || null
+  const requiredCheckIds = context.requiredCheckIds || requiredGateChecks(spec)
+  if (!cmd) {
+    try {
+      const out = '(none configured)'
+      const evidenceError = context.collectEvidence !== false &&
+        ((context.acceptanceCases || []).length || requiredCheckIds.length)
+        ? 'task contract requires a configured gate that emits evidence'
+        : null
+      const state = evidenceError ? 'refused' : 'green'
+      const status = evidenceError ? 75 : 0
+      const receipt = retainGateEvidence({
+        command: null, task, kind, deliveryDigest: digest, state, commandState: 'green',
+        status, commandStatus: 0, durationMs: 0, timeoutMs, rawOutput: out,
+        evidence: { present: false, checks: [], artifacts: [] }, error: evidenceError,
+      })
+      const diagnostic = evidenceError ? `\ngate evidence refused: ${evidenceError}\n` : ''
+      const result = {
+        ok: state === 'green', state, status, out: `${out}${diagnostic}`,
+        durationMs: 0, timeoutMs, receipt,
+      }
+      if (resolvedRuntime) recordStage('gate', kind, Date.now(), state, {
+        task, status, command_status: 0, timeout_ms: timeoutMs, receipt_id: receipt.receipt_id,
+      })
+      return result
+    } finally { removeTree(evidenceScratch) }
+  }
   const env = { ...process.env, PWD: cwd || process.cwd() }
-  if (spec) env.CAW_SPEC = spec
-  const r = spawnSync('bash', ['-lc', cmd], {
-    cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env,
-  })
-  return { ok: r.status === 0, status: r.status, out: `${r.stdout || ''}${r.stderr || ''}`.slice(-8000) }
+  if (spec) {
+    env.CAW_SPEC = spec
+    env.CAW_TASK_KEY = taskKey(spec)
+  }
+  env.CAW_GATE_EVIDENCE_OUT = manifestPath
+  env.CAW_GATE_ARTIFACTS_DIR = artifactsRoot
+  // What the manifest written to that path will be JUDGED against. The engine used to hand
+  // over the output path and nothing else, so a gate could satisfy the contract only by
+  // re-deriving it: one install ended up parsing `## Required gate checks` out of CAW_SPEC
+  // itself, which works, and is discoverable only by reading collectGateEvidence.
+  //
+  // The failure it produces is the expensive kind, because it looks like the opposite one. A
+  // gate emitting a check per test tier — MORE evidence than asked for — is refused with
+  // `not linked to a criterion or acceptance case`, since an unlinked check is tolerated only
+  // where its id was declared required. Measured on one install, that reads as a pipeline
+  // defect over a green gate rather than as a contract the gate was never shown.
+  //
+  // Two spellings, because the audiences differ. The id list is newline-separated plain text
+  // any shell loops over with no dependency, and is what a gate needs for the required-check
+  // case. The JSON carries the rest — a check that links a criterion or an acceptance case
+  // must match that row's exact id, evidence kind and selector, and none of those can be
+  // guessed. Both are always set, including empty, so a gate can tell an engine that offers
+  // the contract from one that does not.
+  env.CAW_GATE_REQUIRED_CHECKS = requiredCheckIds.join('\n')
+  // The files a weak-mutation run changed, one per line; empty on every other run.
+  env.CAW_GATE_MUTATION_PATHS = (context.mutationPaths || []).join('\n')
+  const contractPath = join(evidenceScratch, 'contract.json')
+  writeFileSync(contractPath, `${JSON.stringify({
+    version: 1,
+    task,
+    kind,
+    required_check_ids: requiredCheckIds,
+    criteria: (context.criteria || []).map(({ id, section, criterion }) =>
+      ({ id, section, criterion })),
+    acceptance_cases: (context.acceptanceCases || []).map(({ id, evidence_kind, selector }) =>
+      ({ id, evidence_kind, selector })),
+  }, null, 2)}\n`, { mode: 0o600 })
+  env.CAW_GATE_CONTRACT = contractPath
+  const startedAt = Date.now()
+  try {
+    const r = spawnShellGroupSync(cmd, {
+      cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env, timeoutMs,
+    })
+    const commandState = r.error?.code === 'ETIMEDOUT' ? 'timeout'
+      : r.status === 0 ? 'green'
+      : r.status === 75 ? 'refused'
+      : 'red'
+    const diagnostic = commandState === 'timeout'
+      ? `\ngate exceeded ${formatTimeout(timeoutMs)} and was killed\n`
+      : ''
+    const rawOutput = `${r.stdout || ''}${r.stderr || ''}${diagnostic}`
+    let evidence = { present: false, checks: [], artifacts: [] }
+    let evidenceError = null
+    try {
+      if (context.collectEvidence !== false) {
+        evidence = collectGateEvidence(manifestPath, artifactsRoot, {
+          criteria: context.criteria || [], acceptanceCases: context.acceptanceCases || [],
+          requiredCheckIds,
+        })
+        if (commandState === 'green' && requiredCheckIds.length) {
+          if (!evidence.present) {
+            throw new Error('green gate produced no evidence manifest for required task checks')
+          }
+          const passedChecks = new Set(evidence.checks
+            .filter((check) => check.state === 'passed').map((check) => check.id))
+          const missingChecks = requiredCheckIds.filter((id) => !passedChecks.has(id))
+          if (missingChecks.length) {
+            throw new Error(`green gate did not pass required check ids: ${missingChecks.join(', ')}`)
+          }
+        }
+        if (commandState === 'green' && (context.acceptanceCases || []).length) {
+          if (!evidence.present) {
+            throw new Error('green gate produced no evidence manifest for the acceptance matrix')
+          }
+          const passed = new Set(evidence.checks.filter((check) => check.state === 'passed')
+            .flatMap((check) => check.acceptance_case_ids))
+          const missing = context.acceptanceCases.map((row) => row.id)
+            .filter((id) => !passed.has(id))
+          if (missing.length) {
+            throw new Error(`green gate did not evidence acceptance case ids: ${missing.join(', ')}`)
+          }
+        }
+      }
+    } catch (error) {
+      evidenceError = error?.message || String(error)
+    }
+    const state = evidenceError ? 'refused' : commandState
+    const status = evidenceError ? 75 : r.status
+    const receipt = retainGateEvidence({
+      command: cmd, task, kind, deliveryDigest: digest, state, commandState,
+      status, commandStatus: r.status, durationMs: Date.now() - startedAt, timeoutMs,
+      rawOutput, evidence, error: evidenceError,
+    })
+    const evidenceDiagnostic = evidenceError ? `\ngate evidence refused: ${evidenceError}\n` : ''
+    const value = {
+      ok: state === 'green', state, status,
+      out: `${rawOutput}${evidenceDiagnostic}`.slice(-8000),
+      durationMs: Date.now() - startedAt, timeoutMs, receipt,
+    }
+    if (resolvedRuntime) recordStage('gate', kind, startedAt, state, {
+      task, status, command_status: r.status, timeout_ms: timeoutMs,
+      receipt_id: receipt.receipt_id,
+    })
+    return value
+  } finally { removeTree(evidenceScratch) }
 }
 
 // The closed sets of a project, computed instead of searched for. One opaque command, like a
@@ -2463,33 +6338,179 @@ function gate(cmd, spec, cwd = undefined) {
 //     set in front of a role that is about to be told the set is closed, which is worse than
 //     no index at all — the one failure this whole mechanism exists to prevent.
 const INDEX_MAX = 60_000 // ~15k tokens, against profiles that run 12-17 KB. Cached, so paid once.
+const INDEX_JSON_MAX = 1024 * 1024
+const INDEX_SET_MAX = 128
+const INDEX_MEMBER_MAX = 20_000
 
-function index(cmd) {
-  if (!cmd) return { text: '', truncated: 0, sha256: null }
+function structuredIndex(raw) {
+  if (Buffer.byteLength(raw) > INDEX_JSON_MAX) {
+    die(`project index json-v1 exceeds ${INDEX_JSON_MAX} bytes. No provider call ran.`)
+  }
+  let value
+  try { value = JSON.parse(raw) }
+  catch (error) { die(`project index json-v1 is invalid JSON: ${error.message}. No provider call ran.`) }
+  try {
+    exactObjectKeys(value, ['api_version', 'sets'], 'project index')
+    if (value.api_version !== 1) throw new Error('project index api_version must be 1')
+    if (!Array.isArray(value.sets) || value.sets.length > INDEX_SET_MAX) {
+      throw new Error(`project index sets must be an array with at most ${INDEX_SET_MAX} entries`)
+    }
+    const ids = new Set()
+    let memberCount = 0
+    for (const [index, set] of value.sets.entries()) {
+      const label = `project index sets[${index}]`
+      exactObjectKeys(set, ['id', 'label', 'source', 'members'], label)
+      if (typeof set.id !== 'string' || !/^[a-z][a-z0-9.-]{0,63}$/.test(set.id)) {
+        throw new Error(`${label}.id is invalid`)
+      }
+      if (ids.has(set.id)) throw new Error(`${label}.id duplicates ${JSON.stringify(set.id)}`)
+      ids.add(set.id)
+      for (const key of ['label', 'source']) {
+        if (typeof set[key] !== 'string' || !set[key].trim() || Buffer.byteLength(set[key]) > 2000) {
+          throw new Error(`${label}.${key} must be a non-empty string of at most 2000 bytes`)
+        }
+      }
+      if (!Array.isArray(set.members)) throw new Error(`${label}.members must be an array`)
+      const members = new Set()
+      for (const [memberIndex, member] of set.members.entries()) {
+        if (typeof member !== 'string' || !member.trim() || Buffer.byteLength(member) > 8000) {
+          throw new Error(`${label}.members[${memberIndex}] must be a non-empty string of at most 8000 bytes`)
+        }
+        if (members.has(member)) {
+          throw new Error(`${label}.members[${memberIndex}] duplicates an earlier member`)
+        }
+        members.add(member)
+      }
+      memberCount += set.members.length
+      if (memberCount > INDEX_MEMBER_MAX) {
+        throw new Error(`project index has more than ${INDEX_MEMBER_MAX} members`)
+      }
+    }
+  } catch (error) {
+    die(`${error.message}. No provider call ran.`)
+  }
+  const text = value.sets.map((set) => [
+    `## [${set.id}] ${set.label.trim()}`,
+    `Source: ${set.source.trim()}`,
+    ...set.members.map((member) => `- ${member.trim()}`),
+  ].join('\n')).join('\n\n')
+  if (text.length > INDEX_MAX) {
+    die(`project index json-v1 renders to ${text.length} chars; limit is ${INDEX_MAX}. ` +
+      'A structured closed set cannot be truncated. No provider call ran.')
+  }
+  if (!text) {
+    say('  project index json-v1 contains no sets')
+    return { text: '', truncated: 0, sha256: null, format: 'json-v1', apiVersion: 1 }
+  }
+  say(`  project index json-v1: ${value.sets.length} set(s), ${text.length} chars`)
+  return {
+    text, truncated: 0, sha256: createHash('sha256').update(text).digest('hex'),
+    format: 'json-v1', apiVersion: 1,
+  }
+}
+
+function index(cmd, format = 'text-v0') {
+  if (!cmd) return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   const r = spawnSync('bash', ['-lc', cmd], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (r.error) {
+    if (format === 'json-v1') {
+      die(`project index json-v1 could not run: ${r.error.message}. No provider call ran.`)
+    }
     say(`  index_cmd could not run (${r.error.message}) — enumerating without it`)
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
   if (r.status !== 0) {
+    if (format === 'json-v1') {
+      die(`project index json-v1 exited ${r.status}. No provider call ran. Its last words:\n` +
+        `  ${(`${r.stderr || ''}${r.stdout || ''}`).trim().split('\n').slice(-3).join('\n  ')}`)
+    }
     say(`  index_cmd exited ${r.status} — enumerating without it. Its last words:\n` +
         `    ${(`${r.stderr || ''}${r.stdout || ''}`).trim().split('\n').slice(-3).join('\n    ')}`)
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
   const out = (r.stdout || '').trim()
   if (!out) {
+    if (format === 'json-v1') {
+      die('project index json-v1 printed nothing. No provider call ran.')
+    }
     say('  index_cmd printed nothing — enumerating without it')
-    return { text: '', truncated: 0, sha256: null }
+    return { text: '', truncated: 0, sha256: null, format, apiVersion: null }
   }
+  if (format === 'json-v1') return structuredIndex(out)
   if (out.length > INDEX_MAX) {
     const dropped = out.length - INDEX_MAX
     say(`  index_cmd printed ${out.length} chars, ${dropped} of them DROPPED (cap ${INDEX_MAX}). ` +
         `The sets are cut and the enumerator is told so.`)
     const text = out.slice(0, INDEX_MAX)
-    return { text, truncated: dropped, sha256: createHash('sha256').update(text).digest('hex') }
+    return {
+      text, truncated: dropped, sha256: createHash('sha256').update(text).digest('hex'),
+      format, apiVersion: null,
+    }
   }
   say(`  index_cmd: ${out.length} chars`)
-  return { text: out, truncated: 0, sha256: createHash('sha256').update(out).digest('hex') }
+  return {
+    text: out, truncated: 0, sha256: createHash('sha256').update(out).digest('hex'),
+    format, apiVersion: null,
+  }
+}
+
+const REQUEST_INDEX_STOP = new Set([
+  'about', 'after', 'again', 'also', 'before', 'change', 'does', 'every', 'from', 'have',
+  'into', 'must', 'only', 'remain', 'should', 'task', 'test', 'tests', 'that', 'their',
+  'then', 'this', 'when', 'where', 'which', 'with', 'without',
+])
+
+function builtinRequestIndex(description, mode = '') {
+  if (mode !== 'request-v1') return { text: '', truncated: 0, sha256: null }
+  const tokens = [...new Set((description.toLowerCase().match(/[a-z0-9_/-]{4,}/g) || [])
+    .map((token) => token.replace(/^[-/]+|[-/]+$/g, ''))
+    .filter((token) => token.length >= 4 && !REQUEST_INDEX_STOP.has(token)))]
+    .sort((a, b) => b.length - a.length || a.localeCompare(b)).slice(0, 24)
+  const files = git('ls-files').split('\n').filter(Boolean).sort()
+  const selected = []
+  for (const path of files) {
+    const lowerPath = path.toLowerCase()
+    let matched = tokens.some((token) => lowerPath.includes(token))
+    if (!matched) {
+      try {
+        const stat = lstatSync(path)
+        if (stat.isFile() && stat.size <= 256 * 1024) {
+          const bytes = readFileSync(path)
+          if (!bytes.subarray(0, 8192).includes(0)) {
+            const body = bytes.toString('utf8').toLowerCase()
+            matched = tokens.some((token) => body.includes(token))
+          }
+        }
+      } catch { /* a concurrently removed tracked file is simply absent from this snapshot */ }
+    }
+    if (matched || path === '.caw/CAW.md' || /^scripts\/.*gate/.test(path)) selected.push(path)
+  }
+  const members = selected.slice(0, 300)
+  const text = members.length ? [
+    '## [request-files-v1] Deterministic request-related tracked files',
+    `Source: CAW request-v1; ${tokens.length} normalized tokens; first 300 lexical matches of ${selected.length}`,
+    ...members.map((path) => `- ${path}`),
+  ].join('\n') : ''
+  return {
+    text, truncated: Math.max(0, selected.length - members.length),
+    sha256: text ? createHash('sha256').update(text).digest('hex') : null,
+  }
+}
+
+function combinePlanningIndexes(project, builtin) {
+  const text = [project.text, builtin.text].filter(Boolean).join('\n\n')
+  return {
+    text,
+    truncated: (project.truncated || 0) + (builtin.truncated || 0),
+    sha256: text ? createHash('sha256').update(text).digest('hex') : null,
+    format: project.format || 'text-v0',
+    apiVersion: project.apiVersion || null,
+  }
+}
+
+function planningIndex(description, f) {
+  return combinePlanningIndexes(index(f.index_cmd, f.index_format),
+    builtinRequestIndex(description, f.builtin_index))
 }
 
 // The wording that goes with it, kept next to the reader for the same reason populationBlock()
@@ -2647,6 +6668,60 @@ function sourceLabel(source) {
     ? located.lineStart === located.lineEnd ? located.lineStart : `${located.lineStart}-${located.lineEnd}`
     : `occurrence#${source.occurrence}`
   return `index:${source.index_sha256.slice(0, 12)}:${range} — ${excerpt}`
+}
+
+function validateRequestIssues(issues, context) {
+  const authorityPaths = canonicalAuthorityPaths(context.profileText)
+  for (const [index, issue] of issues.entries()) {
+    if (!issue.issue.trim()) {
+      schemaFailure('enumerator', `$.request_issues[${index}].issue`, 'must not be empty')
+    }
+    if (issue.request_source?.kind !== 'request') {
+      schemaFailure('enumerator', `$.request_issues[${index}].request_source`,
+        'must quote the human request')
+    }
+    const requestResolution = resolvePopulationSource(issue.request_source, context)
+    if (!requestResolution.ok) {
+      schemaFailure('enumerator', `$.request_issues[${index}].request_source`,
+        requestResolution.reason)
+    }
+    if (!issue.authority_sources.length) {
+      schemaFailure('enumerator', `$.request_issues[${index}].authority_sources`,
+        'must contain at least one authority source')
+    }
+    for (const [authorityIndex, source] of issue.authority_sources.entries()) {
+      const path = `$.request_issues[${index}].authority_sources[${authorityIndex}]`
+      if (source?.kind !== 'repository') {
+        schemaFailure('enumerator', path,
+          'must quote .caw/CAW.md or a repository canonical document')
+      }
+      if (!authorityPaths.has(source.path)) {
+        schemaFailure('enumerator', path,
+          `${JSON.stringify(source.path)} is not .caw/CAW.md or listed under ## Canonical docs`)
+      }
+      const authorityResolution = resolvePopulationSource(source, context)
+      if (!authorityResolution.ok) schemaFailure('enumerator', path, authorityResolution.reason)
+    }
+  }
+}
+
+function requestIssuesText(issues) {
+  return issues.map((issue, index) => [
+    `${index + 1}. ${issue.issue}`,
+    `   request: ${sourceLabel(issue.request_source)}`,
+    ...issue.authority_sources.map((source) => `   authority: ${sourceLabel(source)}`),
+  ].join('\n')).join('\n')
+}
+
+function requireReadyRequest(enumeration, retryCommand = 'plan') {
+  if (decidePlanningAction(enumeration.requestIssues) === PlanningAction.architect) {
+    return enumeration.cases
+  }
+  say(`\nrequest preflight stopped before architect; ${enumeration.requestIssues.length} issue(s):`)
+  say(requestIssuesText(enumeration.requestIssues))
+  die('the request conflicts with, or assumes more than, the project authority settles.\n' +
+      `  Resolve every issue in the request or canonical docs, then ${retryCommand} again.\n` +
+      '  No architect or plan-reviewer call ran.')
 }
 
 function exactOccurrence(text, candidate) {
@@ -2864,7 +6939,7 @@ function resolvePopulation(cases, context) {
   }
 }
 
-function recordPopulationResolution(resolved) {
+function recordPopulationResolution(resolved, attemptId = null) {
   const events = [
     ...resolved.repairs.map((repair) => ({
       index: repair.index,
@@ -2897,7 +6972,7 @@ function recordPopulationResolution(resolved) {
     retained: resolved.retainedCount,
     witness_withdrawn: resolved.witnessWithdrawn,
   })
-  if (events.length) recordEngineDiagnostic('enumerator', 'provenance', diagnostic)
+  if (events.length) recordEngineDiagnostic('enumerator', 'provenance', diagnostic, attemptId)
   if (resolved.repairs.length) {
     say(`  enumerator repaired ${resolved.repairs.length} anchor(s) by unique exact search`)
   }
@@ -2934,6 +7009,35 @@ const changedFiles = () =>
   git('status', '--porcelain').split('\n').filter(Boolean).map((l) => l.slice(3))
     .filter((p) => !p.startsWith(`${QUEUE_DIR}/`) && !p.startsWith(`${LOG_DIR}/`))
 
+function taskDeliveryDiff(cwd = undefined) {
+  const maxBuffer = 64 * 1024 * 1024
+  const result = spawnSync('git', [
+    'diff', '--binary', '--no-ext-diff', 'HEAD', '--', '.',
+    `:(exclude)${QUEUE_DIR}`, `:(exclude)${LOG_DIR}`,
+  ], { cwd, encoding: 'utf8', maxBuffer })
+  if (result.error || result.status !== 0) return ''
+  let output = result.stdout || ''
+  let untracked = []
+  try {
+    untracked = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
+      cwd, encoding: 'utf8', maxBuffer,
+    }).split('\0').filter(Boolean)
+      .filter((path) => !path.startsWith(`${QUEUE_DIR}/`) && !path.startsWith(`${LOG_DIR}/`))
+      .sort()
+  } catch { return output }
+  const empty = platform() === 'win32' ? 'NUL' : '/dev/null'
+  for (const path of untracked) {
+    const remaining = maxBuffer - Buffer.byteLength(output)
+    if (remaining <= 0) break
+    const patch = spawnSync('git', [
+      'diff', '--binary', '--no-ext-diff', '--no-index', '--', empty, path,
+    ], { cwd, encoding: 'utf8', maxBuffer: remaining })
+    // `git diff --no-index` uses status 1 for a successfully produced difference.
+    if (!patch.error && [0, 1].includes(patch.status)) output += patch.stdout || ''
+  }
+  return output
+}
+
 // ---------------------------------------------------------------- plan
 
 // A plan is kept whenever the run stops — out of rounds, or on an undecidable question. The
@@ -2963,12 +7067,76 @@ const changedFiles = () =>
 // derives, the no-progress guard that counts holes, and the ability to say "47 of 65 findings
 // were uncovered", which is the measurement that settled the cap question.
 //
-// The coverage mapping survives here and nowhere else. `writeSpecs` scatters it into per-spec
-// `## Must cover` blocks, so each task knows its own cases and the claim about the population
-// as a whole is lost the moment planning ends.
-function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = []) {
-  writeFileSync(PLAN, [
-    '---', `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`, '---', '',
+// The complete coverage mapping survives here. `writeSpecs` scatters its cases and stable
+// acceptance links into per-spec blocks, so each task carries its own part while the population
+// claim as a whole remains readable in this artifact.
+function populationPlanRecord(population) {
+  const summary = populationResolution.get(population) || {
+    state: 'unknown', returned: 0, repaired: 0, dropped: 0, retained: 0,
+    witnessWithdrawn: false,
+  }
+  return {
+    state: summary.state,
+    returned: summary.returned,
+    repaired: summary.repaired,
+    dropped: summary.dropped,
+    retained: summary.retained,
+    witness_withdrawn: summary.witnessWithdrawn,
+    digest: createHash('sha256').update(stableJson(population || [])).digest('hex'),
+  }
+}
+
+function readPlanPopulationRecord(text) {
+  const field = (name) => text.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim()
+  const state = field('population_state')
+  const integer = (name) => {
+    const value = Number(field(name))
+    return Number.isSafeInteger(value) && value >= 0 ? value : null
+  }
+  const digest = field('population_digest')
+  if (!['sample', 'none'].includes(state) || !/^[0-9a-f]{64}$/.test(digest || '')) {
+    return { state: 'unknown', source: 'plan-artifact-missing-or-invalid', digest: null }
+  }
+  const record = {
+    state,
+    returned: integer('population_returned'),
+    repaired: integer('population_repaired'),
+    dropped: integer('population_dropped'),
+    retained: integer('population_retained'),
+    witness_withdrawn: field('population_witness_withdrawn') === 'true',
+    digest,
+    source: 'plan-artifact',
+  }
+  if (Object.values(record).some((value) => value === null)) {
+    return { state: 'unknown', source: 'plan-artifact-missing-or-invalid', digest: null }
+  }
+  return record
+}
+
+function writePlan(description, out, history, unclosed, population, undecidable = [], provenance = [],
+  risk = null) {
+  const populationRecord = populationPlanRecord(population)
+  const ledger = planningLedger(out)
+  const text = [
+    '---',
+    `approved: ${unclosed.length || undecidable.length ? 'false' : 'true'}`,
+    `population_state: ${populationRecord.state}`,
+    `population_returned: ${populationRecord.returned}`,
+    `population_repaired: ${populationRecord.repaired}`,
+    `population_dropped: ${populationRecord.dropped}`,
+    `population_retained: ${populationRecord.retained}`,
+    `population_witness_withdrawn: ${populationRecord.witness_withdrawn}`,
+    `population_digest: ${populationRecord.digest}`,
+    ...(risk ? [
+      `risk_class: ${risk.class}`,
+      `risk_population_requirement: ${risk.population_requirement}`,
+      `risk_population_attestation: ${risk.population_attestation}`,
+      `risk_population_digest: ${risk.population_digest}`,
+      `risk_require_full_gate_baseline: ${risk.require_full_gate_baseline}`,
+      `risk_policy_id: ${risk.policy_id}`,
+      `risk_policy_digest: ${risk.policy_digest}`,
+    ] : []),
+    '---', '',
     '# Plan', '',
     'Written by `caw.mjs`, not by an agent. The specs in `.caw-tasks/` are the source of truth for',
     'what gets built; this file is the reasoning that produced them and is safe to delete.', '',
@@ -2976,8 +7144,18 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     '## Coverage — the population this request implies', '',
     "The architect's own mapping: what it says this request implies, and which task it gave",
     'each case to.', '',
-    '| Case | Task |', '|---|---|',
-    ...(out.coverage || []).map((c) => `| ${c.case} | \`${c.task}\` |`), '',
+    '| Case | Task | Acceptance criteria |', '|---|---|---|',
+    ...(out.coverage || []).map((c) => `| ${c.case.replace(/\|/g, '\\|')} | ` +
+      `\`${c.task}\` | ${c.acceptance_criteria.map((item) =>
+        item.replace(/\|/g, '\\|')).join('<br>')} |`), '',
+    '## Planning relation ledger', '',
+    'Engine-assigned stable IDs for every task requirement and every declared',
+    '`case → task → acceptance criterion` relation.', '',
+    '```json', JSON.stringify(ledger, null, 2), '```', '',
+    ...(risk ? [
+      '## Project risk attestation', '',
+      '```json', JSON.stringify(risk, null, 2), '```', '',
+    ] : []),
     // Both lists, side by side, and no attempt to reconcile them here. A script cannot match
     // two prose phrasings of the same case, and a human reading the two tables against each
     // other is the only reader who can. This is also the only artifact the blind list survives
@@ -3028,15 +7206,24 @@ function writePlan(description, out, history, unclosed, population, undecidable 
          'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
          '`approved:` above. `build` refuses until it does.', '']
       : []),
-  ].join('\n'))
+  ].join('\n')
+  writeFileSync(PLAN, unclosed.length || undecidable.length
+    ? text
+    : withApprovedDigests(text, specFiles()))
+  if (risk) writeRiskRecord(risk)
 }
 
-function planIncomplete(description, out, history, problems, reason, population, provenance) {
+function planIncomplete(description, out, history, problems, reason, population, provenance,
+  risk = null) {
   say(`\n${reason}`)
   writeSpecs(out.tasks, out.coverage)
-  writePlan(description, out, history, problems, population, [], provenance)
+  writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
-  say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+  if (problems.length === 1 && problems[0] === 'signed human planning review required') {
+    say(`\nPrepare the signed review: node caw.mjs human-review prepare plan <identity>`)
+  } else {
+    say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+  }
   say(`  spent ${formatAccounting(accounting)}`)
   // Non-zero: the run did not succeed, and nothing reading this script may conclude otherwise.
   process.exit(1)
@@ -3081,23 +7268,201 @@ function planIncomplete(description, out, history, problems, reason, population,
 // can run to tens of KB — fall behind a varying prefix too, and index_cmd starts costing full
 // rate on every call for nothing. The order is load-bearing for the mechanism, not for the
 // price. The unmeasured residual above still applies, to this role alone.
-function enumerate(description, text, f) {
-  const indexResult = index(f.index_cmd)
-  const p = agent('enumerator', [
+function planningCacheRoot(name) {
+  try {
+    const path = execFileSync('git', ['rev-parse', '--git-path', `caw/${name}`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    return path ? resolve(path) : null
+  } catch { return null }
+}
+
+function populationCacheRoot() {
+  return planningCacheRoot('population-cache')
+}
+
+function prunePopulationCache(root, now = Date.now()) {
+  if (!root || !existsSync(root)) return
+  const entries = readdirSync(root).filter((name) => /^[0-9a-f]{64}\.json$/.test(name))
+    .map((name) => {
+      const path = join(root, name)
+      const stat = lstatSync(path)
+      return { path, stat }
+    })
+    .filter(({ stat }) => stat.isFile() && !stat.isSymbolicLink())
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
+  entries.forEach((entry, index) => {
+    if (index >= POPULATION_CACHE_MAX || now - entry.stat.mtimeMs > POPULATION_CACHE_MAX_AGE_MS) {
+      unlinkSync(entry.path)
+    }
+  })
+}
+
+function canonicalAuthoritySnapshot(profileText) {
+  return [...canonicalAuthorityPaths(profileText)].sort().map((path) => {
+    try {
+      const stat = lstatSync(path)
+      if (!stat.isFile() || stat.isSymbolicLink()) return { path, state: 'not-regular' }
+      return {
+        path,
+        state: 'file',
+        sha256: createHash('sha256').update(readFileSync(path)).digest('hex'),
+      }
+    } catch { return { path, state: 'missing' } }
+  })
+}
+
+function populationCacheIdentity(description, text, f, indexResult, prompt) {
+  if (!populationCacheRoot()) return null
+  const binding = resolvedRuntime.value.roles.enumerator
+  const provider = resolvedRuntime.providers.get(binding.provider)
+  const inputs = {
+    version: POPULATION_CACHE_VERSION,
+    request_sha256: createHash('sha256').update(description).digest('hex'),
+    profile_sha256: createHash('sha256').update(text).digest('hex'),
+    prompt_sha256: createHash('sha256').update(prompt).digest('hex'),
+    instructions_sha256: createHash('sha256').update(
+      assembledInstructions('enumerator', binding, provider, f.docs_language)).digest('hex'),
+    schema_sha256: createHash('sha256').update(stableJson(SCHEMA.population)).digest('hex'),
+    engine_sha256: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    repository: { head: headCommit(), delivery_digest: deliveryDigest() },
+    canonical_authority: canonicalAuthoritySnapshot(text),
+    index: {
+      command_sha256: createHash('sha256').update(f.index_cmd || '').digest('hex'),
+      format: indexResult.format,
+      api_version: indexResult.apiVersion,
+      content_sha256: indexResult.sha256,
+      truncated: indexResult.truncated,
+    },
+    runtime: {
+      digest: resolvedRuntime.digest,
+      provider: binding.provider,
+      vendor: provider.adapter.vendor,
+      model: binding.model,
+      reasoning: binding.reasoning,
+      adapter_digest: provider.adapter.digest,
+      cli_version: provider.cliVersion,
+    },
+    project_policy_digest: projectPolicySnapshot()?.set_digest || null,
+  }
+  return {
+    key: createHash('sha256').update(stableJson(inputs)).digest('hex'),
+    inputs,
+  }
+}
+
+function readPopulationCache(identity) {
+  if (!identity) return null
+  const root = populationCacheRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > POPULATION_CACHE_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record,
+      ['version', 'key', 'created_at', 'inputs', 'value_digest', 'runtime', 'value'],
+      'population cache')
+    if (record.version !== POPULATION_CACHE_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs) ||
+        record.value_digest !== createHash('sha256').update(stableJson(record.value)).digest('hex') ||
+        canonicalIssue(SCHEMA.population, record.value, '$')) return null
+    return record
+  } catch { return null }
+}
+
+function writePopulationCache(identity, value, runtime) {
+  if (!identity) return null
+  const root = populationCacheRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  const { attempt_id: _attemptId, ...cacheRuntime } = runtime || {}
+  const record = {
+    version: POPULATION_CACHE_VERSION,
+    key: identity.key,
+    created_at: new Date().toISOString(),
+    inputs: identity.inputs,
+    value_digest: createHash('sha256').update(stableJson(value)).digest('hex'),
+    runtime: cacheRuntime,
+    value,
+  }
+  const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+  if (bytes.length > POPULATION_CACHE_FILE_MAX) return null
+  const target = join(root, `${identity.key}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, target)
+  try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  prunePopulationCache(root)
+  return record
+}
+
+function recordPopulationCache(value) {
+  const run = beginRunRecord()
+  run.populationCache = value
+  writeRunManifest('active')
+}
+
+function enumerate(description, text, f, suppliedIndex = null) {
+  const indexResult = suppliedIndex || index(f.index_cmd, f.index_format)
+  const prompt = [
     'Profile:\n\n' + text,
     indexBlock(indexResult),
     '\n\nRequest from the human:\n\n' + description,
-    '\n\nEnumerate the cases this request implies. Search the tree for them rather than',
-    ' recalling them, and give every case a source. You are not planning and you will not be',
-    ' shown a plan.',
-  ].join(''), SCHEMA.population, f)
+    '\n\nFirst compare the request against the profile and every relevant canonical document.',
+    ' Put every contradiction or still-undecided product premise in `request_issues`, with exact',
+    ' request and authority sources. Do not stop at the first. If any exist, return no cases:',
+    ' the engine stops before architect. Otherwise leave `request_issues` empty, enumerate the',
+    ' cases this request implies, search the tree for them rather than recalling them, and give',
+    ' every case a source. You are not planning and you will not be shown a plan.',
+  ].join('')
+  const cacheIdentity = populationCacheIdentity(description, text, f, indexResult, prompt)
+  const cached = readPopulationCache(cacheIdentity)
+  let p
+  if (cached) {
+    p = cached.value
+    valueRuntime.set(p, cached.runtime)
+    recordPopulationCache({
+      state: 'hit', key: cacheIdentity.key, created_at: cached.created_at,
+      inputs: cacheIdentity.inputs,
+    })
+    say(`  population cache hit ${cacheIdentity.key.slice(0, 12)} — enumerator call skipped`)
+  } else {
+    if (cacheIdentity) recordPopulationCache({
+      state: 'miss', key: cacheIdentity.key, inputs: cacheIdentity.inputs,
+    })
+    p = agent('enumerator', prompt, SCHEMA.population, f)
+  }
 
-  const resolved = resolvePopulation(p.cases || [], {
+  const context = {
     request: description,
     indexResult,
     workingRoot: process.cwd(),
-  })
-  recordPopulationResolution(resolved)
+    profileText: text,
+  }
+  // The whole enumerator answer rides on the failure. validateRequestIssues judges one field of
+  // it and throws with no value, so the retained contract-failure record read
+  // `"rejected_value": "null"` and `"diagnostics": []` — on one install the refused answer held
+  // two real defects in the project's normative document, and they were recoverable only by
+  // knowing to open the run record's call file before rotation took it.
+  try { validateRequestIssues(p.request_issues, context) }
+  catch (error) {
+    if (!(error instanceof CanonicalOutputError)) throw error
+    if (error.value === null) error.value = p
+    if (!error.attemptId) error.attemptId = runtimeIdentity(p)?.attempt_id || null
+    try {
+      recordEngineDiagnostic('enumerator', 'request-issue-validation',
+        { path: error.path, message: error.detail }, error.attemptId)
+    } catch { /* the failure must still reach the operator */ }
+    throw error
+  }
+  const resolved = resolvePopulation(p.cases, context)
+  recordPopulationResolution(resolved, runtimeIdentity(p)?.attempt_id || null)
   const cases = resolved.cases
   valueRuntime.set(cases, runtimeIdentity(p))
   populationResolution.set(cases, {
@@ -3108,6 +7473,13 @@ function enumerate(description, text, f) {
     retained: resolved.retainedCount,
     witnessWithdrawn: resolved.witnessWithdrawn,
   })
+  if (!cached && cacheIdentity) {
+    const stored = writePopulationCache(cacheIdentity, p, runtimeIdentity(p))
+    if (stored) recordPopulationCache({
+      state: 'miss', stored: true, key: cacheIdentity.key, created_at: stored.created_at,
+      inputs: cacheIdentity.inputs,
+    })
+  }
   // Zero is not fatal: the reviewer still has the request, the profile and a shell, which is
   // exactly what it had before this role existed. It is said out loud because a silent empty
   // list is indistinguishable from a request whose population is genuinely one case wide.
@@ -3116,7 +7488,7 @@ function enumerate(description, text, f) {
     : resolved.returnedCount === 0
       ? '  population: none — enumerator returned no cases; reviewer judges on its own reading alone'
       : '  enumerator witness was withdrawn — reviewer judges on its own reading alone')
-  return cases
+  return { cases, requestIssues: p.request_issues }
 }
 
 // One wording, two callers, because the rule about what may be dropped is the load-bearing
@@ -3266,9 +7638,47 @@ function sayCollisions({ hits, examined }) {
   hits.forEach((h) => say(`    - ${h.task}: '${h.literal}'`))
 }
 
+// Task review and queue finalization intentionally happen on opposite sides of the task commit.
+// A live project exposed the consequence when an architect copied both `supabase test db` and
+// `gate_full` into the final task's Done when: the task reviewer could see only the fast receipt,
+// kept the criteria open, and the full gate that would have produced the other receipt could run
+// only after that same reviewer committed the task. Two review passes then agreed on a condition
+// the engine had made impossible to satisfy.
+//
+// This block is engine-owned lifecycle evidence, not another project preference. It is handed to
+// both planning roles on generated and hand-written paths. The profile text already names both
+// commands, but it does not state which receipt the later reviewer actually receives; making the
+// temporal boundary explicit is what lets `unverifiable` fire before code exists. Project-specific
+// checks stay out of core: a project composes them into gate_fast when a task needs their receipt.
+function taskEvidenceLifecycleBlock(f) {
+  const fast = f.gate_fast || '(no gate_fast configured)'
+  const full = f.gate_full || '(no gate_full configured)'
+  return [
+    '\n\nEngine-owned verification lifecycle (facts about how this plan will run):',
+    `- Before each task review, CAW runs only gate_fast: \`${fast}\`. The reviewer receives that receipt.`,
+    f.gate_full
+      ? `- After every task is reviewed and committed, CAW runs gate_full once: \`${full}\`.`
+      : '- No separate gate_full is configured; the fast gate is the whole engine gate.',
+    '- A task Must cover, Change, or Done when criterion cannot require gate_full, completed-queue',
+    '  validation, or another command that gate_fast does not run. Such a criterion depends on',
+    '  evidence unavailable at task review and is unverifiable, not a task acceptance check.',
+    '- Project-specific pre-review checks belong inside the project-owned gate_fast. Executor',
+    '  claims and proof files are not substitutes for an engine-owned receipt.',
+    '- Every generated task declares `gate_checks`: stable ids the fast gate must report as',
+    '  passed in CAW_GATE_EVIDENCE_OUT. Use CAW_TASK_KEY for task routing; never branch on the',
+    '  numbered filename in CAW_SPEC. An empty gate_checks list is allowed only when the generic',
+    '  fast gate itself is sufficient evidence for every Done when item.',
+  ].join('\n')
+}
+
 function plan(description) {
-  const { f, text } = profile()
+  setProviderBudgetPhase('planning')
+  const { f, text: profileText } = profile()
   noticeNotesLog()
+  if (f.pipeline_mode === 'fast') {
+    die('pipeline_mode fast starts from an existing reviewed or hand-written task spec; ' +
+      'use review-specs for a hand-written queue, then build. No planning provider call ran.')
+  }
 
   // Planning over a queue that still holds specs used to merge two plans in silence:
   // `writeSpecs` numbers from 001 again, so an old `001_old-slug.md` and a new
@@ -3281,15 +7691,31 @@ function plan(description) {
         `  Planning now would renumber from 001 and interleave two plans. Build them, or delete\n` +
         `  the ones you do not want, then plan again.`)
   }
+  clearRiskRecord()
 
-  const population = enumerate(description, text, f)
+  const planning = applyPlanningPolicy(description, profileText)
+  let text = planning.text
+  const resolvedPlanningIndex = planningIndex(description, f)
+  const planningIndexBlock = f.index_audience === 'planning'
+    ? indexBlock(resolvedPlanningIndex) : ''
+  const enumeration = enumerate(description, text, f, resolvedPlanningIndex)
+  const population = requireReadyRequest(enumeration)
+  const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
+  text = populationPolicy.text
+  const risk = populationPolicy.risk
   const planProvenance = [{ role: 'enumerator', ...runtimeIdentity(population) }]
 
   let problems = null
   let last = null
   const history = []
 
-  for (let round = 1; round <= MAX_PLAN_ROUNDS; round++) {
+  for (let round = 1; round <= f.planning_max_rounds; round++) {
+    const architectBudgetIssue = providerBudgetIssue('architect', f.provider_budgets)
+    if (architectBudgetIssue && last) {
+      planIncomplete(description, last, history, problems || [architectBudgetIssue],
+        `provider budget stopped planning before architect: ${architectBudgetIssue}`,
+        population, planProvenance, risk)
+    }
     // Hand the architect its own plan back.
     //
     // It used to get the holes and nothing else: "Your previous plan has holes" named a plan
@@ -3309,7 +7735,7 @@ function plan(description) {
     // say in `resplit` what moved and why.
     const revision = problems
       ? '\n\nYour previous plan, in the order it would run:\n\n' +
-        JSON.stringify(last.tasks, null, 2) +
+        JSON.stringify({ tasks: last.tasks, coverage: last.coverage }, null, 2) +
         '\n\nThe reviewer found these holes in it. Close every one:\n- ' + problems.join('\n- ') +
         '\n\nReturn the whole plan again with the holes closed, and change only what closing them' +
         ' requires: a task nobody raised a hole about comes back as it was. Where a hole is about' +
@@ -3319,15 +7745,25 @@ function plan(description) {
         ' leaves behind, not when `change` mentions it.'
       : ''
 
-    const out = agent('architect', [
+    const architectPrompt = [
       'Request from the human:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      planningIndexBlock,
+      taskEvidenceLifecycleBlock(f),
       revision,
       '\n\nSplit this into an ordered list of atomic tasks, and return the coverage mapping.',
-    ].join(''), SCHEMA.plan, f)
+      ' Give every independently changeable surface a globally unique id and one explicit state',
+      ' machine. Put unrelated surfaces in separate tasks. If several surfaces truly cannot be',
+      ' delivered independently, keep them together only with a concrete indivisible_reason.',
+      ' Assign executor_budget small to one bounded local surface, normal to an ordinary feature,',
+      ' and large to cross-layer, database, authorization, security, credential, or migration work.',
+      ' The engine may raise your proposal to its safety floor and never lowers it.',
+    ].join('')
+    const { value: out, validation: ledger } = planningCanonicalCall(
+      'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
     planProvenance.push({ round, role: 'architect', ...runtimeIdentity(out) })
 
-    validatePlanRelations(out)
+    const budgetSelections = executorBudgetSelections(out.tasks)
 
     if (blocked(out.blocked)) {
       die(`architect stopped:\n\n${out.blocked}\n\n` +
@@ -3347,17 +7783,50 @@ function plan(description) {
     const collided = collisions(out.tasks)
     sayCollisions(collided)
 
-    const r = agent('plan-reviewer', [
+    if (f.planning_independence === 'human-review') {
+      planIncomplete(description, out, history,
+        ['signed human planning review required'],
+        'automated plan review is disabled by planning_independence: human-review',
+        population, planProvenance, risk)
+    }
+
+    const reviewerBudgetIssue = providerBudgetIssue('plan-reviewer', f.provider_budgets)
+    if (reviewerBudgetIssue) {
+      planIncomplete(description, out, history,
+        [`plan review did not run — ${reviewerBudgetIssue}`],
+        `provider budget stopped planning before plan-reviewer: ${reviewerBudgetIssue}`,
+        population, planProvenance, risk)
+    }
+    // The previous round's holes are exactly what the architect just revised against, so the
+    // re-judge answers them by id before it can call the revision clean.
+    const planHoles = (problems || []).map((hole, index) => ({ id: `h${index + 1}`, hole }))
+    const planReviewPrompt = [
       'Judge this plan. There is no code yet: you are judging the split and its coverage.',
       '\n\nRequest:\n\n' + description,
       '\n\nProfile:\n\n' + text,
+      planningIndexBlock,
+      taskEvidenceLifecycleBlock(f),
       '\n\nProposed tasks:\n\n' + JSON.stringify(out.tasks, null, 2),
+      '\n\nEngine-owned executor budget selections. The requested value came from the architect;',
+      ' effective is max(requested, safety floor). Treat an effective class that is still too',
+      ' small for reliable complete delivery as an `unverifiable` hole:\n\n' +
+        JSON.stringify(budgetSelections, null, 2),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
+      '\n\nEngine-owned relation ledger. Return exactly one `relations` row for every id:',
+      '\n\n' + JSON.stringify(ledger.relations, null, 2),
       populationBlock(population),
       collisionBlock(collided),
+      carriedHolesBlock(planHoles),
       '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
       ' dimension.',
-    ].join(''), SCHEMA.planReview, f)
+    ].join('')
+    const { value: r } = planningCanonicalCall(
+      'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
+        const issue = planRelationIssue(ledger, value.relations)
+        if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+        const carriedIssue = carriedHolesIssue(value.carried, planHoles)
+        if (carriedIssue) schemaFailure('plan-reviewer', '$.carried', carriedIssue, value)
+      })
     planProvenance.push({ round, role: 'plan-reviewer', ...runtimeIdentity(r) })
 
     // The script derives the verdict from the slots. The reviewer does not get to state one.
@@ -3387,10 +7856,16 @@ function plan(description) {
     // section under the `## Undecidable` one. The artifact existed; it was handed an empty array.
     // Measured on the install that found it: a $1.57 verdict of which one slot in five was read.
     problems = [
+      ...r.relations.filter((row) => row.state === 'uncovered')
+        .map((row) => `uncovered relation [${row.id}] — ${row.evidence}`),
       ...(r.uncovered || []).map((x) => `uncovered — ${x}`),
       ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
       ...(r.misordered || []).map((x) => `misordered — ${x}`),
       ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+      ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
+        const hole = planHoles.find((h) => h.id === row.id)?.hole || row.id
+        return `still open [${row.id}] — ${hole} — ${row.evidence}`
+      }),
     ]
 
     if (r.undecidable?.length) {
@@ -3400,7 +7875,8 @@ function plan(description) {
           ` —\n  they may themselves rest on it:\n    - ${problems.join('\n    - ')}`
         : `\n  Nothing else in this verdict: the other four slots came back empty.`)
       writeSpecs(out.tasks, out.coverage)
-      writePlan(description, out, history, problems, population, r.undecidable, planProvenance)
+      writePlan(description, out, history, problems, population, r.undecidable, planProvenance,
+        risk)
       say(`\n${PLAN} written, approved: false — the specs below it rest on a guess.`)
       say(`\nDecide the questions and record the answers where a later run will find them — a`)
       say(`file under '## Canonical docs' in .caw/CAW.md. An answer that lives only in the`)
@@ -3412,7 +7888,7 @@ function plan(description) {
     }
     if (!problems.length) {
       writeSpecs(out.tasks, out.coverage)
-      writePlan(description, out, history, [], population, [], planProvenance)
+      writePlan(description, out, history, [], population, [], planProvenance, risk)
       say(`  ${PLAN}`)
       say(`\nRead them, edit or reorder freely, then:  node caw.mjs build`)
       say(`  spent ${formatAccounting(accounting)}`)
@@ -3434,7 +7910,7 @@ function plan(description) {
     // bought was an early exit that has never once been right.
   }
   planIncomplete(description, last, history, problems,
-    `Still has holes after ${MAX_PLAN_ROUNDS} rounds.`, population, planProvenance)
+    `Still has holes after ${f.planning_max_rounds} rounds.`, population, planProvenance, risk)
 }
 
 // Writes the specs and says where they went, and nothing else. The next-step line belongs to
@@ -3442,15 +7918,44 @@ function plan(description) {
 // the human to build a plan nobody approved — and printed it BEFORE the holes.
 function writeSpecs(tasks, coverage) {
   mkdirSync(QUEUE_DIR, { recursive: true })
+  const ledger = planningLedger({ tasks, coverage })
   tasks.forEach((t, i) => {
     const id = String(i + 1).padStart(3, '0')
     const path = join(QUEUE_DIR, `${id}_${t.slug}.md`)
     const covers = (coverage || []).filter((c) => c.task === t.slug).map((c) => c.case)
+    const links = ledger.relations.filter((relation) => relation.task === t.slug)
+    const gateChecks = t.gate_checks || []
+    const budget = effectiveExecutorBudgetClass(t.executor_budget, t)
+    const gateCheckIds = gateChecks.map((check) => check.id)
+    if (new Set(gateCheckIds).size !== gateCheckIds.length) {
+      die(`task ${t.slug} contains duplicate gate check ids`)
+    }
+    for (const check of gateChecks) gateEvidenceId(check.id, `task ${t.slug} gate check id`)
     writeFileSync(path, [
-      '---', `id: ${id}`, `title: ${t.title}`, '---', '',
+      '---', `id: ${id}`, `task_key: ${t.slug}`, `title: ${t.title}`,
+      `executor_budget_requested: ${budget.requested}`,
+      `executor_budget: ${budget.effective}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
+      '## Surfaces', ...t.surfaces.map((surface) =>
+        `- \`${surface.id}\` — ${surface.responsibility}`), '',
+      '## State machines', ...t.state_machines.flatMap((machine) => [
+        `- \`${machine.surface}\`: states ${machine.states.map((state) => `\`${state}\``).join(', ')}`,
+        ...machine.transitions.map((transition) =>
+          `  - \`${transition.from}\` -- ${transition.event} --> \`${transition.to}\``),
+      ]), '',
+      ...(t.indivisible_reason
+        ? ['## Indivisible', `- ${t.indivisible_reason}`, ''] : []),
       ...(covers.length ? ['## Must cover', ...covers.map((x) => `- ${x}`), ''] : []),
+      ...(links.length ? ['## Acceptance links', ...links.map((relation) => {
+        const criteria = relation.criterion_ids.map((criterionId) => {
+          const criterion = ledger.requirements.find((item) => item.id === criterionId)
+          return `\`${criterionId}\` ${criterion?.text || ''}`
+        }).join('; ')
+        return `- \`${relation.id}\` / \`${relation.case_id}\` ${relation.case} → ${criteria}`
+      }), ''] : []),
       '## Change', ...t.change.map((x) => `- ${x}`), '',
+      ...(gateChecks.length ? ['## Required gate checks', ...gateChecks.map((check) =>
+        `- \`${check.id}\` — ${check.description}`), ''] : []),
       '## Done when', ...t.done_when.map((x) => `- ${x}`), '',
     ].join('\n'))
     say(`  ${path}`)
@@ -3460,16 +7965,451 @@ function writeSpecs(tasks, coverage) {
 
 // ---------------------------------------------------------------- build
 
+function fullGateQueueDigest() {
+  const hash = createHash('sha256')
+  for (const path of [PLAN, ...specFiles().map((name) => join(QUEUE_DIR, name))]) {
+    if (!existsSync(path)) continue
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      die(`full-gate baseline input is not a regular file: ${path}`)
+    }
+    hash.update(`\0${path}\0${stat.mode & 0o777}\0`)
+    hash.update(readFileSync(path))
+  }
+  return hash.digest('hex')
+}
+
+function knownFullGateInputs(f, risk, startHead) {
+  const policySnapshot = projectPolicySnapshot()
+  const gateEnvironment = { ...process.env, PWD: process.cwd() }
+  const riskInput = {
+    class: risk.class,
+    population_requirement: risk.population_requirement,
+    population_attestation: risk.population_attestation,
+    population_digest: risk.population_digest,
+    evidence: risk.evidence,
+    policy_id: risk.policy_id,
+    policy_digest: risk.policy_digest,
+  }
+  return {
+    version: 1,
+    head: startHead,
+    delivery_digest: deliveryDigest(),
+    queue_digest: fullGateQueueDigest(),
+    engine_digest: createHash('sha256')
+      .update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    profile_digest: createHash('sha256').update(readFileSync('.caw/CAW.md')).digest('hex'),
+    environment_digest: createHash('sha256').update(stableJson(gateEnvironment)).digest('hex'),
+    policy_set_digest: policySnapshot?.set_digest || null,
+    risk_digest: createHash('sha256').update(stableJson(riskInput)).digest('hex'),
+    gate: f.gate_full,
+    timeout_ms: f.gate_full_timeout_ms,
+  }
+}
+
+function projectFullGateInputs(f, risk, knownInputs) {
+  if (projectPolicySet?.apiVersion < 2 || !projectPolicySet.policies?.gate) return null
+  const result = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full-baseline-inputs',
+    risk_class: risk.class,
+    command: f.gate_full,
+    state: 'not-run',
+    status: null,
+    output: '',
+    duration_ms: 0,
+    timeout_ms: f.gate_full_timeout_ms,
+    known_inputs: knownInputs,
+  })
+  if (result.output.action === 'stop') {
+    die(`project gate policy ${result.policy.id} stopped baseline input resolution: ` +
+      result.output.reason.trim())
+  }
+  return result.output.baseline_inputs_digest || null
+}
+
+// A spec declaring `## Required gate checks` against a gate that writes no evidence manifest
+// stops with `green gate produced no evidence manifest for required task checks` — and that is
+// computed AFTER the executor has run and the gate has gone green. Measured on one install
+// updating from 0.1.0, whose gate predates the manifest entirely: $1.55 of executor work and
+// the tree it produced, thrown away over a contract nobody had told the gate about. With 985
+// tests passing, it reads as a defect in the pipeline rather than as a missing migration step.
+//
+// So the question is asked before any spend, using the only instrument that can answer it: the
+// gate itself, once, on the committed tree. The declared ids are deliberately NOT required here.
+// On a tree where no task has run yet a required check legitimately has nothing to report, and
+// the refusal this prevents is about the manifest's PRESENCE, not its contents.
+//
+// Cached on success against the exact gate command, engine and profile, so a project pays the
+// extra run once per gate change rather than once per build. A failure is never cached: it dies.
+const GATE_CONTRACT_PREFLIGHT_VERSION = 1
+const GATE_CONTRACT_PREFLIGHT_FILE_MAX = 64 * 1024
+
+function gateContractPreflightRoot() {
+  try {
+    const path = execFileSync('git', ['rev-parse', '--git-path', 'caw/gate-contract'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    return path ? resolve(path) : null
+  } catch { return null }
+}
+
+function gateContractPreflightIdentity(f) {
+  const inputs = {
+    version: GATE_CONTRACT_PREFLIGHT_VERSION,
+    gate: f.gate_fast,
+    timeout_ms: f.gate_fast_timeout_ms ?? null,
+    engine_digest: engineDigest(),
+    profile_digest: createHash('sha256').update(readFileSync('.caw/CAW.md')).digest('hex'),
+  }
+  return { key: createHash('sha256').update(stableJson(inputs)).digest('hex'), inputs }
+}
+
+function readGateContractPreflight(identity) {
+  const root = gateContractPreflightRoot()
+  if (!root || !existsSync(root)) return null
+  const path = join(root, `${identity.key}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() ||
+        stat.size > GATE_CONTRACT_PREFLIGHT_FILE_MAX) return null
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    exactObjectKeys(record, ['version', 'key', 'created_at', 'inputs'], 'gate contract preflight')
+    if (record.version !== GATE_CONTRACT_PREFLIGHT_VERSION || record.key !== identity.key ||
+        stableJson(record.inputs) !== stableJson(identity.inputs)) return null
+    return record
+  } catch { return null }
+}
+
+function writeGateContractPreflight(identity) {
+  const root = gateContractPreflightRoot()
+  if (!root) return null
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  try { chmodSync(root, 0o700) } catch { /* POSIX modes unavailable */ }
+  const record = {
+    version: GATE_CONTRACT_PREFLIGHT_VERSION,
+    key: identity.key,
+    created_at: new Date().toISOString(),
+    inputs: identity.inputs,
+  }
+  const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`)
+  if (bytes.length > GATE_CONTRACT_PREFLIGHT_FILE_MAX) return null
+  const target = join(root, `${identity.key}.json`)
+  const temp = `${target}.tmp-${process.pid}`
+  writeFileSync(temp, bytes, { mode: 0o600 })
+  renameSync(temp, target)
+  try { chmodSync(target, 0o600) } catch { /* POSIX modes unavailable */ }
+  return record
+}
+
+function runGateEvidenceContractPreflight(f, specs) {
+  const declaring = specs.filter((spec) => requiredGateChecks(spec).length)
+  if (!declaring.length) return
+  if (!f.gate_fast) return
+  const identity = gateContractPreflightIdentity(f)
+  if (readGateContractPreflight(identity)) return
+
+  say(`\n· gate evidence contract — ${declaring.length} queued task(s) declare required gate` +
+      ' checks, and this gate has not been seen to emit a manifest. Asking it once, before' +
+      ' any executor runs.')
+  // Asked of no task. The question is whether this gate writes a manifest, and a spec whose
+  // delivery does not exist yet cannot be green: measured on one iOS install, a project rule that a task
+  // must close its own backlog block made the preflight — run as the queue's first task, on the
+  // committed tree — red on every engine update whose first task closes one, and `build` refused
+  // an approved queue before any executor had run. Asking no task does not settle that install
+  // by itself: its gate, as docs/gate.md prescribes, judges the whole queue when CAW_SPEC is
+  // unset, and is red there too. What settles it is the rule below, that red proves nothing; a
+  // project that wants the answer cached skips its delivery checks on `kind: contract-preflight`,
+  // which stays visible in CAW_GATE_CONTRACT.
+  const probe = gate(f.gate_fast, null, undefined, f.gate_fast_timeout_ms, {
+    task: null,
+    kind: 'contract-preflight',
+    deliveryDigest: deliveryDigest(),
+    criteria: [],
+    acceptanceCases: [],
+    requiredCheckIds: [],
+  })
+  if (probe.receipt?.manifest?.present) {
+    writeGateContractPreflight(identity)
+    say('  it writes an evidence manifest; the declared ids will be judged per task.')
+    return
+  }
+  // Only a GREEN gate without a manifest proves the gate emits none. A gate that writes its manifest
+  // only when it passes — the common shape — says nothing on a red or refused run, and a docs-
+  // conforming gate run without CAW_SPEC judges the whole queue, which nothing has delivered yet.
+  // So that answer is left unsettled rather than refused: nothing is cached, and each task's own
+  // green gate is still refused without the checks it declares, exactly as before.
+  if (probe.state === 'red' || probe.state === 'refused') {
+    say(`  it was ${probe.state} on the committed tree (status ${probe.status}) and wrote no manifest,` +
+      ' which does not settle whether it can; each task\'s green gate will be judged on its own.')
+    return
+  }
+  if (probe.state === 'timeout') {
+    die(`the gate evidence contract could not be checked: gate_fast exceeded ` +
+        `${formatTimeout(probe.timeoutMs)} and was killed on the committed tree.\n` +
+        `  Nothing was spent. Fix the gate or raise gate_fast_timeout_ms in .caw/CAW.md.`)
+  }
+  say(probe.out)
+  die(`${declaring.length} queued task(s) declare '## Required gate checks', and gate_fast wrote\n` +
+      `  no evidence manifest to CAW_GATE_EVIDENCE_OUT on the committed tree. Every one of those\n` +
+      `  tasks would run an executor, go green, and then be refused — which is what this refusal\n` +
+      `  costs nothing to replace.\n` +
+      `    gate: ${f.gate_fast}\n` +
+      `    it exited ${probe.status} (${probe.state})\n` +
+      `  A gate written before evidence manifests existed needs one migration step; it is the\n` +
+      `  '## Structured evidence' section of docs/gate.md, and docs/updating.md names it under\n` +
+      `  '## Updating'. The ids to emit arrive in CAW_GATE_REQUIRED_CHECKS, one per line.\n` +
+      `  If the gate is meant to emit nothing, remove '## Required gate checks' from the specs\n` +
+      `  instead — the tasks that declare it: ${declaring.join(', ')}`)
+}
+
+function runRequiredFullGateBaseline(f, risk, startHead) {
+  if (!risk?.require_full_gate_baseline) return null
+  const planningPolicy = projectPolicySet?.policies?.planning
+  if (!planningPolicy || planningPolicy.digest !== risk.policy_digest) {
+    die('project risk policy changed or disappeared after attestation; run review-specs again')
+  }
+  if (!f.gate_full) {
+    die(`project risk class ${risk.class} requires a full-gate baseline, but gate_full is empty`)
+  }
+  const knownInputs = knownFullGateInputs(f, risk, startHead)
+  const projectInputsDigest = projectFullGateInputs(f, risk, knownInputs)
+  const inputsDigest = projectInputsDigest
+    ? createHash('sha256').update(stableJson({ knownInputs, projectInputsDigest })).digest('hex')
+    : null
+  const cached = risk.full_gate_baseline
+  if (inputsDigest && cached?.inputs_digest === inputsDigest &&
+      cached.project_inputs_digest === projectInputsDigest && cached.head === startHead &&
+      cached.tree_digest === knownInputs.delivery_digest && cached.gate === f.gate_full) {
+    say(`\n· required full-gate baseline (${risk.class}): reused green result for exact inputs`)
+    const run = beginRunRecord()
+    run.risk = risk
+    run.fullGateBaseline = {
+      ...cached,
+      status: 0,
+      output: '(reused exact-input baseline)',
+      duration_ms: 0,
+      timeout_ms: f.gate_full_timeout_ms,
+      cache: 'hit',
+    }
+    writeRunManifest('active')
+    return run.fullGateBaseline
+  }
+  say(`\n· required full-gate baseline (${risk.class}): ${f.gate_full}`)
+  const baselineTreeDigest = deliveryDigest()
+  const baselineStateDigest = projectPolicyStateDigest()
+  const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms, {
+    kind: 'full-baseline', deliveryDigest: baselineTreeDigest,
+  })
+  const baselineChanged = projectPolicyStateDigest() !== baselineStateDigest
+  const run = beginRunRecord()
+  run.risk = risk
+  run.fullGateBaseline = {
+    head: startHead,
+    tree_digest: baselineTreeDigest,
+    gate: f.gate_full,
+    inputs_digest: inputsDigest,
+    project_inputs_digest: projectInputsDigest,
+    state: baselineChanged ? 'mutated' : g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  }
+  writeRunManifest(g.ok && !baselineChanged ? 'active' : 'failed')
+  if (baselineChanged) {
+    die('required full-gate baseline changed HEAD, delivery, CAW, policies, or the task queue; ' +
+      'no executor ran')
+  }
+  if (projectInputsDigest) {
+    const afterProjectInputsDigest = projectFullGateInputs(f, risk, knownInputs)
+    if (afterProjectInputsDigest !== projectInputsDigest) {
+      run.fullGateBaseline.state = 'inputs-changed'
+      writeRunManifest('failed')
+      die('required full-gate baseline project inputs changed while the gate ran; no executor ran')
+    }
+  }
+  const gatePolicy = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full-baseline',
+    risk_class: risk.class,
+    command: f.gate_full,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  })
+  if (gatePolicy?.output.action === 'stop') {
+    if (g.out) say(g.out)
+    die(`project gate policy ${gatePolicy.policy.id} stopped the required full baseline: ` +
+      gatePolicy.output.reason.trim())
+  }
+  if (!g.ok) {
+    if (g.out) say(g.out)
+    if (g.state === 'timeout') {
+      die(`required full-gate baseline TIMED OUT after ${formatTimeout(g.timeoutMs)}; ` +
+        'no executor ran')
+    }
+    if (g.state === 'refused') {
+      die('required full-gate baseline DID NOT RUN: it refused to start; no executor ran')
+    }
+    die('required full-gate baseline is RED; no executor ran')
+  }
+  say('  green — final full-gate failures can be attributed to this build range')
+  writeRiskRecord({
+    ...risk,
+    full_gate_baseline: {
+      head: startHead,
+      tree_digest: run.fullGateBaseline.tree_digest,
+      gate: f.gate_full,
+      state: 'green',
+      inputs_digest: inputsDigest,
+      project_inputs_digest: projectInputsDigest,
+    },
+  })
+  return run.fullGateBaseline
+}
+
+function runFinalFullGate(f, startHead, fullGateBaseline = null) {
+  say(`\n· full gate: ${f.gate_full}`)
+  const fullDelivery = deliveryDigest()
+  const g = gate(f.gate_full, undefined, undefined, f.gate_full_timeout_ms, {
+    kind: 'full', deliveryDigest: fullDelivery,
+  })
+  if (deliveryDigest() !== fullDelivery) {
+    die('full gate changed the tracked delivery tree; its receipt no longer describes the current delivery')
+  }
+  const gatePolicy = runProjectPolicy('gate', {
+    task: null,
+    kind: 'full',
+    command: f.gate_full,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+  })
+  if (gatePolicy?.output.action === 'stop') {
+    if (g.out) say(g.out)
+    die(`project gate policy ${gatePolicy.policy.id} stopped the full gate: ` +
+      gatePolicy.output.reason.trim())
+  }
+  if (!g.ok) {
+    say(g.out)
+    if (g.state === 'timeout') {
+      die(`full gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed. No full-gate` +
+          ` verdict exists; re-run it or adjust gate_full_timeout_ms in .caw/CAW.md.`)
+    }
+    if (g.state === 'refused') {
+      die(`full gate DID NOT RUN — it refused to start, and nothing was tested.\n` +
+          `  Every task is committed on its own green fast gate; none of that is in doubt.\n` +
+          `  Re-run once the refusal is over:  ${f.gate_full}`)
+    }
+    if (fullGateBaseline?.state === 'green' && fullGateBaseline.head === startHead) {
+      die(`full gate is RED after a green required baseline at ${startHead}. The regression is` +
+        ` inside this build range:\n    git bisect start HEAD ${startHead}`)
+    }
+    die(`full gate is RED. Every task was committed on its own green fast gate, so the fast gate\n` +
+        `  is not what missed this. Whether ${startHead} was green under the FULL gate is unknown —\n` +
+        `  this run never ran it there — so bisect the range rather than assume it:\n` +
+        `    git bisect start HEAD ${startHead}`)
+  }
+  say('  green')
+  return g
+}
+
+function runBatchGate(f) {
+  if (!f.gate_batch) return null
+  say(`\n· batch gate: ${f.gate_batch}`)
+  const batchDelivery = deliveryDigest()
+  const g = gate(f.gate_batch, undefined, undefined, f.gate_batch_timeout_ms, {
+    kind: 'batch', deliveryDigest: batchDelivery,
+  })
+  if (deliveryDigest() !== batchDelivery) {
+    die('batch gate changed the tracked delivery tree; its receipt no longer describes the delivery')
+  }
+  if (!g.ok) {
+    if (g.out) say(g.out)
+    if (g.state === 'timeout') {
+      die(`batch gate timed out after ${formatTimeout(g.timeoutMs)}; no verdict exists`)
+    }
+    if (g.state === 'refused') die('batch gate refused to run; no verdict exists')
+    die(`batch gate is red (status ${g.status})`)
+  }
+  say('  green')
+  return g
+}
+
+function requirePersistedFullGateBaseline(f, risk) {
+  if (!risk.require_full_gate_baseline) return null
+  if (!f.gate_full) {
+    die(`project risk class ${risk.class} requires a full-gate baseline, but gate_full is empty`)
+  }
+  const baseline = risk.full_gate_baseline
+  if (!baseline) {
+    die(`project risk class ${risk.class} has no green full-gate baseline; start with build`)
+  }
+  if (baseline.gate !== f.gate_full) {
+    die('gate_full changed after the required baseline; start again with build')
+  }
+  const ancestry = spawnSync('git', ['merge-base', '--is-ancestor', baseline.head, 'HEAD'], {
+    encoding: 'utf8',
+  })
+  if (ancestry.status !== 0) {
+    die(`required full-gate baseline ${baseline.head} is not an ancestor of HEAD; start again with build`)
+  }
+  return baseline
+}
+
+function requireTaskBranch(f) {
+  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
+  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
+}
+
+const CHALLENGER_RISK_PATH = /(^|\/)(auth|security|billing|payment|migrations?|polic(?:y|ies)|rls)(\/|[._-]|$)/i
+
+// Why a challenger was planned before the primary pass, in the words of the profile. Measured on
+// one iOS install: pass 2 ran with nothing in the log saying why, and the operator reconstructed a wrong
+// cause — a refuted weak claim — from the gate receipts. Null when no challenger is planned up front.
+function challengerReason(f, files, open = []) {
+  if (f.review_challenger_policy === 'fixed') {
+    return f.review_challenger_passes > 0 ? 'review_challenger_policy: fixed' : null
+  }
+  if (open.length) return `review_challenger_policy: risk, ${open.length} open item(s) carried in`
+  if (files.length >= f.review_challenger_file_threshold) {
+    return `review_challenger_policy: risk, ${files.length} changed files` +
+      ` (threshold ${f.review_challenger_file_threshold})`
+  }
+  const risky = files.find((path) => CHALLENGER_RISK_PATH.test(path))
+  return risky ? `review_challenger_policy: risk, ${risky} is a risk path` : null
+}
+
+function reviewNeedsChallenger(f, files, open = [], verdict = null) {
+  if (f.review_challenger_policy === 'fixed') return f.review_challenger_passes > 0
+  if (open.length || files.length >= f.review_challenger_file_threshold ||
+      files.some((path) => CHALLENGER_RISK_PATH.test(path))) return true
+  if (!verdict) return false
+  return ['broken', 'uncovered', 'weak'].some((slot) => (verdict[slot] || []).length > 0) ||
+    (verdict.criteria || []).some((row) => row.state !== 'met')
+}
+
 function build(noFull) {
+  setProviderBudgetPhase('delivery')
   const { f, text } = profile()
   noticeNotesLog()
+  activePopulationCertification = { state: 'unknown', source: 'no-plan-artifact', digest: null }
+  let planText = null
   // The flag outlives the terminal that printed the holes, which is the whole point of it
   // being on disk. Flipped by `review-specs` when it comes back clean — the one thing in this
   // tool whose job is judging a spec against the request — or by hand, which is an explicit
-  // act rather than a scrollback nobody read. A hand-written ticket has no PLAN.md and so no
-  // gate here, which is right: there was never a plan to approve.
+  // act rather than a scrollback nobody read. `review-specs` creates the same durable approval
+  // artifact for a hand-written queue, while naming that no plan was generated.
   if (existsSync(PLAN)) {
     const plan = readFileSync(PLAN, 'utf8')
+    planText = plan
+    activePopulationCertification = readPlanPopulationRecord(plan)
     if (/^approved:\s*false\s*$/m.test(plan)) {
       // Two states, one flag, and they are not the same event. A plan that was never approved
       // carries what stopped it. A plan whose approval was WITHDRAWN carries nothing — withdrawal
@@ -3532,11 +8472,29 @@ function build(noFull) {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to build')
 
-  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
-  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits per task`)
+  requireTaskBranch(f)
   if (changedFiles().length) die('working tree is dirty — commit or stash first')
 
   const startHead = git('rev-parse', 'HEAD').trim()
+  let risk = null
+  try { risk = readRiskRecord() }
+  catch (error) { die(error?.message || String(error)) }
+  const planDeclaresRisk = /^risk_class:\s*\S+/m.test(planText || '')
+  if (planDeclaresRisk && !risk) {
+    die(`${PLAN} declares project risk, but ${RISK_RECORD} is missing; run review-specs again`)
+  }
+  if (risk) {
+    requireMatchingPlanRisk(planText, risk)
+    requireCurrentRiskPolicy(risk)
+    applyRiskPopulationCertification(risk)
+  }
+  if (risk?.require_full_gate_baseline && noFull) {
+    die(`project risk class ${risk.class} requires gate_full before and after the build; ` +
+      '--no-full is not allowed')
+  }
+  const fullGateBaseline = runRequiredFullGateBaseline(f, risk, startHead)
+  // Before the first executor, because the refusal it replaces is computed after one.
+  runGateEvidenceContractPreflight(f, specs)
   // Any saved review history here is stale by construction and is dropped rather than resumed.
   // `build` refuses to start on a dirty tree and every task before this one committed, so the
   // tree a state file describes is not the tree in front of us: whatever it held was thrown
@@ -3548,31 +8506,12 @@ function build(noFull) {
     runTask(spec, f, text)
   }
 
-  if (!noFull && f.gate_full) {
-    say(`\n· full gate: ${f.gate_full}`)
-    const g = gate(f.gate_full)
-    if (!g.ok) {
-      say(g.out)
-      // 75 (EX_TEMPFAIL) is the gate saying it DID NOT RUN — the convention the README asks
-      // a gate to follow when it refuses to start rather than fails: a machine too busy for
-      // the suite it shards, a simulator that is not there, a service it depends on that is
-      // down. A refusal and a failure are different facts and deserve different words.
-      // Calling a refusal RED sends the reader hunting a defect through a range where no test
-      // executed, each bisect step a full suite run. Measured on one install, where the gate
-      // used exit 1 for both and the bisect advice was followed.
-      if (g.status === 75) {
-        die(`full gate DID NOT RUN — it refused to start, and nothing was tested.\n` +
-            `  Every task is committed on its own green fast gate; none of that is in doubt.\n` +
-            `  Re-run once the refusal is over:  ${f.gate_full}`)
-      }
-      // "Attributable" needs `startHead` green under gate_full, and this run never ran gate_full
-      // there: it runs once, on HEAD. The range is where to look, not proof the answer is in it.
-      die(`full gate is RED. Every task was committed on its own green fast gate, so the fast gate\n` +
-          `  is not what missed this. Whether ${startHead} was green under the FULL gate is unknown —\n` +
-          `  this run never ran it there — so bisect the range rather than assume it:\n` +
-          `    git bisect start HEAD ${startHead}`)
-    }
-    say('  green')
+  if (f.pipeline_mode !== 'fast') runBatchGate(f)
+
+  if (f.pipeline_mode === 'fast') {
+    say('\n· fast mode ends after focused task gates and reviews')
+  } else if (!noFull && f.gate_full) {
+    runFinalFullGate(f, startHead, fullGateBaseline)
   } else if (!f.gate_full) {
     say('\n· no gate_full configured — fast gate is the whole gate')
   } else {
@@ -3591,6 +8530,7 @@ function build(noFull) {
     unlinkSync(PLAN)
     say(`  cleared ${PLAN} — the queue it planned is empty`)
   }
+  if (!specFiles().length) clearRiskRecord()
   if (notes.length) {
     // Each of these is already in the commit message of the task that produced it. Reprinted
     // here because a note's value is usually to the PROJECT rather than to its own task — the
@@ -3820,9 +8760,21 @@ function prepareWeakCapture(surface) {
   return baseline
 }
 
-const weakDowngrade = (item, reason) =>
-  `weak downgraded to noted — ${item.where}: ${item.fix}; ` +
-  `mutation was not reproducible (${reason}). Evidence: ${item.evidence}`
+function resetReviewPassForSemanticRepair(surface, baseline) {
+  restoreWeakReplaySurface(surface, baseline)
+  const branches = surfaceGit(surface.workingRoot, 'for-each-ref',
+    '--format=%(refname:short)', 'refs/heads/caw-weak-*').split('\n').filter(Boolean)
+  for (const branch of branches) surfaceGit(surface.workingRoot, 'branch', '-D', branch)
+  restoreWeakReplaySurface(surface, baseline)
+}
+
+const weakRefuted = (item, reason) =>
+  `weak refuted experiment, noted only — ${item.where}: ${item.fix}; ` +
+  `the experiment contradicted the finding (${reason}). Evidence: ${item.evidence}`
+
+const weakUnavailable = (item, reason) =>
+  `weak verification unavailable, noted only — ${item.where}: ${item.fix}; ` +
+  `verification could not complete (${reason}). Evidence: ${item.evidence}`
 
 function weakPatchPaths(surface, patch) {
   const raw = execFileSync('git', ['apply', '--numstat', '-z', '-'], {
@@ -3850,6 +8802,19 @@ function weakPatchPaths(surface, patch) {
   return paths
 }
 
+function weakExpectedPath(item, surface) {
+  const where = item?.where?.trim().replace(/^`|`$/g, '') || ''
+  const location = where.match(/^(.+?):\d+(?::\d+|[-–]\d+)?$/)?.[1] || where
+  if (!location || isAbsolute(location) || location.includes('\\')) return null
+  const target = resolve(surface.workingRoot, location)
+  if (!inside(surface.workingRoot, target) || !existsSync(target)) return null
+  try {
+    const stat = lstatSync(target)
+    if (!stat.isFile() || stat.isSymbolicLink()) return null
+    return relative(surface.workingRoot, target).split(sep).join('/')
+  } catch { return null }
+}
+
 function captureWeakMutations(items, surface, baseline) {
   const accepted = []
   const noted = []
@@ -3870,13 +8835,211 @@ function captureWeakMutations(items, surface, baseline) {
       if (error instanceof WeakMutationSecurityError) throw error
       const detail = (error?.stderr?.toString() || error?.message || String(error))
         .trim().split('\n').filter(Boolean).pop() || 'capture unavailable'
-      noted.push(weakDowngrade(item, detail))
+      noted.push(weakUnavailable(item, detail))
     }
   }
   return { accepted, noted }
 }
 
-function replayWeakMutation(item, f, spec, expectedDigest) {
+function runWeakControlCommand(command, f, spec, surface) {
+  const timeoutMs = f.gate_fast_timeout_ms || WEAK_CONTROL_TIMEOUT_DEFAULT_MS
+  const env = { ...process.env, PWD: surface.workingRoot }
+  if (spec) env.CAW_SPEC = spec
+  const startedAt = Date.now()
+  const result = spawnShellGroupSync(command, {
+    cwd: surface.workingRoot,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    env,
+    timeoutMs,
+  })
+  const stdout = (result.stdout || '').slice(-8000)
+  const stderr = (result.stderr || '').slice(-8000)
+  return {
+    status: result.status,
+    timeout_ms: timeoutMs,
+    duration_ms: Date.now() - startedAt,
+    timed_out: result.error?.code === 'ETIMEDOUT',
+    stdout,
+    stderr,
+    output: `${stdout}${stderr}`.slice(-8000),
+  }
+}
+
+function weakVerificationControls(f, spec, expectedDigest, surface, baseline) {
+  if (!f.weak_source_probe_cmd) return null
+  const unavailable = (state, sourceProbe, positiveControl = null) => ({
+    state, source_probe: sourceProbe, positive_control: positiveControl,
+  })
+  const sourceProbe = runWeakControlCommand(f.weak_source_probe_cmd, f, spec, surface)
+  if (deliveryDigest() !== expectedDigest) {
+    throw new WeakMutationInvariantError(
+      'delivery tree changed while the weak source probe ran')
+  }
+  if (sourceProbe.timed_out || sourceProbe.status !== 0) {
+    return unavailable(sourceProbe.timed_out
+      ? 'unverified-source-probe-timeout' : 'unverified-source-probe-failed', sourceProbe)
+  }
+  let answer
+  try { answer = JSON.parse(sourceProbe.stdout) }
+  catch { return unavailable('unverified-source-probe-invalid', sourceProbe) }
+  try {
+    exactObjectKeys(answer, ['loaded_paths'], 'weak source probe')
+    if (!Array.isArray(answer.loaded_paths) || !answer.loaded_paths.length ||
+        answer.loaded_paths.some((path) => typeof path !== 'string' || !isAbsolute(path))) {
+      throw new Error('weak source probe loaded_paths must be a non-empty array of absolute paths')
+    }
+    sourceProbe.loaded_paths = answer.loaded_paths.map((path) => {
+      const sourceRoot = realpathSync(surface.workingRoot)
+      const canonical = realpathSync(path)
+      const stat = lstatSync(canonical)
+      if (!inside(sourceRoot, canonical) ||
+          inside(join(sourceRoot, '.git'), canonical) || !stat.isFile()) {
+        throw new Error(`weak source probe path is outside review source: ${path}`)
+      }
+      return relative(sourceRoot, canonical).split(sep).join('/')
+    })
+  } catch (error) {
+    sourceProbe.reason = error?.message || String(error)
+    return unavailable('unverified-source-probe-invalid', sourceProbe)
+  }
+  const sourceStatus = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (sourceStatus) {
+    sourceProbe.reason = `source probe changed the review surface: ${sourceStatus}`
+    return unavailable('unverified-source-probe-mutated', sourceProbe)
+  }
+
+  const positiveControl = runWeakControlCommand(f.weak_positive_control_cmd, f, spec, surface)
+  if (deliveryDigest() !== expectedDigest) {
+    throw new WeakMutationInvariantError(
+      'delivery tree changed while the weak positive control ran')
+  }
+  if (positiveControl.timed_out || positiveControl.status !== 0) {
+    return unavailable(positiveControl.timed_out
+      ? 'unverified-positive-control-timeout' : 'unverified-positive-control-failed',
+    sourceProbe, positiveControl)
+  }
+  const status = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (!status || status.split('\n').some((line) => line.startsWith('?? '))) {
+    positiveControl.reason = !status
+      ? 'positive control changed no tracked file'
+      : 'positive control created an untracked file'
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  const patch = execFileSync('git', ['diff', '--binary', baseline, '--'], {
+    cwd: surface.workingRoot, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  if (!patch.length || patch.length > REVIEW_PATCH_MAX) {
+    positiveControl.reason = 'positive control patch is empty or oversized'
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  try { positiveControl.paths = weakPatchPaths(surface, patch) }
+  catch (error) {
+    if (error instanceof WeakMutationSecurityError) throw error
+    positiveControl.reason = error?.message || String(error)
+    return unavailable('unverified-positive-control-invalid', sourceProbe, positiveControl)
+  }
+  positiveControl.patch_bytes = patch.length
+  positiveControl.patch_sha256 = createHash('sha256').update(patch).digest('hex')
+  const controlGate = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
+    task: spec, kind: 'weak-positive-control', deliveryDigest: expectedDigest,
+    collectEvidence: false,
+  })
+  positiveControl.gate = {
+    state: controlGate.state,
+    status: controlGate.status,
+    duration_ms: controlGate.durationMs,
+    timeout_ms: controlGate.timeoutMs,
+    output: controlGate.out,
+  }
+  surface.weakGate = {
+    phase: 'positive-control', state: controlGate.state, gate: f.gate_fast,
+    status: controlGate.status, output: controlGate.out,
+  }
+  if (controlGate.state !== 'red') {
+    return unavailable(`unverified-positive-control-${controlGate.state}`,
+      sourceProbe, positiveControl)
+  }
+  return { state: 'verified', source_probe: sourceProbe, positive_control: positiveControl }
+}
+
+function runWeakReplaySession(items, operations) {
+  if (!Array.isArray(items)) throw new TypeError('weak replay items must be an array')
+  const required = [
+    'createSurface', 'prepareSurface', 'restoreSurface',
+    'runBaseline', 'runMutation', 'finishSurface',
+  ]
+  for (const name of required) {
+    if (typeof operations?.[name] !== 'function') {
+      throw new TypeError(`weak replay operation ${name} must be a function`)
+    }
+  }
+
+  const surface = operations.createSurface()
+  const outcome = { state: 'error', baseline: null, mutations: [], restores: 0 }
+  let baseline = null
+  try {
+    baseline = operations.prepareSurface(surface)
+    outcome.baseline = operations.runBaseline(surface, baseline)
+    if (outcome.baseline?.state !== 'green') {
+      outcome.state = 'baseline-unavailable'
+      return outcome
+    }
+    if (typeof operations.runControls === 'function') {
+      outcome.controls = operations.runControls(surface, baseline)
+      if (outcome.controls?.state !== 'verified') {
+        outcome.state = 'controls-unavailable'
+        return outcome
+      }
+      operations.restoreSurface(surface, baseline, 'controls')
+      outcome.restores += 1
+    }
+    for (const [index, item] of items.entries()) {
+      operations.restoreSurface(surface, baseline, index)
+      outcome.restores += 1
+      outcome.mutations.push(operations.runMutation(item, surface, baseline, index))
+    }
+    operations.restoreSurface(surface, baseline, items.length)
+    outcome.restores += 1
+    outcome.state = 'complete'
+    return outcome
+  } catch (error) {
+    outcome.error = error
+    throw error
+  } finally {
+    operations.finishSurface(surface, outcome)
+  }
+}
+
+function restoreWeakReplaySurface(surface, baseline) {
+  surfaceGit(surface.workingRoot, 'reset', '--hard', baseline)
+  surfaceGit(surface.workingRoot, 'clean', '-fd')
+  const head = surfaceGit(surface.workingRoot, 'rev-parse', 'HEAD').trim()
+  const status = surfaceGit(
+    surface.workingRoot, 'status', '--porcelain=v1', '--untracked-files=all').trim()
+  if (head !== baseline || status) {
+    throw new WeakMutationInvariantError(
+      `weak replay surface did not restore its baseline${status ? `: ${status}` : ''}`)
+  }
+}
+
+// What a weak gate already answered in this invocation, keyed by everything its answer depends on:
+// the gate command and limit, the task it runs as, the exact delivery digest and, for a mutation,
+// the patch bytes. Measured on one iOS install (one gate_fast ≈ 13 min there): a primary review pass and
+// its blind challenger replayed the same five captures against the same digest, each after its own
+// unmutated gate, and a round spent 3 baselines where one answered — about 65 min of gate time
+// that told nobody anything new. Only a green baseline and a mutation verdict (caught or
+// survived) are kept; a red, timed-out or refused run is asked again, because that is exactly
+// the run a retry might settle.
+const weakGateAnswers = new Map()
+const weakGateKey = (f, spec, digest, patchSha256 = null) => stableJson({
+  gate: f.gate_fast, timeout_ms: f.gate_fast_timeout_ms ?? null, spec: spec || null,
+  delivery_digest: digest, patch_sha256: patchSha256,
+})
+
+function replayWeakMutation(item, f, spec, expectedDigest, surface) {
   const patch = item?.mutation?.patch
   if (typeof patch !== 'string' || !patch.length) throw new Error('weak mutation patch is missing')
   const bytes = Buffer.byteLength(patch)
@@ -3887,78 +9050,102 @@ function replayWeakMutation(item, f, spec, expectedDigest) {
     throw new WeakMutationInvariantError(
       'delivery tree changed after its green gate; refusing weak replay')
   }
-  const surface = createReviewSurface(f)
-  let succeeded = false
-  try {
-    const paths = weakPatchPaths(surface, patch)
-    execFileSync('git', ['apply', '--check', '--binary', '-'], {
-      cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
-    })
-    execFileSync('git', ['apply', '--binary', '-'], {
-      cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
-    })
-    const result = gate(f.gate_fast, spec, surface.workingRoot)
-    const event = {
-      state: result.status === 75 ? 'unverified-refused'
-        : result.ok ? 'confirmed-weak' : 'mutation-caught',
-      patch_sha256: createHash('sha256').update(patch).digest('hex'),
-      patch_bytes: bytes,
-      paths,
-      gate: f.gate_fast,
-      gate_status: result.status ?? (result.ok ? 0 : null),
-      gate_output: result.out.slice(-8000),
-    }
+  const paths = weakPatchPaths(surface, patch)
+  const expectedPath = weakExpectedPath(item, surface)
+  const patchEvidence = {
+    patch,
+    patch_sha256: createHash('sha256').update(patch).digest('hex'),
+    patch_bytes: bytes,
+    paths,
+    expected_path: expectedPath,
+    expected_path_matched: expectedPath ? paths.includes(expectedPath) : null,
+  }
+  if (expectedPath && !paths.includes(expectedPath)) {
+    const error = new Error(
+      `weak mutation changes ${paths.join(', ')} but reviewer location names ${expectedPath}`)
+    error.weakPatch = patchEvidence
+    throw error
+  }
+  const key = weakGateKey(f, spec, expectedDigest, patchEvidence.patch_sha256)
+  const known = weakGateAnswers.get(key)
+  if (known) {
+    say(`    ${paths.join(', ')}: same patch on the same delivery already ${known.state}; reused`)
+    const event = { ...known, ...patchEvidence, gate_reused: true }
     surface.weakGate = {
       phase: 'mutation', state: event.state, gate: event.gate,
       status: event.gate_status, output: event.gate_output,
     }
-    if (result.ok) succeeded = true
-    else retainReviewSurface(surface,
-      result.status === 75 ? 'weak-gate-refused' : 'weak-gate-red',
-      result.status === 75
-        ? 'weak mutation gate refused to run (status 75)'
-        : `weak mutation made the gate red (status ${result.status})`)
     return event
-  } catch (error) {
-    retainReviewSurface(surface, 'failure', error?.message || String(error))
-    throw error
-  } finally {
-    if (succeeded) removeReviewSurface(surface)
   }
+  execFileSync('git', ['apply', '--check', '--binary', '-'], {
+    cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  execFileSync('git', ['apply', '--binary', '-'], {
+    cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
+  })
+  const startedAt = Date.now()
+  // The files the mutation changes, so a gate may narrow what it runs to the tests that reach
+  // them. That narrowing is the project's call and its risk: a suite cut too far lets a mutation
+  // survive that the full suite would catch, and the reviewer's weak finding then blocks.
+  const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
+    task: spec, kind: 'weak-mutation', deliveryDigest: expectedDigest, collectEvidence: false,
+    mutationPaths: paths,
+  })
+  const event = {
+    state: result.state === 'timeout' ? 'unverified-timeout'
+      : result.state === 'refused' ? 'unverified-refused'
+      : result.ok ? 'confirmed-weak' : 'mutation-caught',
+    ...patchEvidence,
+    gate: f.gate_fast,
+    gate_status: result.status ?? (result.ok ? 0 : null),
+    gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
+    gate_timeout_ms: result.timeoutMs,
+    gate_output: result.out.slice(-8000),
+  }
+  surface.weakGate = {
+    phase: 'mutation', state: event.state, gate: event.gate,
+    status: event.gate_status, output: event.gate_output,
+  }
+  if (['confirmed-weak', 'mutation-caught'].includes(event.state)) {
+    const { patch: _patch, ...answer } = event
+    weakGateAnswers.set(key, answer)
+  }
+  return event
 }
 
-function weakBaselineGate(f, spec, expectedDigest) {
+function weakBaselineGate(f, spec, expectedDigest, surface) {
   if (deliveryDigest() !== expectedDigest) {
     throw new WeakMutationInvariantError(
       'delivery tree changed after its green gate; refusing weak baseline')
   }
-  const surface = createReviewSurface(f)
-  let remove = false
-  try {
-    const result = gate(f.gate_fast, spec, surface.workingRoot)
-    const observation = {
-      gate: f.gate_fast,
-      gate_status: result.status ?? (result.ok ? 0 : null),
-      gate_output: result.out.slice(-8000),
-    }
+  const key = weakGateKey(f, spec, expectedDigest)
+  const known = weakGateAnswers.get(key)
+  if (known) {
+    say('    unmutated gate on this delivery was already green in this run; reused')
     surface.weakGate = {
-      phase: 'baseline',
-      state: result.status === 75 ? 'refused' : result.ok ? 'green' : 'red',
-      gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
+      phase: 'baseline', state: known.state,
+      gate: known.gate, status: known.gate_status, output: known.gate_output,
     }
-    if (result.ok) remove = true
-    else retainReviewSurface(surface,
-      result.status === 75 ? 'weak-baseline-refused' : 'weak-baseline-red',
-      result.status === 75
-        ? 'unmutated weak-verification gate refused to run (status 75)'
-        : `unmutated weak-verification gate was red (status ${result.status})`)
-    return { ...observation, state: surface.weakGate.state }
-  } catch (error) {
-    retainReviewSurface(surface, 'failure', error?.message || String(error))
-    throw error
-  } finally {
-    if (remove) removeReviewSurface(surface)
+    return { ...known, gate_reused: true }
   }
+  const startedAt = Date.now()
+  const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
+    task: spec, kind: 'weak-baseline', deliveryDigest: expectedDigest, collectEvidence: false,
+  })
+  const observation = {
+    gate: f.gate_fast,
+    gate_status: result.status ?? (result.ok ? 0 : null),
+    gate_duration_ms: result.durationMs ?? (Date.now() - startedAt),
+    gate_timeout_ms: result.timeoutMs,
+    gate_output: result.out.slice(-8000),
+  }
+  surface.weakGate = {
+    phase: 'baseline',
+    state: result.state,
+    gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
+  }
+  if (result.state === 'green') weakGateAnswers.set(key, { ...observation, state: 'green' })
+  return { ...observation, state: surface.weakGate.state }
 }
 
 function verifyWeakMutations(items, f, spec, expectedDigest) {
@@ -3971,53 +9158,516 @@ function verifyWeakMutations(items, f, spec, expectedDigest) {
   const events = []
   const noted = []
   if (!(items || []).length) return { accepted, events, noted, verification: null }
-  const baseline = weakBaselineGate(f, spec, expectedDigest)
+  say(`  weak verification: one reusable replay surface, ${(items || []).length}` +
+    ` independent mutation gate(s)`)
+  const session = runWeakReplaySession(items, {
+    createSurface: () => createReviewSurface(f),
+    prepareSurface: (surface) => prepareWeakCapture(surface),
+    restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
+    runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
+    ...(f.weak_source_probe_cmd ? {
+      runControls: (surface, baseline) =>
+        weakVerificationControls(f, spec, expectedDigest, surface, baseline),
+    } : {}),
+    runMutation: (item, surface) => {
+      try {
+        return { event: replayWeakMutation(item, f, spec, expectedDigest, surface) }
+      } catch (error) {
+        if (error instanceof WeakMutationSecurityError ||
+            error instanceof WeakMutationInvariantError) throw error
+        const detail = (error?.stderr?.toString() || error?.message || String(error))
+          .trim().split('\n').filter(Boolean).pop() || 'replay unavailable'
+        return { error: detail, ...(error?.weakPatch || {}) }
+      }
+    },
+    finishSurface: (surface, outcome) => {
+      if (outcome.state === 'baseline-unavailable') {
+        const baseline = outcome.baseline || {}
+        const baselineReason = baseline.state === 'refused'
+          ? ['weak-baseline-refused', 'unmutated weak-verification gate refused to run (status 75)']
+          : baseline.state === 'timeout'
+            ? ['weak-baseline-timeout', 'unmutated weak-verification gate timed out']
+            : ['weak-baseline-red',
+                `unmutated weak-verification gate was red (status ${baseline.gate_status})`]
+        retainReviewSurface(surface,
+          baselineReason[0], baselineReason[1])
+      } else if (outcome.state === 'controls-unavailable') {
+        retainReviewSurface(surface, 'weak-controls-unavailable',
+          outcome.controls?.state || 'weak verification controls did not complete')
+      } else if (outcome.state === 'error') {
+        retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
+      } else {
+        const refused = outcome.mutations.find((result) =>
+          result?.event?.state === 'unverified-refused')
+        const timedOut = outcome.mutations.find((result) =>
+          result?.event?.state === 'unverified-timeout')
+        const caught = outcome.mutations.find((result) =>
+          result?.event?.state === 'mutation-caught')
+        const failed = outcome.mutations.find((result) => result?.error)
+        if (refused) {
+          retainReviewSurface(surface, 'weak-gate-refused',
+            'weak mutation gate refused to run (status 75)')
+        } else if (timedOut) {
+          retainReviewSurface(surface, 'weak-gate-timeout',
+            'weak mutation gate timed out')
+        } else if (caught) {
+          retainReviewSurface(surface, 'weak-gate-red',
+            `weak mutation made the gate red (status ${caught.event.gate_status})`)
+        } else if (failed) {
+          retainReviewSurface(surface, 'weak-replay-partial', failed.error)
+        } else {
+          removeReviewSurface(surface)
+        }
+      }
+    },
+  })
+  const baseline = session.baseline
   const verification = {
     state: baseline.state === 'green' ? 'baseline-green'
-      : baseline.state === 'refused' ? 'unverified-baseline-refused' : 'unverified-baseline-red',
+      : baseline.state === 'refused' ? 'unverified-baseline-refused'
+      : baseline.state === 'timeout' ? 'unverified-baseline-timeout'
+      : 'unverified-baseline-red',
     baseline,
+    controls: session.controls || null,
     mutations: [],
+    failures: [],
+    replay_surface: {
+      strategy: 'single-reusable-surface',
+      surfaces_created: 1,
+      restores: session.restores,
+    },
   }
   if (baseline.state !== 'green') {
-    say(`  weak verification ${baseline.state === 'refused' ? 'DID NOT RUN' : 'unavailable'}:` +
+    say(`  weak verification ${['refused', 'timeout'].includes(baseline.state)
+      ? 'DID NOT COMPLETE' : 'unavailable'}:` +
       ` unmutated surface gate status ${baseline.gate_status};` +
-      ` carrying ${(items || []).length} finding(s) unverified`)
+      ` recording ${(items || []).length} finding(s) as non-blocking unavailable evidence`)
     for (const item of items || []) {
-      accepted.push(item)
-      events.push({
-        state: 'unverified',
-        reason: baseline.state === 'refused' ? 'baseline-refused' : 'baseline-red',
-        gate: baseline.gate,
-        gate_status: baseline.gate_status,
-        gate_output: baseline.gate_output,
-      })
+      noted.push(weakUnavailable(item,
+        baseline.state === 'refused' ? 'unmutated baseline gate refused to run'
+          : baseline.state === 'timeout' ? 'unmutated baseline gate timed out'
+            : `unmutated baseline gate was red (status ${baseline.gate_status})`))
     }
     return { accepted, events, noted, verification }
   }
-  for (const item of items || []) {
-    try {
-      const event = replayWeakMutation(item, f, spec, expectedDigest)
+  if (session.state === 'controls-unavailable') {
+    verification.state = session.controls?.state || 'unverified-controls'
+    const reason = verification.state.replace(/^unverified-/, '').replaceAll('-', ' ')
+    say(`  weak verification DID NOT COMPLETE: ${reason};` +
+      ` recording ${(items || []).length} finding(s) as non-blocking unavailable evidence`)
+    for (const item of items || []) noted.push(weakUnavailable(item, reason))
+    return { accepted, events, noted, verification }
+  }
+  if (session.controls?.state === 'verified') verification.state = 'controlled-green'
+  for (const [index, item] of (items || []).entries()) {
+    const result = session.mutations[index]
+    if (result?.event) {
+      const event = result.event
       verification.mutations.push(event)
       if (event.state === 'confirmed-weak') {
         events.push(event)
         accepted.push(item)
       } else if (event.state === 'unverified-refused') {
         verification.state = 'unverified-mutation-refused'
-        events.push({ ...event, state: 'unverified', reason: 'mutation-gate-refused' })
-        accepted.push(item)
+        noted.push(weakUnavailable(item, 'mutation gate refused to run'))
+      } else if (event.state === 'unverified-timeout') {
+        verification.state = 'unverified-mutation-timeout'
+        noted.push(weakUnavailable(item, 'mutation gate timed out'))
       } else {
-        noted.push(weakDowngrade(item,
-          `weak mutation made the gate red (status ${event.gate_status}); finding refused`))
+        noted.push(weakRefuted(item,
+          `weak mutation made the gate red (status ${event.gate_status})`))
       }
-    } catch (error) {
-      if (error instanceof WeakMutationSecurityError ||
-          error instanceof WeakMutationInvariantError) throw error
-      const detail = (error?.stderr?.toString() || error?.message || String(error))
-        .trim().split('\n').filter(Boolean).pop() || 'replay unavailable'
-      noted.push(weakDowngrade(item, detail))
+    } else {
+      const reason = result?.error || 'replay unavailable'
+      verification.state = 'unverified-mutation-replay'
+      verification.failures.push({
+        index,
+        state: 'unavailable',
+        where: item.where,
+        reason,
+        ...(result?.patch === undefined ? {} : {
+          patch: result.patch,
+          patch_sha256: result.patch_sha256,
+          patch_bytes: result.patch_bytes,
+          paths: result.paths,
+          expected_path: result.expected_path,
+          expected_path_matched: result.expected_path_matched,
+        }),
+      })
+      noted.push(weakUnavailable(item, reason))
     }
   }
   return { accepted, events, noted, verification }
+}
+
+// The executor's own mutations, measured by the engine before any reviewer is paid.
+//
+// The executor is told to run the gate itself and cannot, on every install whose gate needs a
+// toolchain cache outside the delivery tree. Measured on one iOS install, 51 tasks: every
+// executor note says the gate "could not reach a verdict", and every test the executor wrote came
+// with red-making mutations it could only call "unmeasured". The reviewer then found the one that
+// survived and a whole round went on it — one task went six rounds, each closing on exactly that.
+// Widening the boundary does not help there: SwiftPM compiles package manifests under its own
+// seatbelt, and macOS refuses a sandbox inside the executor's (`sandbox_apply: Operation not
+// permitted`), whatever paths are writable.
+//
+// So the engine runs them, on the same reusable replay surface the reviewer's weak findings use,
+// with the same patch-path checks. What differs is what a bad mutation costs: the executor's
+// delivery is not its words, so a mutation that cannot be applied is `unavailable` with its
+// reason, never a refusal of the delivery.
+function executorMutationProblem(mutation, seen) {
+  if (!/^[a-z][a-z0-9.-]{0,63}$/.test(mutation.id || '')) return 'id must match [a-z][a-z0-9.-]{0,63}'
+  if (seen.has(mutation.id)) return `duplicate id ${mutation.id}`
+  if (!mutation.find) return '`find` is empty'
+  if (mutation.find === mutation.replace) return '`replace` equals `find`, so nothing is mutated'
+  return null
+}
+
+function applyExecutorMutation(mutation, surface) {
+  const path = weakExpectedPath({ where: mutation.path }, surface)
+  if (!path) throw new Error(`${mutation.path} is not a regular file in the delivery`)
+  const target = join(surface.workingRoot, path)
+  const text = readFileSync(target, 'utf8')
+  const count = text.split(mutation.find).length - 1
+  if (count !== 1) throw new Error(`\`find\` occurs ${count} times in ${path}; it must occur exactly once`)
+  writeFileSync(target, text.replace(mutation.find, () => mutation.replace))
+  return path
+}
+
+// The open `weak` findings whose captured mutation the engine can replay. A finding carries the
+// reviewer's exact patch from the round it was verified in, so whether a later delivery closes
+// it is, first of all, whether that patch now turns the gate red.
+// The patch itself is moved out of the event into the run record when the round is recorded, so
+// it is read back from there and trusted only if it still hashes to what the event says. An event
+// recorded before `patch_run` existed names only the file, so every run is searched for it.
+function reviewFindingPatch(item) {
+  const event = item?.mutation_event
+  if (typeof event?.patch === 'string' && event.patch.length) return event.patch
+  if (typeof event?.patch_file !== 'string' || !/^[0-9a-f]{64}$/.test(event.patch_sha256 || '')) {
+    return null
+  }
+  const safe = (name) => typeof name === 'string' && name.length > 0 && !name.includes('/') &&
+    !name.includes('\\') && name !== '.' && name !== '..'
+  if (!safe(event.patch_file)) return null
+  let runs = []
+  if (safe(event.patch_run)) runs = [event.patch_run]
+  else {
+    try { runs = readdirSync(LOG_DIR).filter((name) => name.startsWith('run-')).sort().reverse() }
+    catch { return null }
+  }
+  for (const run of runs) {
+    try {
+      const bytes = readFileSync(join(LOG_DIR, run, event.patch_file))
+      if (createHash('sha256').update(bytes).digest('hex') === event.patch_sha256) {
+        return bytes.toString('utf8')
+      }
+    } catch { /* not in this run */ }
+  }
+  return null
+}
+
+const replayableReviewFindings = (history) => openItems(history)
+  .filter((item) => item.slot === 'weak')
+  .map((item) => ({ item, patch: reviewFindingPatch(item) }))
+  .filter(({ patch }) => patch)
+  .map(({ item, patch }) => ({ ...item, replay_patch: patch }))
+
+// Measured on one iOS install: 71% of reviewer findings were test gaps, and in tasks 009 and 010 the
+// executor answered a `weak` finding without ever running the reviewer's mutation — its own
+// mutations moved a static helper while the reviewer's broke the screen, so "all caught" was
+// true and closed nothing. The reviewer's patch is replayed here with the executor's, on the
+// same surface after the same unmutated gate, so it costs one gate per open finding and no
+// extra baseline. A patch the new delivery no longer applies to is `unavailable`: the finding
+// goes to the reviewer as before, and nothing is passed off as proof.
+function measureExecutorMutations(mutations, f, spec, expectedDigest, reviewFindings = []) {
+  const results = []
+  const runnable = []
+  const seen = new Set()
+  for (const mutation of mutations || []) {
+    const row = {
+      id: mutation.id, source: 'executor', criterion_ids: mutation.criterion_ids,
+      path: mutation.path, breaks: mutation.breaks,
+    }
+    const problem = executorMutationProblem(mutation, seen)
+      || (runnable.length >= EXECUTOR_MUTATIONS_MAX
+        ? `beyond the ${EXECUTOR_MUTATIONS_MAX}-mutation limit` : null)
+    seen.add(mutation.id)
+    results.push(problem ? { ...row, state: 'unavailable', reason: problem } : row)
+    if (!problem) runnable.push({ mutation, row: results.at(-1) })
+  }
+  for (const finding of reviewFindings) {
+    const row = {
+      id: finding.id, source: 'reviewer', criterion_ids: finding.criterion_ids,
+      path: finding.where, breaks: finding.fix,
+    }
+    results.push(row)
+    runnable.push({ finding, row })
+  }
+  const measurement = { delivery_digest: expectedDigest, state: 'complete', baseline: null, results }
+  if (!runnable.length) return measurement
+  say(`  mutations: one replay surface, ${runnable.length} mutation gate(s)` +
+    (reviewFindings.length ? `, ${reviewFindings.length} of them the reviewer's` : ''))
+  const session = runWeakReplaySession(runnable, {
+    createSurface: () => createReviewSurface(f),
+    prepareSurface: (surface) => prepareWeakCapture(surface),
+    restoreSurface: (surface, baseline) => restoreWeakReplaySurface(surface, baseline),
+    runBaseline: (surface) => weakBaselineGate(f, spec, expectedDigest, surface),
+    runMutation: ({ mutation, finding }, surface, baseline) => {
+      try {
+        if (finding) {
+          return { event: replayWeakMutation({ where: finding.where,
+            mutation: { patch: finding.replay_patch } }, f, spec, expectedDigest, surface) }
+        }
+        const path = applyExecutorMutation(mutation, surface)
+        const patch = execFileSync('git', ['diff', '--binary', baseline, '--'], {
+          cwd: surface.workingRoot, maxBuffer: REVIEW_PATCH_MAX,
+        }).toString('utf8')
+        restoreWeakReplaySurface(surface, baseline)
+        return { event: replayWeakMutation({ where: path, mutation: { patch } }, f, spec,
+          expectedDigest, surface) }
+      } catch (error) {
+        if (error instanceof WeakMutationInvariantError) throw error
+        const detail = (error?.stderr?.toString() || error?.message || String(error))
+          .trim().split('\n').filter(Boolean).pop() || 'mutation unavailable'
+        return { error: detail }
+      }
+    },
+    finishSurface: (surface, outcome) => {
+      if (outcome.state === 'error') {
+        retainReviewSurface(surface, 'failure', outcome.error?.message || String(outcome.error || ''))
+      } else removeReviewSurface(surface)
+    },
+  })
+  measurement.baseline = {
+    state: session.baseline.state, gate_status: session.baseline.gate_status,
+    gate_output: session.baseline.gate_output,
+  }
+  if (session.baseline.state !== 'green') {
+    measurement.state = 'baseline-unavailable'
+    for (const { row } of runnable) {
+      Object.assign(row, { state: 'unavailable',
+        reason: `the unmutated copy's gate was ${session.baseline.state} ` +
+          `(status ${session.baseline.gate_status})` })
+    }
+    return measurement
+  }
+  for (const [index, { row }] of runnable.entries()) {
+    const result = session.mutations[index]
+    const event = result?.event
+    if (!event) {
+      Object.assign(row, { state: 'unavailable', reason: result?.error || 'mutation unavailable' })
+      continue
+    }
+    Object.assign(row, {
+      state: event.state === 'mutation-caught' ? 'caught'
+        : event.state === 'confirmed-weak' ? 'survived' : 'unavailable',
+      ...(event.state === 'unverified-timeout' ? { reason: 'the mutated gate timed out' } : {}),
+      ...(event.state === 'unverified-refused' ? { reason: 'the mutated gate refused to run' } : {}),
+      patch_sha256: event.patch_sha256,
+      gate_status: event.gate_status,
+      gate_output: event.gate_output,
+    })
+  }
+  return measurement
+}
+
+const renderMutationRow = (row) => `${row.id} (${row.path}) — ${row.state}` +
+  (row.reason ? `: ${row.reason}` : row.state === 'survived'
+    ? ': the gate stayed green with it applied' : row.state === 'caught'
+      ? `: the gate went red (status ${row.gate_status})` : '') +
+  (row.breaks ? row.source === 'reviewer' ? `. The finding: ${row.breaks}`
+    : `. It was meant to break: ${row.breaks}` : '')
+const executorMutationRows = (rows) => rows.filter((row) => row.source !== 'reviewer')
+const reviewMutationRows = (rows) => rows.filter((row) => row.source === 'reviewer')
+
+// The gate probe: the same fact, inside the executor's own turn.
+//
+// The measurement above reaches the executor one delivery later. The probe lets it ask while it
+// is still working: the engine starts a broker process beside the executor call, outside the
+// executor's boundary, and hands the executor a command that files a request into its scratch
+// directory and waits. The broker copies the delivery tree as it stands onto a disposable
+// surface, optionally applies one mutation, and runs the profile's fast gate there.
+//
+// What the executor controls is the tree and at most one mutation, never the command: the gate
+// is the profile's. That code already runs outside the boundary once the executor returns — the
+// deciding gate runs it — so the probe gives the executor no new kind of reach, only an earlier
+// look. It is bounded per call, and it certifies nothing; only the orchestrator's gate does.
+const GATE_PROBE_REQUESTS_MAX = 6
+const GATE_PROBE_REQUEST_ID = /^[a-z0-9-]{1,64}$/
+const GATE_PROBE_POLL_MS = 200
+
+const GATE_PROBE_CLIENT = `import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+const dir = process.argv[2]
+const args = process.argv.slice(3)
+let mutation = null
+if (args[0] === '--mutation') {
+  const source = args[1] === '-' || !args[1] ? readFileSync(0, 'utf8') : readFileSync(args[1], 'utf8')
+  mutation = JSON.parse(source)
+} else if (args.length) {
+  process.stderr.write('usage: caw-gate [--mutation <file>|-]\\n')
+  process.exit(64)
+}
+const id = randomBytes(8).toString('hex')
+const request = join(dir, 'requests', id + '.json')
+writeFileSync(request + '.tmp', JSON.stringify({ id, mutation }))
+renameSync(request + '.tmp', request)
+const response = join(dir, 'responses', id + '.json')
+const deadline = Date.now() + Number(process.env.CAW_GATE_PROBE_WAIT_MS || 3600000)
+const pause = new Int32Array(new SharedArrayBuffer(4))
+const brokerAlive = () => {
+  let pid
+  try { pid = Number(readFileSync(join(dir, 'broker.pid'), 'utf8')) } catch { return true }
+  try { process.kill(pid, 0); return true } catch (error) { return error.code !== 'ESRCH' }
+}
+while (!existsSync(response)) {
+  if (Date.now() > deadline || !brokerAlive()) {
+    if (existsSync(response)) break
+    process.stderr.write('caw-gate: no answer from the engine; its gate broker is not running\\n')
+    process.exit(2)
+  }
+  Atomics.wait(pause, 0, 0, 250)
+}
+const answer = JSON.parse(readFileSync(response, 'utf8'))
+if (answer.output) process.stdout.write(answer.output.endsWith('\\n') ? answer.output : answer.output + '\\n')
+process.stdout.write('caw-gate: ' + answer.state + (answer.status === null || answer.status === undefined
+  ? '' : ' (status ' + answer.status + ')') + (answer.reason ? ': ' + answer.reason : '') + '\\n')
+process.exit(answer.state === 'green' ? 0 : answer.state === 'red' ? 1 : 2)
+`
+
+function startGateProbe(f, spec, scratchRoot) {
+  if (!f.gate_fast) return null
+  const dir = scratchRoot
+    ? join(scratchRoot, 'caw-gate-probe')
+    : mkdtempSync(join(tmpdir(), 'caw-gate-probe-'))
+  mkdirSync(join(dir, 'requests'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'responses'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(dir, 'client.mjs'), GATE_PROBE_CLIENT, { mode: 0o600 })
+  const command = join(dir, 'caw-gate')
+  writeFileSync(command, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ` +
+    `${JSON.stringify(join(dir, 'client.mjs'))} ${JSON.stringify(dir)} "$@"\n`, { mode: 0o700 })
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '__gate-broker', dir], {
+    // Its own process group, so stopping it also stops a gate it is still running. The executor
+    // can return while a probe is in flight, and an orphaned build writing into a shared
+    // derived-data directory would race the deciding gate that runs next.
+    cwd: process.cwd(), stdio: 'ignore', detached: process.platform !== 'win32',
+    env: { ...process.env, CAW_GATE_BROKER_SPEC: spec || '', CAW_GATE_BROKER_PARENT: String(process.pid) },
+  })
+  child.on('error', () => {})
+  return { dir, command, child, owned: !scratchRoot }
+}
+
+function stopGateProbe(probe) {
+  if (!probe) return null
+  try {
+    if (process.platform !== 'win32' && probe.child.pid) process.kill(-probe.child.pid, 'SIGTERM')
+    else probe.child.kill('SIGTERM')
+  } catch { /* already gone */ }
+  let answers = []
+  try {
+    answers = readdirSync(join(probe.dir, 'responses')).filter((name) => name.endsWith('.json'))
+      .map((name) => { try { return JSON.parse(readFileSync(join(probe.dir, 'responses', name), 'utf8')) } catch { return null } })
+      .filter(Boolean)
+  } catch { /* nothing was asked */ }
+  if (probe.owned) { try { removeTree(probe.dir) } catch { /* next prune */ } }
+  return answers
+}
+
+const gateProbeInstructions = (probe, f) => [
+  '\n\nGate probe. Your write boundary may keep the gate from running where you are. The command',
+  ` ${JSON.stringify(probe.command)} (also in $CAW_GATE_PROBE) runs the profile's fast gate`,
+  ` \`${f.gate_fast}\` on a disposable copy of your tree as it stands, outside that boundary, and`,
+  ' prints its output and `caw-gate: green|red` (exit 0 when green). With `--mutation -` it first',
+  ' applies one mutation of the shipped code read from stdin as JSON {"path","find","replace"}',
+  ' (`find` exactly once in `path`) — use it to watch your test go red. Each run takes as long',
+  ' as the gate, so give that shell call a long timeout',
+  f.gate_fast_timeout_ms ? ` (the gate's limit is ${f.gate_fast_timeout_ms} ms)` : '',
+  `. At most ${GATE_PROBE_REQUESTS_MAX} runs in this call. It is a fact for you, not the verdict:`,
+  ' the orchestrator still runs the deciding gate after you return.',
+].join('')
+
+// The broker side: a separate `caw.mjs` process, because the engine is blocked in `spawnSync` for
+// the whole executor call and cannot answer anything itself.
+function runGateBroker(dir) {
+  const { f } = profile(false)
+  const spec = process.env.CAW_GATE_BROKER_SPEC || null
+  const parent = Number(process.env.CAW_GATE_BROKER_PARENT || 0)
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  const seen = new Set()
+  let served = 0
+  writeFileSync(join(dir, 'broker.pid'), String(process.pid))
+  const answer = (id, body) => {
+    const target = join(dir, 'responses', `${id}.json`)
+    writeFileSync(`${target}.tmp`, JSON.stringify({ id, ...body }))
+    renameSync(`${target}.tmp`, target)
+  }
+  for (;;) {
+    if (parent) { try { process.kill(parent, 0) } catch { return } }
+    let names = []
+    try { names = readdirSync(join(dir, 'requests')).filter((name) => name.endsWith('.json')).sort() }
+    catch { return }
+    for (const name of names) {
+      const id = name.slice(0, -'.json'.length)
+      if (seen.has(id)) continue
+      seen.add(id)
+      if (!GATE_PROBE_REQUEST_ID.test(id)) continue
+      const path = join(dir, 'requests', name)
+      let request
+      try {
+        if (!lstatSync(path).isFile()) continue
+        request = JSON.parse(readFileSync(path, 'utf8'))
+      } catch (error) {
+        answer(id, { state: 'unavailable', status: null, reason: `unreadable request: ${error?.message || error}` })
+        continue
+      }
+      if (served >= GATE_PROBE_REQUESTS_MAX) {
+        answer(id, { state: 'refused', status: null,
+          reason: `this call's ${GATE_PROBE_REQUESTS_MAX} gate probes are spent` })
+        continue
+      }
+      served += 1
+      const mutation = request?.mutation || null
+      let surface = null
+      try {
+        if (mutation && (typeof mutation.path !== 'string' || typeof mutation.find !== 'string' ||
+            typeof mutation.replace !== 'string' || !mutation.find || mutation.find === mutation.replace)) {
+          throw new Error('a mutation needs string path, a non-empty find, and a different replace')
+        }
+        surface = createReviewSurface(f)
+        if (mutation) applyExecutorMutation(mutation, surface)
+        const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
+          task: spec, kind: 'executor-probe', collectEvidence: false,
+        })
+        answer(id, {
+          state: result.state, status: result.status ?? null, duration_ms: result.durationMs,
+          mutated: Boolean(mutation), output: boundedUtf8HeadTail(result.out, 12 * 1024).text,
+        })
+      } catch (error) {
+        answer(id, { state: 'unavailable', status: null, mutated: Boolean(mutation),
+          reason: (error?.message || String(error)).split('\n')[0] })
+      } finally {
+        if (surface) { try { removeReviewSurface(surface) } catch { /* pruned later */ } }
+      }
+    }
+    Atomics.wait(pause, 0, 0, GATE_PROBE_POLL_MS)
+  }
+}
+
+function recordExecutorMutations(file, round, measurement) {
+  const tail = (text, max) => typeof text === 'string' ? text.slice(-max) : ''
+  const keep = Math.floor(ENGINE_DIAGNOSTIC_MAX / (measurement.results.length + 2) / 2)
+  try {
+    recordEngineDiagnostic('executor', 'mutation-measurement', {
+      task: file, round, delivery_digest: measurement.delivery_digest, state: measurement.state,
+      baseline: measurement.baseline
+        ? { ...measurement.baseline, gate_output: tail(measurement.baseline.gate_output, keep) }
+        : null,
+      results: measurement.results.map((row) => ({
+        ...row, breaks: tail(row.breaks, 256), gate_output: tail(row.gate_output, keep),
+      })),
+    })
+  } catch { /* the measurement still reaches the executor and the reviewer */ }
 }
 
 // Flatten a verdict's blocking slots into the history. `state` is the only mutable field on an
@@ -4034,15 +9684,101 @@ function ingest(history, rv, round, weakEvents = [], originRuntime = null) {
         where: (it.where || '').trim(),
         fix: (it.fix || '').trim(),
         evidence: (it.evidence || '').trim(),
+        evidence_refs: [...(it.evidence_refs || [])],
+        criterion_ids: [...(it.criterion_ids || [])],
+        surface_ids: [...(it.surface_ids || [])],
+        transition_ids: [...(it.transition_ids || [])],
+        property_key: it.property_key || null,
         state: 'open',
         origin_runtime: originRuntime,
+        review_pass: it.review_pass || 1,
+        discovery: it.discovery || 'primary',
+        baseline_digest: it.baseline_digest || null,
       }
+      item.work_package_id = groupFindings([item])[0].id
       if (slot === 'weak') item.mutation_event = weakEvents[weakIndex++]
       history.push(item)
       added.push(item)
     }
   }
   return added
+}
+
+// Reviewer passes are independent samples over one immutable delivery digest. The merge is
+// conservative: one dissent keeps a carried item open and the strongest non-met criterion wins.
+// New findings from challenger passes are retained and explicitly marked as late discoveries
+// against the same baseline; they are never silently presented as facts about a later delivery.
+function mergeReviewPasses(passes, baselineDigest) {
+  if (!Array.isArray(passes) || !passes.length) {
+    throw new TypeError('at least one review pass is required')
+  }
+  const stateRank = { met: 0, weak: 1, uncovered: 2, broken: 3 }
+  const criteriaOrder = passes[0].verdict.criteria.map((row) => row.id)
+  const criteria = criteriaOrder.map((id) => {
+    const rows = passes.map((pass) => pass.verdict.criteria.find((row) => row.id === id))
+    const state = rows.reduce((worst, row) =>
+      stateRank[row.state] > stateRank[worst] ? row.state : worst, 'met')
+    return {
+      id,
+      state,
+      evidence: rows.map((row, index) => `pass ${index + 1}: ${row.evidence}`).join('\n'),
+      evidence_refs: [...new Set(rows.flatMap((row) => row.evidence_refs || []))],
+    }
+  })
+  const carriedIds = passes[0].verdict.carried.map((row) => row.id)
+  const carried = carriedIds.map((id) => {
+    const rows = passes.map((pass) => pass.verdict.carried.find((row) => row.id === id))
+    const states = new Set(rows.map((row) => row.state))
+    return {
+      id,
+      state: states.size === 1 ? rows[0].state : 'open',
+      evidence: rows.map((row, index) => `pass ${index + 1}: ${row.evidence}`).join('\n'),
+      evidence_refs: [...new Set(rows.flatMap((row) => row.evidence_refs || []))],
+    }
+  })
+  const merged = { criteria, carried, broken: [], uncovered: [], weak: [], noted: [] }
+  const weakEvents = []
+  for (const [passIndex, pass] of passes.entries()) {
+    for (const slot of SLOTS) {
+      for (const [itemIndex, source] of (pass.verdict[slot] || []).entries()) {
+        const item = {
+          ...source,
+          review_pass: passIndex + 1,
+          discovery: passIndex === 0 ? 'primary' : 'late-same-baseline',
+          baseline_digest: baselineDigest,
+        }
+        merged[slot].push(item)
+        if (slot === 'weak') weakEvents.push(pass.weakEvents[itemIndex])
+      }
+    }
+    for (const note of pass.verdict.noted || []) {
+      const tagged = passIndex === 0 ? note : `[late on ${baselineDigest.slice(0, 12)}] ${note}`
+      if (!merged.noted.includes(tagged)) merged.noted.push(tagged)
+    }
+  }
+  const weakPasses = passes.map((pass, index) => ({
+    pass: index + 1,
+    state: pass.weakVerification?.state || 'not-requested',
+    verification: pass.weakVerification,
+  }))
+  const limited = weakPasses.find((pass) => pass.state.startsWith('unverified'))
+  const weakVerification = passes.length === 1 ? passes[0].weakVerification : {
+    state: limited?.state || (weakPasses.some((pass) => pass.state === 'controlled-green')
+      ? 'controlled-green' : 'baseline-green'),
+    baseline: passes[0].weakVerification?.baseline || null,
+    controls: passes[0].weakVerification?.controls || null,
+    mutations: weakPasses.flatMap((pass) => pass.verification?.mutations || []),
+    failures: weakPasses.flatMap((pass) => pass.verification?.failures || []),
+    replay_surface: {
+      strategy: 'one-reusable-surface-per-review-pass',
+      passes: weakPasses.length,
+      surfaces_created: weakPasses.length,
+      restores: weakPasses.reduce((sum, pass) =>
+        sum + (pass.verification?.replay_surface?.restores || 0), 0),
+    },
+    passes: weakPasses,
+  }
+  return { verdict: merged, weakEvents, weakVerification }
 }
 
 // The reviewer's judgement on what this task was already holding. An item it does not mention
@@ -4062,6 +9798,7 @@ function adjudicate(history, carried) {
     // it still fails" says more to the next executor than the sentence that raised the item a
     // round ago, which has by now been read and acted on once without success.
     item.checked = (c.evidence || '').trim()
+    item.checked_evidence_refs = [...(c.evidence_refs || [])]
     if (c.state === 'closed') { item.state = 'closed'; closed.push(item) }
     else if (c.state === 'withdrawn') { item.state = 'withdrawn'; withdrawn.push(item) }
   }
@@ -4079,17 +9816,33 @@ function adjudicate(history, carried) {
 
 const openItems = (history) => history.filter((i) => i.state === 'open')
 
+function renderOriginRuntime(originRuntime) {
+  if (!originRuntime) return '\n      origin: legacy/unknown'
+  const origins = Array.isArray(originRuntime) ? originRuntime : [originRuntime]
+  return origins.map((origin, index) => {
+    const pass = origins.length > 1 ? `pass ${origin?.pass || index + 1} ` : ''
+    return `\n      origin: ${pass}${origin?.provider || 'unknown'}/${
+      origin?.requested?.model || '?'} runtime=${origin?.runtime_digest?.slice(0, 12) || '?'}`
+  }).join('')
+}
+
 // What the executor is handed. The evidence travels with the item, and it is not padding: "this
 // assertion can be mutated green" and the mutation that proves it are different instructions,
 // and the executor has no other way to see the tree the way the reviewer saw it.
 const renderItems = (items) => items
   .map((i) => `[${i.id}] ${i.slot} — ${i.where}\n      ${i.fix}\n      evidence: ${i.evidence}` +
-    (i.origin_runtime
-      ? `\n      origin: ${i.origin_runtime.provider}/${i.origin_runtime.requested?.model || '?'} ` +
-        `runtime=${i.origin_runtime.runtime_digest?.slice(0, 12) || '?'}`
-      : '\n      origin: legacy/unknown') +
+    renderOriginRuntime(i.origin_runtime) +
+    (i.discovery === 'late-same-baseline'
+      ? `\n      discovery: challenger pass ${i.review_pass}, late on baseline ${
+          i.baseline_digest?.slice(0, 12) || '?'}`
+      : '') +
     (i.checked ? `\n      still open after the last round: ${i.checked}` : ''))
   .join('\n  - ')
+
+const renderWorkPackages = (items) => groupFindings(items).map((group) =>
+  `[${group.id}] property ${group.property_key || 'legacy-ungrouped'}; members ` +
+    `${group.members.map((item) => item.id).join(', ')}\n      ` +
+    renderItems(group.members).replaceAll('\n', '\n      ')).join('\n  - ')
 
 // The line the whole change exists to make printable. "3 findings, again" and "2 closed, 1 still
 // open, 0 new" are the same round described twice, and they lead a human to opposite answers.
@@ -4127,6 +9880,35 @@ function sayWaysOn(file) {
   say(`  Either commits the task on approval. Run build again for the rest of the queue.`)
 }
 
+function requireTaskReviewIndependence(f, author) {
+  const independence = reviewIndependence(f.task_independence, 'executor', 'reviewer', author)
+  resolvedRuntime.independence = [
+    ...(resolvedRuntime.independence || []).filter((entry) => entry.scope !== 'task'),
+    independence,
+  ]
+  if (!independence.satisfied) {
+    const label = (participant) => `${participant.vendor || 'unknown'}/${participant.model || 'unknown'}`
+    die(`task independence requires ${independence.mode}; recorded author is ` +
+      `${label(independence.author)} and reviewer is ${label(independence.reviewer)}. ` +
+      independence.reason)
+  }
+}
+
+function taskGatePolicy(file, f, g, executorRetries, confirmationRuns, projectGateRetries) {
+  return runProjectPolicy('gate', {
+    task: file,
+    command: f.gate_fast,
+    state: g.state,
+    status: g.status ?? (g.ok ? 0 : null),
+    output: g.out.slice(-8000),
+    duration_ms: g.durationMs,
+    timeout_ms: g.timeoutMs,
+    executor_retries: executorRetries,
+    confirmation_runs: confirmationRuns,
+    project_retry_runs: projectGateRetries,
+  })
+}
+
 // `opts.resume` carries what a previous invocation left — the history, the round count, and the
 // last executor's delivery, so that a commit reached from `review` still has a summary to write.
 // `opts.startAt` is 'gate' only for `review`, where the hands that did the work have already put
@@ -4134,6 +9916,7 @@ function sayWaysOn(file) {
 // inside `build`, and exactly one from `round` and `review`, because a human who authorised one
 // more round authorised one.
 function runTask(file, f, profileText, opts = {}) {
+  setProviderBudgetPhase('delivery', file)
   const { resume = null, startAt = 'executor', rounds = MAX_TASK_ROUNDS, how = null } = opts
 
   // Guarded for the same reason `commit()` now guards its unlink: `.caw-tasks/` is not this
@@ -4143,15 +9926,45 @@ function runTask(file, f, profileText, opts = {}) {
   let spec
   try { spec = readFileSync(join(QUEUE_DIR, file), 'utf8') }
   catch (e) { die(`${file} — cannot read it: ${(e?.message || e).toString().split('\n')[0]}`) }
+  // From here a contract failure has a spec to retain. The queue file is deleted at this
+  // task's commit, so by the time anyone reads the failure it is the only copy left.
+  setActiveTaskContract(file)
+  let executorBudget
+  try { executorBudget = executorBudgetForSpec(f, spec) }
+  catch (error) { die(`${file} — ${error?.message || error}`) }
+  const topology = extractTaskTopology(spec)
+  const coreCriteria = topology.criteria
+  const acceptancePolicy = runProjectPolicy('acceptance', {
+    task: file,
+    criteria: topology.criteria,
+    surfaces: topology.surfaces,
+    transitions: topology.transitions,
+  })
+  const acceptanceCases = acceptancePolicy?.output.cases || []
   say(`\n· ${file}`)
+  if (executorBudget) {
+    const selection = executorBudget.mode === 'adaptive'
+      ? `${executorBudget.class} (requested ${executorBudget.requested}, floor ${executorBudget.floor})`
+      : 'static'
+    say(`  executor budget: ${selection}; ${executorBudget.tool_events || 'unlimited'} tool events, ` +
+        `${executorBudget.event_bytes || 'unlimited'} event bytes — ${executorBudget.reason}`)
+  }
 
   const history = resume?.history || []
   const startRound = resume?.round || 0
   let round = startRound // review rounds: attempts a reviewer actually judged
-  let retry = 0 // gate retries: attempts that never reached a reviewer
+  let retry = 0 // executor retries bought by a confirmed red gate
+  let gateRedAttempts = 0 // all red gate invocations, including confirmation runs
+  let confirmationRuns = 0 // provider-free reruns since the last executor delivery
+  let projectGateRetries = 0 // bounded policy retries for a confirmed project-classified flaky gate
   let ex = resume?.ex || null
-  let gateFact = null // a red gate's output, which is a fact handed over rather than a finding
+  let gateFact = resume?.gate_fact || null // last confirmed red, handed to the next executor
   let weakVerification = resume?.weak_verification || null
+  let mutationFact = null // the engine's measurement of the last executor's own mutations
+  let measureMutations = false // set by an executor delivery that named mutations
+  let mutationRetries = 0 // executor retries bought by a surviving mutation this review round
+  let unchangedReturns = 0 // executor returns of the tree the last reviewer rejected, this round
+  let unchangedFact = null // the open ids such a return could not close, for the next executor
   // The reviewer's non-blocking sightings, kept per task so the commit can carry them. The
   // global `notes` array cannot serve here: it spans every task in the run and is printed once
   // at the end, so a commit built from it would attribute one task's observations to another.
@@ -4183,10 +9996,19 @@ function runTask(file, f, profileText, opts = {}) {
       say(`  RUNTIME DIVERGENCE: carried findings originated under ${resume.runtime_digest.slice(0, 12)}`)
       say(`  and are now judged under ${resolvedRuntime.digest.slice(0, 12)}; origins remain attached.`)
     }
+    const currentPolicies = projectPolicySnapshot()
+    const snapshotDigest = (snapshot) => snapshot?.set_digest || (snapshot
+      ? createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')
+      : null)
+    if (resume.project_policies !== undefined &&
+        snapshotDigest(resume.project_policies) !== snapshotDigest(currentPolicies)) {
+      say(`  PROJECT POLICY DIVERGENCE: saved ${snapshotDigest(resume.project_policies)?.slice(0, 12) || 'none'}`)
+      say(`  and current ${snapshotDigest(currentPolicies)?.slice(0, 12) || 'none'}; the new policy set is recorded.`)
+    }
   }
 
-  // Every pass increments exactly one of the two counters, so this ends after at most
-  // `rounds` + MAX_GATE_RETRIES attempts however the two interleave.
+  // Every delivery gets at most one provider-free confirmation. Only a confirmed red gate
+  // consumes an executor retry; reviewer rounds remain separately bounded.
   // What HEAD was before the executor ran. Only used to tell two silences apart below.
   let headBeforeExecutor = null
   for (;;) {
@@ -4195,34 +10017,91 @@ function runTask(file, f, profileText, opts = {}) {
     } else {
       const open = openItems(history)
       headBeforeExecutor = headCommit()
-      ex = agent('executor', [
-        'Task spec:\n\n' + spec,
-        '\n\nProfile:\n\n' + profileText,
-        gateFact ? '\n\n' + gateFact : '',
+      const dossier = buildTaskDossier({
+        spec, profile: profileText, open, files: changedFiles(), diff: taskDeliveryDiff(),
+        gateEvidence: gateFact, executorClaims: ex?.claims || [], acceptanceCases,
+      })
+      // Persist before spending. A live provider budget, terminal close, or machine failure may
+      // stop the executor after it has edited the tree but before it returns canonical output.
+      // The dirty tree is recoverable on its own; this state preserves the prior confirmed-red
+      // receipt and review history needed to continue it without a fresh reading.
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+      ex = canonicalRepairCall('executor', [
+        dossier.text,
+        '\n\nImplement the task contract. Treat executor claims in the dossier only as prior hints.',
+        '\nReturn a concise summary and notes. Claims are optional navigation metadata in meaning:',
+        ' use an empty claims array unless every referenced id and selector is copied exactly',
+        ' from the dossier. Claim validity never decides whether the delivery passes.',
+        executorBudget?.tool_events
+          ? `\nYou have a hard live ${executorBudget.class || 'static'} budget of ` +
+            `${executorBudget.tool_events} provider tool events.` +
+            ' Finish the smallest contract-complete change and return before it is reached.'
+          : '',
+        executorBudget?.event_bytes
+          ? `\nYour provider event stream is capped at ${executorBudget.event_bytes} bytes.` +
+            ' Keep command output narrow and avoid rereading files already inspected.'
+          : '',
         open.length
-          ? '\n\nYour previous round was reviewed and rejected. Every item below was checked' +
-            ' against the tree by the reviewer, and its `evidence` is how. Close every one:' +
-            '\n\n  - ' + renderItems(open) +
+          ? '\nClose every open finding in the dossier before doing unrelated work.' +
             (open.some((i) => i.round < round)
-              ? '\n\nAn item whose id is older than the last round has been raised, worked on,' +
-                ' and found still open: read what the reviewer actually ran before deciding what' +
-                ' it is asking for, because the obvious reading has already been tried.'
+              ? ' Older ids have survived at least one attempted fix; use their checked evidence.'
               : '')
           : '',
-      ].join(''), SCHEMA.delivery, f, file)
+        mutationFact && executorMutationRows(mutationFact.results).length
+          ? '\n\nThe engine ran the fast gate outside your write boundary on each mutation you' +
+            ' returned last time, one at a time on a disposable copy of your delivery:\n\n  - ' +
+            executorMutationRows(mutationFact.results).map(renderMutationRow).join('\n  - ') +
+            '\n\nA survived mutation means your tests do not catch it. Make each one go red,' +
+            ' then return it again so the engine measures it again. Drop one only if the' +
+            ' behaviour it breaks is not something the contract requires.'
+          : '',
+        mutationFact && reviewMutationRows(mutationFact.results).length
+          ? '\n\nThe engine also replayed the reviewer\'s own mutation for each open weak finding' +
+            ' against your last delivery, the same way:\n\n  - ' +
+            reviewMutationRows(mutationFact.results).map(renderMutationRow).join('\n  - ') +
+            '\n\nA survived one is that finding still open by the reviewer\'s own experiment: the' +
+            ' dossier has its evidence. Make a test go red on exactly that mutation, observed where' +
+            ' the finding names it, not in a helper beside it. The engine replays it again on your' +
+            ' next delivery.'
+          : '',
+        unchangedFact
+          ? '\n\nYou returned the tree the reviewer rejected, byte for byte. That tree cannot close' +
+            ` ${unchangedFact.join(', ')}: the reviewer has already judged it and left them open.` +
+            ' Change the delivery so each is closed, or return `blocked` naming why no change can' +
+            ' close it. Returning the same tree again stops the task for a human.'
+          : '',
+      ].join(''), SCHEMA.delivery, f, file, {
+        dossier: dossier.meta, round: round + 1, executorBudget, gateProbe: true,
+      }, null)
+      mutationFact = null
+      unchangedFact = null
+      measureMutations = (ex.mutations || []).length > 0 ||
+        replayableReviewFindings(history).length > 0
       runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
 
       if (blocked(ex.blocked)) {
         const kept = keepBlocked(file)
-        die(`${file} — executor stopped:\n\n${ex.blocked}\n\n` +
+        const stopRecord = recordExecutorStop(ex, kept)
+        writeStopRecord('executor-blocked', { task: file })
+        die(`${file} — executor stopped:\n\n${JSON.stringify(ex.blocked)}\n\n` +
+            (stopRecord ? `  The full response is retained at ${stopRecord}.\n` : '') +
             (kept.path
               ? `  Its work is in the tree and a copy is at ${kept.path}.\n` +
                 (kept.unverified
                   ? `  THAT COPY DID NOT VERIFY: git apply --check --reverse says "${kept.unverified}".\n` +
                     `  So it may not restore what is in the tree. Copy the tree out by hand as well.\n`
                   : '') +
-                `  NOTHING JUDGED IT — no gate ran on it and no reviewer saw it, so it is a\n` +
-                `  starting point, not a delivery. build refuses a dirty tree, so to run again:\n` +
+                `  NOTHING JUDGED IT — no gate ran on it and no reviewer saw it.\n` +
+                // Before any advice that removes the tree. Measured on one install: a complete,
+                // gate-green delivery arrived here, and following the next lines literally would
+                // have thrown away 117 lines that later passed five review rounds and committed.
+                // What saved it was looking at the tree first, so the command that judges the
+                // tree as it stands is named first.
+                `  Read the tree before anything else. If the work there is complete despite the\n` +
+                `  reason above, judge it as it stands — nothing is cleared:\n` +
+                `    node caw.mjs review ${file} > ${LOG_DIR}/review-$(date +%H%M%S).log 2>&1\n` +
+                `  If the reason is real, build refuses a dirty tree, so to run again:\n` +
                 `    cp ${kept.path} ..            # 'git clean' would take it with the tree\n` +
                 `    <clear the tree, fix the spec>\n` +
                 `    git apply ../${kept.path.split('/').pop()}   # from the repository root\n`
@@ -4240,35 +10119,140 @@ function runTask(file, f, profileText, opts = {}) {
         const line = `${file}: ${n}`
         if (!notes.includes(line)) notes.push(line)
       })
+      // An unchanged tree cannot close what a reviewer left open on it, so judging it again buys
+      // nothing: the fast gate, every weak replay and the review passes would all be paid to
+      // establish that the digest is the one already rejected. Measured on one iOS install twice in a day
+      // (tasks 007 and 010): each such round ended `closed 0, new 0`, and 010 stopped for a human.
+      // The `nothing changed` guard below cannot see it from round 2 on, because the tree still
+      // holds round 1's work. The reviewer's baseline digest is persisted with its runtime, so
+      // this holds across a resumed invocation too.
+      const stillOpen = openItems(history)
+      const rejectedDigest = [...runtimeHistory].reverse()
+        .find((entry) => entry.role === 'reviewer')?.baseline_digest
+      if (stillOpen.length && rejectedDigest && deliveryDigest() === rejectedDigest) {
+        const ids = stillOpen.map((item) => item.id)
+        if (unchangedReturns >= 1) {
+          stop(file, spec, ex, history, round, how, noted, { kind: 'unchanged-twice', text:
+            `${file} — the executor returned the tree the reviewer rejected, unchanged, twice.` +
+              ` Nothing it can deliver unchanged closes ${ids.join(', ')}; no gate or reviewer ran on it.` },
+            taskAccounting(), runtimeHistory, weakVerification)
+        }
+        unchangedReturns += 1
+        unchangedFact = ids
+        say(`  executor returned the tree the reviewer rejected, unchanged — back to the executor;` +
+          ` no gate or reviewer paid`)
+        continue
+      }
       // Before the gate, because the gate is the next thing that can take minutes and the
       // delivery is already real: the files are written and this is the earliest moment at
       // which losing the process would lose something that cost money.
-      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
-        weakVerification)
       gateFact = null
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+      confirmationRuns = 0
+      projectGateRetries = 0
     }
 
-    const g = gate(f.gate_fast, file)
-    if (!g.ok) {
+    const gateDelivery = deliveryDigest()
+    const g = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, {
+      task: file,
+      kind: 'fast',
+      deliveryDigest: gateDelivery,
+      criteria: coreCriteria,
+      acceptanceCases,
+    })
+    if (deliveryDigest() !== gateDelivery) {
+      stop(file, spec, ex, history, round, how, noted, { kind: 'gate-changed-tree', text:
+        `${file} — the fast gate changed the tracked delivery tree; its receipt no longer ` +
+          'describes the current delivery.' },
+        taskAccounting(), runtimeHistory, weakVerification)
+    }
+    const gatePolicy = taskGatePolicy(file, f, g, retry, confirmationRuns, projectGateRetries)
+    if (gatePolicy?.output.action === 'stop') {
+      if (g.out) say(g.out)
+      stop(file, spec, ex, history, round, how, noted, { kind: 'gate-policy', text:
+        `${file} — project gate policy ${gatePolicy.policy.id} stopped the run: ` +
+          gatePolicy.output.reason.trim() },
+        taskAccounting(), runtimeHistory, weakVerification)
+    }
+    const gateUnavailable = !g.ok && ['refused', 'timeout'].includes(g.state) &&
+      f.gate_unavailable_review
+    if (gateUnavailable) {
+      say(g.out)
+      gateFact = g.receipt
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+      say(`  fast gate ${g.state}; running one advisory reviewer pass without certification`)
+    } else if (!g.ok) {
+      if (g.state === 'timeout') {
+        say(g.out)
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-timeout', text:
+             `${file} — the fast gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed.` +
+             ` No gate verdict exists; re-run it or adjust gate_fast_timeout_ms in .caw/CAW.md.` },
+             taskAccounting(), runtimeHistory, weakVerification)
+      }
       // A refusal spends no retry, because no executor round changes why a gate refuses to
       // start. Retrying it would burn the purse and then report "still red after N retries"
       // about a gate that never ran once. Same convention as the full gate above; unlike it,
       // this branch has never fired — the one gate known to exit 75 is a full one.
-      if (g.status === 75) {
+      if (g.state === 'refused') {
         say(g.out)
-        stop(file, spec, ex, history, round, how, noted,
+        if (g.receipt?.manifest?.error) {
+          stop(file, spec, ex, history, round, how, noted, { kind: 'gate-evidence-refused', text:
+               `${file} — the fast gate command finished with state ${g.receipt.command_state}, ` +
+               `but CAW refused its evidence: ${g.receipt.manifest.error}` },
+               taskAccounting(), runtimeHistory, weakVerification)
+        }
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-refused', text:
              `${file} — the fast gate DID NOT RUN: it refused to start, so nothing was tested.` +
-             `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}`,
+             `\n  Clear the refusal first — it is not a defect in the delivery:  ${f.gate_fast}` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
-      if (++retry > MAX_GATE_RETRIES) {
+      gateRedAttempts += 1
+      const action = decideGateFailure({
+        reviewOnly: startAt === 'gate',
+        confirmationRuns,
+        executorRetries: retry,
+        maxExecutorRetries: MAX_GATE_RETRIES,
+      })
+      if (action === GateFailureAction.confirm) {
+        confirmationRuns += 1
+        skipExecutor = true
+        say('  gate red — confirming once without an executor')
+        continue
+      }
+      if (gatePolicy?.output.action === 'retry' &&
+          projectGateRetries < PROJECT_GATE_RETRIES_MAX) {
+        projectGateRetries += 1
+        confirmationRuns += 1
+        skipExecutor = true
+        say(`  project gate policy classified the confirmed failure as flaky — retry ` +
+          `${projectGateRetries}/${PROJECT_GATE_RETRIES_MAX} without an executor`)
+        continue
+      }
+      if (gatePolicy?.output.action === 'retry') {
+        say(`  project flaky retry cap reached (${PROJECT_GATE_RETRIES_MAX})`)
+      }
+      if (action === GateFailureAction.stopReview) {
         say(g.out)
-        stop(file, spec, ex, history, round, how, noted,
-             `${file} — gate still red after ${MAX_GATE_RETRIES} retries. Its output is above.`,
+        stop(file, spec, ex, history, round, how, noted, { kind: 'review-baseline-red', text:
+             `${file} — review baseline stayed red after one provider-free confirmation.` +
+             ` No executor ran; fix or classify the gate failure, then run review again.` },
              taskAccounting(), runtimeHistory, weakVerification)
       }
-      say(`  gate red (retry ${retry}/${MAX_GATE_RETRIES})`)
-      gateFact = `The gate \`${f.gate_fast}\` failed. Its output, last 8000 chars:\n\n${g.out}`
+      if (action === GateFailureAction.stopRetries) {
+        say(g.out)
+        stop(file, spec, ex, history, round, how, noted, { kind: 'gate-red-retries', text:
+             `${file} — gate stayed red after ${MAX_GATE_RETRIES} executor retries.` +
+             ` Its output is above.` },
+             taskAccounting(), runtimeHistory, weakVerification)
+      }
+      retry += 1
+      confirmationRuns = 0
+      say(`  gate reproducibly red (executor retry ${retry}/${MAX_GATE_RETRIES})`)
+      gateFact = g.receipt
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
       continue
     }
 
@@ -4296,20 +10280,156 @@ function runTask(file, f, profileText, opts = {}) {
       die(`${file} — gate is green but nothing changed. Read the spec yourself.`)
     }
 
+    if (measureMutations && !gateUnavailable) {
+      measureMutations = false
+      try { mutationFact = measureExecutorMutations(ex.mutations, f, file, deliveryDigest(),
+        replayableReviewFindings(history)) }
+      catch (error) { die(`${file} — executor mutations: ${error?.message || error}`) }
+      recordExecutorMutations(file, round + 1, mutationFact)
+      for (const row of mutationFact.results) say(`    ${renderMutationRow(row)}`)
+      const survived = mutationFact.results.filter((row) => row.state === 'survived')
+      if (survived.length && mutationRetries < MAX_MUTATION_RETRIES) {
+        mutationRetries += 1
+        say(`  ${survived.length} mutation(s) survived the gate — back to the executor` +
+          ` before review (mutation retry ${mutationRetries}/${MAX_MUTATION_RETRIES})`)
+        continue
+      }
+    }
+
     const open = openItems(history)
     const deliveryBaseline = deliveryDigest()
-    const reviewSurface = createReviewSurface(f)
-    const weakBaseline = prepareWeakCapture(reviewSurface)
-    let rv
-    try {
-      rv = agent('reviewer', [
-        'Task spec:\n\n' + spec,
-        '\n\nProfile:\n\n' + profileText,
-        '\n\nFiles changed, derived from git:\n\n' + files.map((x) => `- ${x}`).join('\n'),
-        `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
-        ' Whether it passes is settled. Judge whether it passes for the right reason.',
+    const measuredMutations = mutationFact?.delivery_digest === deliveryBaseline
+      ? mutationFact.results : []
+    // The measurement is the reviewer's now, and only the reviewer's. Carried to the next
+    // executor it arrived after a rejecting verdict, as "m1 caught, m2 caught, m3 caught" beside
+    // "Close every open finding"; measured on one iOS install twice, the executor read the first as the
+    // answer to the second and returned the tree the reviewer had just rejected.
+    mutationFact = null
+    const reviewPolicy = runProjectPolicy('review', { spec, files, criteria: coreCriteria })
+    const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+      ...item,
+      id: `project:${reviewPolicy.policy.id}:${item.id}`,
+      section: `Project: ${item.section}`,
+    }))
+    const projectReviewInstructions = reviewPolicy?.output.instructions.length
+      ? '\n\nProject review policy instructions:\n\n' +
+        reviewPolicy.output.instructions.map((item) => `- ${item}`).join('\n')
+      : ''
+    if (f.task_independence === 'human-review') {
+      saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+      die(`${file} — automated task review is disabled by task_independence: human-review.\n` +
+        `  The green-gate delivery is preserved. Prepare its signed review with:\n` +
+        `    node caw.mjs human-review prepare task ${file} <identity>`)
+    }
+    const authorRuntime = [...runtimeHistory].reverse().find((entry) => entry.role === 'executor') || null
+    requireTaskReviewIndependence(f, authorRuntime)
+    const reviewPasses = []
+    const reviewSurfaceIds = []
+    const reviewDossier = buildTaskDossier({
+      spec,
+      profile: profileText,
+      open,
+      files,
+      diff: taskDeliveryDiff(),
+      gateEvidence: g.receipt,
+      executorClaims: ex?.claims || [],
+      acceptanceCases,
+    })
+    let weakBaseline = null
+    let passCount = gateUnavailable ? 1 : 1 + (reviewNeedsChallenger(f, files, open)
+      ? f.review_challenger_passes : 0)
+    if (passCount > 1) {
+      say(`  review: ${passCount} passes — the primary and ${passCount - 1} blind challenger` +
+        `${passCount > 2 ? 's' : ''} (${challengerReason(f, files, open)})`)
+    }
+    for (let passIndex = 0; passIndex < passCount; passIndex++) {
+      const reviewSurface = createReviewSurface(f, g.receipt)
+      reviewSurfaceIds.push(reviewSurface.parent.split(/[\\/]/).pop())
+      const passBaseline = prepareWeakCapture(reviewSurface)
+      weakBaseline ||= passBaseline
+      let passVerdict
+      let semanticProblem = null
+      const reviewPrompt = [
+        reviewDossier.text,
+        reviewSurface.gateArtifacts.length
+          ? '\n\n## Read-only gate artifacts:\n' + stableJson(reviewSurface.gateArtifacts) +
+            '\nRead these exact files to inspect gate evidence. Reference them as gate-artifact:<id>.' +
+            ' They are outside your writable roots and survive Git experiment resets.'
+          : '',
+        '\n\n',
+        `Review pass ${passIndex + 1} of ${passCount}. ` +
+          (passIndex === 0
+            ? 'This is the primary pass.'
+            : 'This is a blind challenger pass. Do not assume the primary pass found everything.'),
+        `\n\nAll passes judge the exact delivery digest ${deliveryBaseline}.`,
+        gateUnavailable
+          ? `\n\nThe gate \`${f.gate_fast}\` was ${g.state}; no test verdict exists.`
+          : `\n\nThe gate \`${f.gate_fast}\` has been run by the orchestrator and is green.`,
+        gateUnavailable
+          ? ` Its engine-owned receipt is ${g.receipt.receipt_id}. This is one advisory pass:` +
+            ' inspect the delivery and record blockers, but do not claim unavailable checks passed.'
+          : ` Its engine-owned receipt is ${g.receipt.receipt_id}. Whether it passes is settled.`,
+        executorMutationRows(measuredMutations).length
+          ? '\n\nThe executor named mutations its tests should catch, and the engine ran the' +
+            ' gate on each against this exact delivery:\n\n  - ' +
+            executorMutationRows(measuredMutations).map(renderMutationRow).join('\n  - ') +
+            '\n\nA caught one is engine evidence you may cite as `executor-mutation:<id>`; it' +
+            ' does not settle a criterion by itself. Look for the mutation the executor did not name.'
+          : '',
+        reviewMutationRows(measuredMutations).length
+          ? '\n\nFor each open weak finding the engine replayed the mutation a reviewer captured' +
+            ' for it, against this exact delivery:\n\n  - ' +
+            reviewMutationRows(measuredMutations).map(renderMutationRow).join('\n  - ') +
+            '\n\nA caught one is engine evidence you may cite as `review-mutation:<id>` when you' +
+            ' close that finding; it shows the tests now catch that one mutation, not that the' +
+            ' finding\'s property is covered. A survived one cannot be closed on this delivery;' +
+            ' an unavailable one is judged as before.'
+          : '',
+        ' Use receipt checks and artifacts before consulting executor claims. Claims are untrusted',
+        ' navigation hints. Judge whether the gate passes for the right reason.',
+        '\n\nEngine-enumerated task contract. Fill `criteria` with exactly one row per id,',
+        ' and finish every row before returning. For a non-met row, the blocking item in the',
+        ' matching slot must list that criterion id in its `criterion_ids`. An already-open',
+        ' carried item that names the criterion is that blocking item; keep it in `carried`',
+        ' and do not duplicate it as a new finding.',
+        // Not "look harder". A `met` row used to need only a consumer and a verification, and a
+        // reviewer could record one without ever asking what the verification misses — so the
+        // missed half surfaced one item per round. Measured on one install: two tasks of four
+        // hit the round ceiling at one open item each after rounds that went new 6, 1, 1, 1,
+        // $94.07 of a $187.11 build, and both last items were about the quality of a check
+        // (a hash call-site count blind to an aliased import; an isolation test reading the
+        // seam's error instead of the function's answer). Both were visible in round 1 to
+        // anyone who had tried to break the code.
+        ' For every `Must cover` row you record `met`, its evidence must name one concrete',
+        ' mutation of the shipped code and the check that fails on it. If you can name a',
+        ' mutation the current verification would NOT catch, the row is `weak` now, in this',
+        ' round, with that mutation as its evidence — not a finding held for a later round:\n\n' +
+          renderReviewCriteria(spec, projectCriteria),
+        // Only the kinds this delivery has rows for. Measured on two installs, every pass of several tasks:
+        // offered `review-mutation:<id>` with nothing replayed, the reviewer cited its own capture
+        // as `review-mutation:caw-weak-1` and paid a semantic repair to learn the id was unknown.
+        '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
+        ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',
+        ' `gate-artifact:<id>`, `executor-claim:<id>`,',
+        executorMutationRows(measuredMutations).length ? ' `executor-mutation:<id>`,' : '',
+        reviewMutationRows(measuredMutations).length ? ' `review-mutation:<id>`,' : '',
+        ' `repository:<path>` or',
+        ' `review-experiment:<id>`. A met criterion cannot rely only on executor claims.',
+        ' A mutation you capture yourself in this pass is `review-experiment:caw-weak-N`;',
+        ' a `*-mutation:<id>` names only a row the engine listed above.',
+        ' Every new finding must also name criterion_ids, surface_ids, transition_ids and one',
+        ` stable property_key: ${PROPERTY_KEY_RULE}.`,
+        ' Use empty surface/transition arrays only when the contract has no',
+        ' applicable topology. Repeated symptoms share a work package only when all these stable',
+        ' links and property_key match; similar prose or a shared file is not enough.',
+        '\n\nThe engine-owned surface and transition ids, which are the only values those two',
+        ' arrays accept. A transition id is opaque and derived; it is not the arrow you read in',
+        ' the spec, and it cannot be composed from the state names:\n\n' +
+          renderTaskTopology(topology),
+        projectReviewInstructions,
         '\n\nYou are in an isolated Git review surface. Experiment only here. Its clean experiment' +
-          ` baseline is commit ${weakBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
+          ` baseline is commit ${passBaseline} on branch ${WEAK_BASELINE_BRANCH}. For weak item N` +
           ` (array order, starting at 1), reset to that baseline, make only its mutation, commit` +
           ` it, force branch caw-weak-N to that commit, then reset to the baseline before the next` +
           ` item and before returning. Do not type or return a diff: the engine derives each` +
@@ -4322,51 +10442,144 @@ function runTask(file, f, profileText, opts = {}) {
             (open.some((i) => i.round < round)
               ? ' Some have been carried through more than one round.'
               : '') +
-            '\n\n  - ' + renderItems(open) +
+            '\n\nWork packages (fix each root cause once; adjudicate every member id):\n\n  - ' +
+            renderWorkPackages(open) +
             '\n\nFill `carried` with one entry per id above, and do that BEFORE looking for' +
             ' anything new — whether the tree now satisfies what was already raised is the' +
             ' question this round exists to answer, and an id you leave out stays open.' +
             ' `withdrawn` is there and using it is not a defeat: an item that was wrong when it' +
             ' was raised should be retracted rather than carried, and retracting your own costs' +
-            ' this task less than the executor bending the code to satisfy it.'
+            ' this task less than the executor bending the code to satisfy it.' +
+            '\n\nA carried entry you keep `open` may also list `criterion_ids`. Use it when that' +
+            ' item is now what blocks a criterion it was not raised against: the entry is then' +
+            ' that criterion\'s blocking item and you must not duplicate it as a new finding.'
           : '\n\nThis is round 1 of this task and nothing is open, so `carried` is empty.',
-      ].join(''), SCHEMA.verdict, f, file, {
+        // What earlier rounds already said. `noted` accumulates in the task's round state and was
+        // never shown back, so every round re-derived the same observations from the tree and
+        // paid for them again: on one install one stale-comment note appeared seven times in a
+        // single task's log and another four, both verbatim.
+        // `noted` holds only earlier rounds here: this round's are merged after its passes.
+        noted.length
+          ? '\n\nAlready recorded as `noted` in earlier rounds of this task. Do not restate these;' +
+            ' add a `noted` item only for something new:\n\n' +
+            boundedUtf8(noted.map((n) => `- ${n}`).join('\n'), REVIEW_PRIOR_NOTED_MAX).text
+          : '',
+      ].join('')
+      const reviewContext = {
         workingRoot: reviewSurface.workingRoot,
         scratchRoot: reviewSurface.scratchRoot,
-        surfaceId: reviewSurface.parent.split(/[\\/]/).pop(),
+        surfaceId: reviewSurfaceIds.at(-1),
+        dossier: reviewDossier.meta,
+        round: round + 1,
+        pass: passIndex + 1,
         deniedReadPaths: reviewSurface.deniedReadPaths,
         writeBoundary: {
           kind: REVIEW_WRITE_BOUNDARY,
           writableRoot: reviewSurface.workingRoot,
           deniedReadPaths: reviewSurface.deniedReadPaths,
-          readOnlyDependencyRoots: reviewSurface.dependencies.map((d) => d.canonical),
+          readOnlyDependencyRoots: [],
         },
-      })
-      try {
-        const captured = captureWeakMutations(rv.weak, reviewSurface, weakBaseline)
-        rv.weak = captured.accepted
-        rv.noted.push(...captured.noted)
-      } catch (error) {
-        die(`${file} — invalid weak evidence: ${error?.message || error}`)
       }
-    } finally {
-      removeReviewSurface(reviewSurface)
+      try {
+        for (let repair = 0; repair <= MAX_REVIEW_SEMANTIC_REPAIRS; repair++) {
+          const prompt = repair === 0 ? reviewPrompt : [
+            `Semantic repair ${repair} for review pass ${passIndex + 1} of ${passCount}.`,
+            '\n\nYour previous response passed the JSON schema but failed the engine semantic',
+            ` consistency check at ${semanticProblem.path}: ${semanticProblem.message}.`,
+            '\nReturn one complete replacement verdict. The review surface has been restored to',
+            ' the same baseline. Preserve valid findings, rerun any weak experiments you still',
+            ' claim, adjudicate every carried id, and do not duplicate an open carried finding',
+            ' into a new blocking slot merely to justify the same non-met criterion.',
+            '\n\nOriginal review request:\n\n', reviewPrompt,
+            '\n\nRejected canonical value:\n\n', JSON.stringify(passVerdict),
+          ].join('')
+          // The surface is restored between canonical attempts for the same reason the semantic
+          // loop restores it: a pass that mutated its surface before answering must not have its
+          // retry describe the tree the first attempt left behind.
+          passVerdict = canonicalRepairCall('reviewer', prompt, SCHEMA.verdict, f, file,
+            reviewContext, () => resetReviewPassForSemanticRepair(reviewSurface, passBaseline))
+          if (deliveryDigest() !== deliveryBaseline) {
+            die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
+          }
+          const carriedProblem = carriedSetIssue(passVerdict.carried, open)
+          const criteriaProblem = carriedProblem ? null : reviewCriteriaIssue(
+            spec, passVerdict.criteria, passVerdict, projectCriteria, open)
+          if (!carriedProblem && !criteriaProblem) {
+            bindFindingCriteria(passVerdict, [...coreCriteria, ...projectCriteria])
+            normalizePropertyKeys(passVerdict)
+          }
+          const contractProblem = carriedProblem || criteriaProblem ? null : reviewContractIssue(
+            passVerdict, {
+              criteria: [...coreCriteria, ...projectCriteria],
+              surfaces: topology.surfaces,
+              transitions: topology.transitions,
+              receipt: g.receipt,
+              claims: ex?.claims || [],
+              mutations: measuredMutations,
+            })
+          semanticProblem = carriedProblem
+            ? { path: '$.carried', message: carriedProblem }
+            : criteriaProblem ? { path: '$.criteria', message: criteriaProblem }
+              : contractProblem ? { path: '$.evidence', message: contractProblem } : null
+          if (!semanticProblem) break
+          recordEngineDiagnostic('reviewer', 'semantic-validation', {
+            pass: passIndex + 1,
+            repair,
+            baseline_digest: deliveryBaseline,
+            path: semanticProblem.path,
+            message: semanticProblem.message,
+          }, runtimeIdentity(passVerdict)?.attempt_id || null)
+          if (repair >= MAX_REVIEW_SEMANTIC_REPAIRS) break
+          say(`  reviewer semantic inconsistency; retrying pass ${passIndex + 1} once: ` +
+            `${semanticProblem.path} ${semanticProblem.message}`)
+          resetReviewPassForSemanticRepair(reviewSurface, passBaseline)
+        }
+        if (!semanticProblem) {
+          try {
+            const captured = captureWeakMutations(passVerdict.weak, reviewSurface, passBaseline)
+            passVerdict.weak = captured.accepted
+            passVerdict.noted.push(...captured.noted)
+          } catch (error) {
+            die(`${file} — invalid weak evidence: ${error?.message || error}`)
+          }
+        }
+      } catch (error) {
+        throw error
+      } finally {
+        removeReviewSurface(reviewSurface)
+      }
+      // With the verdict, not without it. This is the terminal end of the semantic repair, so
+      // the value it rejects is the last thing anyone gets to read about why the run stopped —
+      // and it is what recordContractFailure retains once the transcript is rotated away.
+      if (semanticProblem) {
+        schemaFailure('reviewer', semanticProblem.path, semanticProblem.message, passVerdict,
+          runtimeIdentity(passVerdict)?.attempt_id || null)
+      }
+      let verified
+      try { verified = verifyWeakMutations(passVerdict.weak, f, file, deliveryBaseline) }
+      catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }
+      passVerdict.weak = verified.accepted
+      passVerdict.noted.push(...verified.noted)
+      const runtime = runtimeIdentity(passVerdict)
+      runtimeHistory.push({ round: round + 1, role: 'reviewer', pass: passIndex + 1,
+        baseline_digest: deliveryBaseline, ...runtime })
+      reviewPasses.push({ verdict: passVerdict, runtime, weakEvents: verified.events,
+        weakVerification: verified.verification })
+      if (!gateUnavailable && passIndex === 0 && passCount === 1 &&
+          reviewNeedsChallenger(f, files, open, passVerdict)) {
+        passCount = 1 + f.review_challenger_passes
+        if (passCount > 1) say(`  primary review found risk; adding ${passCount - 1} challenger pass(es)`)
+      }
     }
-    if (deliveryDigest() !== deliveryBaseline) {
-      die(`${file} — delivery tree changed while the isolated reviewer ran; refusing the verdict`)
-    }
-    const reviewerRuntime = runtimeIdentity(rv)
-    runtimeHistory.push({ round: round + 1, role: 'reviewer', ...reviewerRuntime })
-    validateCarriedSet(rv.carried, open)
-    let weakEvents
-    try {
-      const verified = verifyWeakMutations(rv.weak, f, file, deliveryBaseline)
-      rv.weak = verified.accepted
-      rv.noted.push(...verified.noted)
-      weakEvents = verified.events
-      weakVerification = verified.verification
-    }
-    catch (error) { die(`${file} — invalid weak evidence: ${error?.message || error}`) }
+    const mergedReview = mergeReviewPasses(reviewPasses, deliveryBaseline)
+    const rv = mergedReview.verdict
+    const weakEvents = mergedReview.weakEvents
+    weakVerification = mergedReview.weakVerification
+    const reviewerRuntime = reviewPasses.length === 1 ? reviewPasses[0].runtime
+      : reviewPasses.map((pass, index) => ({
+        pass: index + 1, baseline_digest: deliveryBaseline, ...pass.runtime,
+      }))
+    const reviewSurface = { id: reviewSurfaceIds.join(',') }
 
     // The reviewer's own sightings go where the executor's go — printed once at the end of the
     // run, carried in the commit — and they are labelled, because the commit message names who
@@ -4379,6 +10592,8 @@ function runTask(file, f, profileText, opts = {}) {
 
     const adj = adjudicate(history, rv.carried)
     round++
+    mutationRetries = 0
+    unchangedReturns = 0
     recordWeakVerification(file, round, weakVerification)
     const added = ingest(history, rv, round, weakEvents, reviewerRuntime)
     const nowOpen = openItems(history)
@@ -4386,12 +10601,34 @@ function runTask(file, f, profileText, opts = {}) {
     // the tree and can be read, a reviewer's reading of it cannot — so it goes to disk before
     // anything is printed about it.
     saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
-      weakVerification)
+      weakVerification, gateFact)
+    const certification = gateUnavailable ? null : recordTaskCertification({
+      task: file,
+      round,
+      criteria: rv.criteria,
+      open: nowOpen,
+      author: authorRuntime,
+      reviewer: reviewerRuntime,
+      reviewSurface,
+      reviewBaseline: weakBaseline,
+      weakVerification,
+      gateReceipt: g.receipt,
+      acceptanceCases,
+      executorClaims: ex?.claims || [],
+      topology,
+    })
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
+    if (gateUnavailable) {
+      stop(file, spec, ex, history, round, how, noted, { kind: 'advisory-review', text:
+        `${file} — advisory review finished after the fast gate was ${g.state}. ` +
+        `The delivery is not certified or committed.` }, taskAccounting(), runtimeHistory,
+        weakVerification, gateFact)
+    }
+
     if (!nowOpen.length) {
-      clearRoundState(file)
-      return commit(file, spec, ex, f, round, retry, how, noted, deliveryBaseline)
+      return commit(file, spec, ex, f, round, gateRedAttempts, how, noted, deliveryBaseline,
+        certification)
     }
 
     // Two ways to reach the human and they ask different questions. The budget says "this has
@@ -4401,11 +10638,11 @@ function runTask(file, f, profileText, opts = {}) {
     if (stalled || round - startRound >= rounds) {
       // `stop` prints the open items itself, so this branch does not.
       stop(file, spec, ex, history, round, how, noted, stalled
-        ? `${file} — round ${round} closed none of the ${adj.given} item(s) it was handed.` +
-          ` Another reading is not what is missing.`
-        : rounds === 1
+        ? { kind: 'stalled', text: `${file} — round ${round} closed none of the ${adj.given}` +
+          ` item(s) it was handed. Another reading is not what is missing.` }
+        : { kind: 'round-cap', text: rounds === 1
           ? `${file} — the one round this command runs is done.`
-          : `${file} — ${rounds} rounds, the cap this tool stops to ask at.`,
+          : `${file} — ${rounds} rounds, the cap this tool stops to ask at.` },
         taskAccounting(), runtimeHistory, weakVerification)
     }
     say(`    open:\n  - ${renderItems(nowOpen)}`)
@@ -4441,9 +10678,9 @@ function runTask(file, f, profileText, opts = {}) {
 // executor still leaves its work in the tree: without this, a later `review` that approves would
 // commit that work under the previous round's summary.
 function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory = [],
-  weakVerification = null) {
+  weakVerification = null, gateFact = null) {
   writeRoundState(file, {
-    state_version: 3,
+    state_version: 6,
     spec_digest: specDigest(spec),
     round,
     history,
@@ -4453,20 +10690,26 @@ function saveRound(file, spec, ex, history, round, how, noted, taskAccounting, r
     runtime_digest: taskAccounting?.legacy ? null : resolvedRuntime.digest,
     runtime_provenance: taskAccounting?.legacy ? 'legacy-unknown' : 'explicit-adapter-runtime',
     runtime_history: runtimeHistory,
+    project_policies: projectPolicySnapshot(),
     weak_verification: weakVerification,
+    gate_fact: gateFact,
     // Kept so that a `review` which approves has a delivery to commit. A hand-finished task has
     // no executor of its own, and a commit with an empty summary line is one nobody can read
     // back later.
-    ex: ex ? { summary: ex.summary, notes: ex.notes || [] } : null,
+    ex: ex ? { summary: ex.summary, notes: ex.notes || [], claims: ex.claims || [] } : null,
   })
 }
 
+// `why` is the sentence, or `{ kind, text }` when the stop is one `autopilot` can tell apart.
 function stop(file, spec, ex, history, round, how, noted, why,
-  taskAccounting = zeroAccounting(), runtimeHistory = [], weakVerification = null) {
+  taskAccounting = zeroAccounting(), runtimeHistory = [], weakVerification = null,
+  gateFact = null) {
   saveRound(file, spec, ex, history, round, how, noted, taskAccounting, runtimeHistory,
-    weakVerification)
+    weakVerification, gateFact)
   const open = openItems(history)
-  say(`\n· ${why}`)
+  const { kind = 'decision', text } = typeof why === 'string' ? { text: why } : why
+  writeStopRecord(kind, { task: file, round, open: open.map((item) => item.id) })
+  say(`\n· ${text}`)
   say(`  This task has cost ${formatAccounting(taskAccounting)} over ${round} round(s).`)
   if (open.length) {
     say(`\n  ${open.length} item(s) open after ${round} round(s):\n  - ${renderItems(open)}`)
@@ -4484,6 +10727,45 @@ function stop(file, spec, ex, history, round, how, noted, why,
 // stdout would be written into a file nobody is watching, and the run would hang at a question
 // the human cannot see. A stop that ends the process and a command that resumes it survive the
 // terminal being closed, which a keystroke does not.
+function prepareTaskReviewRisk(f) {
+  const planText = existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : null
+  activePopulationCertification = planText
+    ? readPlanPopulationRecord(planText)
+    : { state: 'unknown', source: 'no-plan-artifact', digest: null }
+  let risk = null
+  try { risk = readRiskRecord() }
+  catch (error) { die(error?.message || String(error)) }
+  const planDeclaresRisk = /^risk_class:\s*\S+/m.test(planText || '')
+  if (planDeclaresRisk && !risk) {
+    die(`${PLAN} declares project risk, but ${RISK_RECORD} is missing; run review-specs again`)
+  }
+  let fullGateBaseline = null
+  if (risk) {
+    requireMatchingPlanRisk(planText, risk)
+    requireCurrentRiskPolicy(risk)
+    applyRiskPopulationCertification(risk)
+    fullGateBaseline = requirePersistedFullGateBaseline(f, risk)
+    const run = beginRunRecord()
+    run.risk = risk
+    if (fullGateBaseline) run.fullGateBaseline = fullGateBaseline
+    writeRunManifest('active')
+  }
+
+  return { risk, fullGateBaseline }
+}
+
+function finishReviewedTask(f, risk, fullGateBaseline) {
+  if (!specFiles().length && f.pipeline_mode !== 'fast') runBatchGate(f)
+  if (fullGateBaseline) runFinalFullGate(f, fullGateBaseline.head, fullGateBaseline)
+  if (risk && !specFiles().length) {
+    if (existsSync(PLAN)) {
+      unlinkSync(PLAN)
+      say(`  cleared ${PLAN} — the queue it planned is empty`)
+    }
+    clearRiskRecord()
+  }
+}
+
 function resumeTask(cmd, arg) {
   const { f, text } = profile()
   if (!arg) die(`${cmd} needs a spec filename, e.g.: caw.mjs ${cmd} 001_registry-and-scan.md`)
@@ -4493,8 +10775,7 @@ function resumeTask(cmd, arg) {
         `  committed — there is nothing left to review.`)
   }
 
-  const branch = git('rev-parse', '--abbrev-ref', 'HEAD').trim()
-  if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
+  requireTaskBranch(f)
 
   // The work being judged is the dirty tree. A clean one means there is nothing for a reviewer
   // to read, and the two ways that happens want opposite advice, so both are named.
@@ -4504,6 +10785,8 @@ function resumeTask(cmd, arg) {
         `  If you already committed it by hand, this cannot review a commit — take the spec out\n` +
         `  of the queue with:  node caw.mjs done ${name}`)
   }
+
+  const { risk, fullGateBaseline } = prepareTaskReviewRisk(f)
 
   const resume = readRoundState(name)
   if (!resume) {
@@ -4525,32 +10808,267 @@ function resumeTask(cmd, arg) {
     resume,
     startAt: cmd === 'review' ? 'gate' : 'executor',
     rounds: 1,
-    how: cmd === 'review' ? 'hand' : 'resumed',
+    // Under `autopilot` the further round was authorised by a policy, not a person, and the
+    // commit must not say otherwise.
+    how: cmd === 'review' ? 'hand' : process.env.CAW_AUTOPILOT === '1' ? 'autopilot' : 'resumed',
   })
+  finishReviewedTask(f, risk, fullGateBaseline)
   say(`\n  spent ${formatAccounting(accounting)}`)
 }
 
-// The spec is deleted once its task is committed, so `ls .caw-tasks/` is the queue — existence
-// is the whole state, and nothing stores progress.
+// ---------------------------------------------------------------- autopilot
 //
-// The spec file never enters git as a file; its TEXT goes into the commit message, verbatim.
-// This used to end at `Spec: .caw-tasks/001_thing.md` — a pointer to a path that is `.gitignore`d
-// and deleted two lines below, so it resolved to nothing from the moment it was written. What
-// was lost with it is the half of a task that a diff cannot carry: what the spec ruled OUT.
-// `Change` and `Done when` are recoverable by reading the code that landed; "server-side
-// enforcement is deliberately out of scope" and "this migration is applied, fix it with a new
-// one" are not recoverable from anything, and they are what a later reader most needs, because
-// re-litigating a settled exclusion is the expensive mistake.
+// Every stop in this file is a question with its answer printed under it — `round` or `review` —
+// and the reason it is a command rather than a keystroke is that a run is saved to a log nobody
+// is watching. Measured on one iOS install, one night of 10.3 h: 3.9 h were a stopped queue waiting for a
+// person who was asleep, and for most of those stops the person's answer was never in doubt.
+//
+// `autopilot` answers those, and only those. It runs `build`, `round` and `review` as child
+// processes, reads the stop record each writes on its way out (CAW_STOP_RECORD), and picks the
+// command the stop itself offers — never one it does not. It lowers no gate and skips no
+// reviewer: every commit is still a reviewer's approval of a tree a green gate ran on. What it
+// may answer is bounded per task by the profile, and everything it does not recognise, a stall
+// included, is the human's, exactly as without it. Running `build` instead of `autopilot` is how
+// an install opts out; nothing else changes for it.
+//
+// Three kinds of stop, three answers. A stop about the infrastructure — a gate that timed out or
+// refused, a role killed at its timeout, an expired credential with a configured re-auth command —
+// is retried. A stop with progress — the round cap, a gate still red after the executor's retries,
+// a review whose baseline was red — gets one more executor round. A stall (a round that closed
+// nothing, or the same rejected tree twice) and every judgement stop go to the human: the stall
+// guard's own sentence is "another reading is not what is missing", and a policy is not a
+// different reader.
+const AUTOPILOT_STEPS_MAX = 100
+const AUTOPILOT_HOOK_TIMEOUT_MS = 5 * 60 * 1000
+const AUTOPILOT_ROUND_KINDS = new Set(['round-cap', 'gate-red-retries', 'review-baseline-red'])
+const AUTOPILOT_GATE_KINDS = new Set(['gate-timeout', 'gate-refused'])
+
+// The whole policy, pure so it can be read and tested apart from the processes it drives.
+// `counts` is per task and per run; the caller increments what the answer spends.
+function decideAutopilot(record, counts, limits, { treeDirty }) {
+  const kind = record?.kind || 'unknown'
+  const task = record?.task || null
+  const human = (reason) => ({ action: 'stop', reason })
+  if (!task) return human(`${kind} names no task`)
+  const spent = counts.tasks[task] || { rounds: 0, gates: 0, resumes: 0 }
+  // The role that died decides where the task resumes: an executor's round is re-run, a
+  // reviewer's judgement is re-asked of the tree already there.
+  const resumeRole = (role) => role === 'reviewer' ? { argv: ['review', task] }
+    : role === 'executor' ? { argv: treeDirty ? ['round', task] : ['build'] }
+      : null
+  if (AUTOPILOT_ROUND_KINDS.has(kind)) {
+    if (spent.rounds >= limits.rounds) {
+      return human(`${task} has had the ${limits.rounds} autopilot round(s) autopilot_rounds allows`)
+    }
+    return { action: 'run', argv: ['round', task], spend: 'rounds',
+      reason: `${kind}: one more executor round (${spent.rounds + 1}/${limits.rounds})` }
+  }
+  if (AUTOPILOT_GATE_KINDS.has(kind)) {
+    if (spent.gates >= limits.gates) {
+      return human(`${task}: the fast gate ${kind === 'gate-timeout' ? 'timed out' : 'refused'} again` +
+        ` after ${limits.gates} autopilot retr${limits.gates === 1 ? 'y' : 'ies'}`)
+    }
+    return { action: 'run', argv: ['review', task], spend: 'gates',
+      reason: `${kind}: the gate is re-run on the same tree (${spent.gates + 1}/${limits.gates})` }
+  }
+  if (kind === 'role-timeout' || kind === 'credentials-expired') {
+    const resume = resumeRole(record.role)
+    if (!resume) return human(`${kind} in ${record.role || 'an unknown role'}, which autopilot does not resume`)
+    if (spent.resumes >= limits.resumes) {
+      return human(`${task}: ${record.role} failed again after ${limits.resumes} autopilot resume(s)`)
+    }
+    if (kind === 'credentials-expired') {
+      if (!limits.reauth) return human('credentials expired and the profile sets no autopilot_reauth_cmd')
+      if (counts.reauths >= limits.reauthMax) {
+        return human(`credentials expired again after ${limits.reauthMax} re-authentication(s)`)
+      }
+      return { action: 'run', argv: resume.argv, spend: 'resumes', reauth: true,
+        reason: `${kind} in ${record.role}: re-authenticate, then resume` }
+    }
+    return { action: 'run', argv: resume.argv, spend: 'resumes',
+      reason: `${kind} in ${record.role}: resume the task (${spent.resumes + 1}/${limits.resumes})` }
+  }
+  return human(kind === 'unknown' ? 'the run stopped without a stop record' : `${kind} is a decision`)
+}
+
+function autopilotLimits(f) {
+  const count = (key, fallback) => {
+    const raw = f[key]
+    if (raw === undefined || raw === '') return fallback
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 0 || value > 10) {
+      die(`.caw/CAW.md ${key} must be a whole number from 0 to 10`)
+    }
+    return value
+  }
+  return {
+    rounds: count('autopilot_rounds', 3),
+    gates: count('autopilot_gate_retries', 1),
+    resumes: count('autopilot_role_resumes', 1),
+    reauthMax: count('autopilot_reauth_max', 2),
+    reauth: f.autopilot_reauth_cmd || null,
+    notify: f.autopilot_notify_cmd || null,
+  }
+}
+
+function runAutopilot(noFull) {
+  const { f } = profile()
+  const limits = autopilotLimits(f)
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '')
+  mkdirSync(LOG_DIR, { recursive: true })
+  const journal = join(LOG_DIR, `autopilot-${stamp}.jsonl`)
+  const scratch = mkdtempSync(join(tmpdir(), 'caw-autopilot-'))
+  const recordPath = join(scratch, 'stop.json')
+  const counts = { tasks: {}, reauths: 0 }
+  const note = (entry) => {
+    appendFileSync(journal, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+      { mode: 0o600 })
+  }
+  const hook = (label, command, env) => {
+    if (!command) return null
+    const r = spawnShellGroupSync(command, { encoding: 'utf8', timeoutMs: AUTOPILOT_HOOK_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024, env: { ...process.env, ...env } })
+    const status = r.error?.code === 'ETIMEDOUT' ? 'timeout' : r.status
+    note({ event: label, command, status })
+    return status
+  }
+  const finish = (outcome, fields, code) => {
+    note({ event: outcome, ...fields })
+    say(`\n· autopilot ${outcome}${fields.reason ? `: ${fields.reason}` : ''}`)
+    say(`  its decisions are in ${journal}`)
+    hook('notify', limits.notify, {
+      CAW_AUTOPILOT_OUTCOME: outcome, CAW_AUTOPILOT_KIND: fields.kind || '',
+      CAW_AUTOPILOT_TASK: fields.task || '', CAW_AUTOPILOT_JOURNAL: journal,
+    })
+    try { removeTree(scratch) } catch { /* temp sweep */ }
+    process.exit(code)
+  }
+  say(`· autopilot: rounds ${limits.rounds}, gate retries ${limits.gates}, role resumes` +
+    ` ${limits.resumes} per task; re-auth ${limits.reauth ? `up to ${limits.reauthMax}` : 'not configured'}`)
+  note({ event: 'start', limits: { ...limits, reauth: Boolean(limits.reauth), notify: Boolean(limits.notify) } })
+  let argv = ['build', ...(noFull ? ['--no-full'] : [])]
+  for (let step = 1; step <= AUTOPILOT_STEPS_MAX; step += 1) {
+    rmSync(recordPath, { force: true })
+    say(`\n· autopilot step ${step}: caw.mjs ${argv.join(' ')}`)
+    note({ event: 'run', step, argv })
+    const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+      stdio: 'inherit',
+      env: { ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1' },
+    })
+    if (child.status === 0) {
+      if (argv[0] === 'build') finish('finished', { reason: 'the queue is built' }, 0)
+      if (!specFiles().length) finish('finished', { reason: `${argv[1]} was the last task` }, 0)
+      note({ event: 'committed', task: argv[1] })
+      argv = ['build', ...(noFull ? ['--no-full'] : [])]
+      continue
+    }
+    let record = null
+    try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { /* unknown */ }
+    const decision = decideAutopilot(record, counts, limits, { treeDirty: changedFiles().length > 0 })
+    note({ event: 'stop', status: child.status, record, decision })
+    if (decision.action === 'stop') {
+      finish('stopped', { reason: decision.reason, kind: record?.kind || 'unknown',
+        task: record?.task || null }, child.status || 1)
+    }
+    if (decision.reauth) {
+      counts.reauths += 1
+      const status = hook('reauth', limits.reauth, {})
+      if (status !== 0) {
+        finish('stopped', { reason: `re-authentication command ended with ${status}`,
+          kind: record.kind, task: record.task }, child.status || 1)
+      }
+    }
+    const spent = counts.tasks[record.task] ||= { rounds: 0, gates: 0, resumes: 0 }
+    spent[decision.spend] += 1
+    say(`· autopilot: ${decision.reason}`)
+    argv = decision.argv[0] === 'build' ? ['build', ...(noFull ? ['--no-full'] : [])] : decision.argv
+  }
+  finish('stopped', { reason: `${AUTOPILOT_STEPS_MAX} steps without an end` }, 1)
+}
+
+// The spec is deleted once its task is committed, so `ls .caw-tasks/` is the queue. Its exact
+// text survives in the Git-private audit record written before the commit. The public commit is
+// deliberately compact and carries the audit SHA-256; project-specific subject policy cannot
+// change staging, evidence or the private record.
 // `how` records the shape of the round that earned the approval, and it exists because the
 // signature line is the thing this loop is for. `null` — the ordinary case, the whole task ran
-// inside one `build`. `'resumed'` — a human authorised further rounds after a stop. `'hand'` —
+// inside one `build`. `'resumed'` — a human authorised further rounds after a stop; `'autopilot'`
+// — the `autopilot` command did, under the profile's limits. `'hand'` —
 // no executor ran in the approving round, so the code came from a hand or from a round this
 // pipeline started and never judged.
 //
 // The third is the one worth having. Before it, the only way out of a task the loop could not
 // approve was `done`, which removes a spec from the queue with no judgement of the work at all
 // — so the tasks most likely to need a review were exactly the ones guaranteed not to get one.
-function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewedDigest = null) {
+// What the public commit says the change IS. It used to be the executor's summary, and an
+// executor's summary describes its own round: after a review round sends it back, the summary it
+// writes is about closing those findings. The commit carries the whole task, so the two agree
+// only when there was exactly one round — and there almost never is. Measured on one install:
+// three commits of four, each +377 to +1565 lines, whose bodies described the test hardening that
+// closed the last round's findings and said nothing of the work — one of them a batch-acceptance
+// path over three lookup places, of which the body mentioned none. The round reports are kept in
+// full in the private audit record, where they belong; the public body is what a reader with
+// `git log` and no `.git/caw/` will have in six months.
+//
+// One executor round: its summary does describe the whole delivery, so it stays. Otherwise the
+// body is built from what the task was judged against — its `## Change` bullets, the same census
+// the reviewer filled — and the shape of the staged delivery, both true of the whole task.
+const COMMIT_BODY_FILES_MAX = 30
+
+function reviewLine(certification, round, how) {
+  const limited = certification?.state === 'limited'
+  if (!limited && !['hand', 'human', 'resumed', 'autopilot'].includes(how)) return null
+  const detail = how === 'hand'
+    ? ' — approved by `review`: no executor ran in the approving round, so the code above it was' +
+      ' written by a hand or by an earlier round this pipeline did not get to judge'
+    : how === 'human' ? ' — approved by a signed human attestation'
+    : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
+    : how === 'autopilot' ? ' — rounds beyond the cap were authorised by `autopilot`, not by a person'
+    : ''
+  return `Review: ${limited ? 'accepted with LIMITED certification' : 'approved'}, round ${round}${detail}.`
+}
+
+function taskCommitBody(spec, ex, round, how) {
+  // The staged delivery: every file this commit carries, with its own line counts.
+  let stat = []
+  try {
+    stat = git('diff', '--cached', '--numstat').trim().split('\n').filter(Boolean)
+      .map((line) => line.split('\t'))
+      .map(([added, removed, ...path]) => ({ added, removed, path: path.join('\t') }))
+  } catch { /* the body still says what the task was, without the file list */ }
+  const count = (value) => (value === '-' ? 0 : Number(value) || 0)
+  const added = stat.reduce((sum, row) => sum + count(row.added), 0)
+  const removed = stat.reduce((sum, row) => sum + count(row.removed), 0)
+  const files = stat.length ? [
+    `${stat.length} file${stat.length === 1 ? '' : 's'}, +${added} -${removed}:`,
+    ...stat.slice(0, COMMIT_BODY_FILES_MAX).map((row) =>
+      row.added === '-' ? `  ${row.path} (binary)` : `  ${row.path} (+${row.added} -${row.removed})`),
+    ...(stat.length > COMMIT_BODY_FILES_MAX
+      ? [`  … and ${stat.length - COMMIT_BODY_FILES_MAX} more`] : []),
+  ] : []
+
+  const change = extractReviewCriteria(spec).filter((row) => row.section === 'Change')
+    .map((row) => `- ${row.criterion}`)
+  const singleRound = round === 1 && how !== 'hand' && ex?.summary
+
+  let description
+  if (singleRound) description = [ex.summary]
+  else if (change.length) description = ['Change:', ...change]
+  else if (how === 'hand' || !ex?.summary) {
+    // Stated rather than filled in: `review` approves a tree no executor produced under its eye,
+    // and this script cannot tell a hand-finished tree from a round killed after its executor.
+    description = ['No executor round recorded for this task — the tree was finished outside the' +
+      ' pipeline and approved by `review`.']
+  } else {
+    description = [`Delivered over ${round} review rounds. The spec has no \`## Change\` section,` +
+      ' so the contract and each round\'s report are only in the audit record below.']
+  }
+  return [...description, ...(files.length ? ['', ...files] : [])]
+}
+
+function commit(file, spec, ex, f, round, gateRedAttempts, how = null, noted = [],
+  reviewedDigest = null, certification = null) {
+  requireTaskBranch(f)
   // .caw-tasks/ must never enter a commit, and it takes both lines because each has a hole.
   // `git add -A` already skips ignored files, so the .gitignore line the README asks for
   // does the job; the reset covers a project that has not added it. An explicit
@@ -4578,10 +11096,52 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
   if (reviewedDigest && deliveryDigest() !== reviewedDigest) {
     die(`${file} — delivery tree differs from the tree the reviewer approved; refusing commit`)
   }
+  const title = (spec.match(/^title:\s*(.+)$/m) || [, file])[1]
+  const commitPolicy = runProjectPolicy('commit', {
+    title,
+    spec,
+    files: changedFiles(),
+    round,
+    gate: f.gate_fast,
+    gate_red_attempts: gateRedAttempts,
+  })
+  const subject = commitPolicy?.output.subject.trim() || title
+  const files = changedFiles()
+  const precommitSnapshot = deliverySnapshotDigest()
   git('add', '-A')
   try { git('reset', '-q', '--', QUEUE_DIR) } catch { /* nothing of .caw-tasks/ was staged */ }
   try { git('reset', '-q', '--', LOG_DIR) } catch { /* nothing of .caw-logs/ was staged */ }
-  const title = (spec.match(/^title:\s*(.+)$/m) || [, file])[1]
+  if (deliverySnapshotDigest() !== precommitSnapshot) {
+    die(`${file} — delivery snapshot changed during staging; refusing commit`)
+  }
+  const stagedTree = git('write-tree').trim()
+  const audit = writeTaskAudit({
+    version: 2,
+    task: file,
+    title,
+    public_subject: subject,
+    created_at: new Date().toISOString(),
+    spec,
+    delivery: {
+      summary: ex?.summary || null,
+      executor_notes: ex?.notes || [],
+      executor_claims: ex?.claims || [],
+      reviewer_notes: noted || [],
+      files,
+      delivery_digest: reviewedDigest || deliveryDigest(),
+      precommit_snapshot_digest: precommitSnapshot,
+      staged_tree: stagedTree,
+    },
+    gate: {
+      fast: f.gate_fast,
+      state: 'green',
+      earlier_red_attempts: gateRedAttempts,
+      full: f.gate_full || null,
+      full_state_at_task_commit: 'not-run',
+    },
+    review: { round, mode: how || 'pipeline', certification },
+    project_policies: projectPolicySnapshot(),
+  })
   // `--cleanup=verbatim` is load-bearing, not tidiness. A spec is markdown: `## Read`,
   // `## Done when`. Under git's `strip` mode every one of those lines is a comment and is
   // silently removed, leaving a message whose headings are gone and whose bullets have lost
@@ -4590,46 +11150,33 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
   // the integrity of this record depend on a setting outside the repository. Naming the mode
   // here takes it back.
   git('commit', '-q', '--cleanup=verbatim', '-m', [
-    title, '',
-    // The summary line is what a later reader sees first, so it says only what this script
-    // actually knows. `review` approves a tree no executor produced under its eye, and until the
-    // round was saved before the gate there was only one way to arrive there: a human had
-    // written it. There are two now — a round killed after its executor leaves exactly the same
-    // shape — and this script cannot tell them apart, so it stopped claiming to. It says who
-    // approved and how; the summary describes the last delivery anyone recorded, and the absence
-    // of one is itself stated rather than filled in.
-    ex?.summary || 'No executor round recorded for this task — the tree was finished outside the'
-      + ' pipeline and approved by `review`.', '',
-    `Gate: ${f.gate_fast} — green${retry ? ` (red on ${retry} earlier attempt${retry === 1 ? '' : 's'})` : ''}.` +
-      ` Not run: ${f.gate_full || '(none configured)'}.`,
-    `Review: approved, round ${round}${
-      how === 'hand' ? " — approved by `review`: no executor ran in the approving round, so the"
-                       + ' code above it was written by a hand or by an earlier round this'
-                       + ' pipeline did not get to judge'
-      : how === 'resumed' ? ' — rounds beyond the cap were authorised one at a time'
-      : ''}.`,
-    // The executor's notes ride along with the commit they were made during. They used to be
-    // printed at the end of the run and nowhere else — the script said so itself: "nothing was
-    // recorded anywhere". On one live run a note was the discovery that the project's Xcode
-    // file registers every source by hand, so an unregistered test does not fail: it ceases to
-    // exist and the suite goes green. It survived because someone read the terminal before
-    // closing it. That is not a mechanism.
-    //
-    // Marked unreviewed because they are. The reviewer judges the code against the spec; a note
-    // is a side observation it never looked at, so this is testimony, not a finding. The
-    // reviewer's own `noted` slot lands in the same place and is prefixed there, so the two
-    // speakers stay told apart — this header used to name only the executor and would have
-    // become false the moment the reviewer gained a channel that does not block.
-    ...(ex?.notes?.length || noted?.length
-      ? ['', '--- notes from this task (unreviewed — nobody judged these, only the code) ---', '',
-         ...(ex?.notes || []).map((n) => `- ${n}`),
-         ...(noted || []).map((n) => `- (reviewer) ${n}`)]
-      : []),
+    subject, '',
+    ...taskCommitBody(spec, ex, round, how), '',
+    // What the public history keeps is what stays true about this commit. `Not run: <gate_full>`
+    // did not: the full gate is queue-final by design and runs AFTER every task commit, so the
+    // line was written into every commit — including ones whose full gate went green minutes
+    // later — and history kept "not run" about code that had been checked. Its state belongs to
+    // the run record and the audit, which know how it ended. One install stripped these lines
+    // from every commit before pushing, for the reason that a closed pull request keeps its
+    // commits forever.
+    `Gate: ${f.gate_fast} — green${gateRedAttempts ? ` (red on ${gateRedAttempts} earlier attempt${gateRedAttempts === 1 ? '' : 's'})` : ''}.`,
+    // Only when it says something a reader would act on. A plain approval in round N is the
+    // pipeline working; a LIMITED certification, a hand-finished tree, a signed human attestation
+    // or rounds authorised past the cap are what someone reading `git log` needs to see.
+    ...(reviewLine(certification, round, how) ? [reviewLine(certification, round, how)] : []),
+    // Notes and the exact spec live in the audit record above. Keeping them out of the public
+    // commit is the separation this method enforces: the commit is a useful project history,
+    // while the local private record is the complete operational history.
     '',
-    `--- spec (${file}), verbatim — the text this task was built and judged against ---`,
-    '',
-    spec.trim(),
+    `CAW-Audit: sha256:${audit.digest}`,
   ].join('\n'))
+  const committedHead = git('rev-parse', 'HEAD').trim()
+  let auditPath = audit.path
+  try { auditPath = finalizeTaskAudit(audit, committedHead) }
+  catch (error) {
+    say(`  WARNING: audit record remains pending at ${audit.path}: ${error?.message || error}`)
+  }
+  clearRoundState(file)
 
   // That header used to call this the only durable copy, and the unlink below is what would
   // have made it true. `spec` was read once, before the first executor round, and every pass
@@ -4659,7 +11206,7 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
   if (onDisk === null) {
     // The executor holds Write and Edit and could have removed it. Unlinking would throw ENOENT
     // out of a run that has already committed, taking the notes and the spend line with it.
-    say(`  committed  ${head}`)
+    say(`  committed  ${head}  audit ${auditPath}`)
     say(`  note: .caw-tasks/${file} was already gone before this line ran`)
     clearTaskRecoveryArtifacts(file)
     return
@@ -4687,7 +11234,7 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
     } catch { kept = null }
     rm(specPath)
     clearTaskRecoveryArtifacts(file)
-    say(`  committed  ${head}`)
+    say(`  committed  ${head}  audit ${auditPath}`)
     say(`  .caw-tasks/${file} CHANGED under this run. The commit carries the text the executor and`)
     say(`  reviewer were actually given; the file on disk was something else and no role here`)
     say(kept && retained ? `  read it. It is at ${kept} — diff it against the spec in the commit.`
@@ -4698,7 +11245,7 @@ function commit(file, spec, ex, f, round, retry, how = null, noted = [], reviewe
   }
   rm(specPath)
   clearTaskRecoveryArtifacts(file)
-  say(`  committed  ${head}`)
+  say(`  committed  ${head}  audit ${auditPath}`)
 }
 
 // ---------------------------------------------------------------- review-specs
@@ -4739,7 +11286,10 @@ function clearSpecs() {
 }
 
 function reviewSpecs(description, noFix) {
-  const { f, text } = profile()
+  setProviderBudgetPhase('planning')
+  const { f, text: profileText } = profile()
+  const planning = applyPlanningPolicy(description, profileText)
+  let text = planning.text
 
   // ONCE, before the loop — the rule enumerate() states about itself, and which this function
   // broke for as long as it has existed. The call sat inside judgeSpecs(), so a run that fixed
@@ -4756,11 +11306,26 @@ function reviewSpecs(description, noFix) {
   // 24% different populations run to run. That number decided how much of the spread between
   // runs is sampling and how much is the request growing. Nothing else could have told them
   // apart, and after this line it has to be measured on purpose rather than found in the waste.
-  const population = enumerate(description, text, f)
+  const population = requireReadyRequest(enumerate(description, text, f), 'review-specs')
+  const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
+  text = populationPolicy.text
+  if (populationPolicy.risk) {
+    writeRiskRecord(populationPolicy.risk)
+    syncPlanRisk(populationPolicy.risk)
+  } else {
+    clearRiskRecord()
+    syncPlanRisk(null)
+  }
 
+  // Round 1 carries what the last plan or review left in PLAN.md; each later round carries what
+  // the round before it raised, because fixSpecs has just edited the specs to close exactly those.
+  let holes = unclosedHoles(existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : '')
+  if (holes.length) say(`  carrying ${holes.length} earlier hole(s) from ${PLAN} into this review`)
   for (let round = 1; round <= FIX_ROUNDS; round++) {
-    const verdict = judgeSpecs(description, f, text, population)
-    if (!verdict.problems.length) return approveSpecs(verdict.specs)
+    const verdict = judgeSpecs(description, f, text, population, holes)
+    if (!verdict.problems.length) {
+      return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
+    }
 
     say(`\nholes (round ${round}/${FIX_ROUNDS}):\n  - ${verdict.problems.join('\n  - ')}`)
 
@@ -4771,6 +11336,7 @@ function reviewSpecs(description, noFix) {
     }
 
     fixSpecs(description, f, text, verdict.specs, verdict.problems, round)
+    holes = verdict.problems.map((hole, index) => ({ id: `h${index + 1}`, hole }))
   }
 }
 
@@ -4783,10 +11349,11 @@ function fixSpecs(description, f, text, specs, problems, round) {
     .map((s) => `### .caw-tasks/${s}\n\n${readFileSync(join(QUEUE_DIR, s), 'utf8')}`)
     .join('\n\n')
 
-  const out = agent('architect', [
+  const architectPrompt = [
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they run:\n\n' + bodies,
     '\n\nHoles to close:\n- ' + problems.join('\n- '),
     '\n\nReturn the whole plan again with the holes closed, and change only what closing them',
@@ -4795,9 +11362,13 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' before what it needs — move it, and record every such move in `resplit` with the hole that',
     ' forced it. A hole is closed when `done_when` checks it on the tree the task leaves behind,',
     ' not when `change` mentions it.',
-  ].join(''), SCHEMA.plan, f)
-
-  validatePlanRelations(out)
+    ' Preserve the explicit surfaces and state machines. Split unrelated surfaces into separate',
+    ' tasks unless the task carries a concrete indivisible_reason.',
+    ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
+    ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
+  ].join('')
+  const { value: out } = planningCanonicalCall(
+    'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
 
   if (out.blocked) {
     die(`architect stopped while closing holes:\n\n${out.blocked}\n\n` +
@@ -4812,6 +11383,23 @@ function fixSpecs(description, f, text, specs, problems, round) {
 }
 
 function stopWithHoles(problems, specs, why) {
+  // Written down, not only printed. A stop used to leave PLAN.md holding whatever the PREVIOUS
+  // plan said, so the next review-specs carried stale holes or none — the same silence the
+  // carried list exists to end, one run later. A queue with no PLAN.md is left without one:
+  // creating it here would invent a plan artifact for hand-written specs.
+  if (existsSync(PLAN)) {
+    const plan = readFileSync(PLAN, 'utf8')
+    const kept = plan.replace(/\n## Unclosed[\s\S]*?(?=\n## |$)/, '')
+      .replace(/^approved:\s*true\s*$/m, 'approved: false')
+    writeFileSync(PLAN, [
+      kept.replace(/\n+$/, ''), '',
+      '## Unclosed — this plan was NOT approved', '',
+      ...problems.map((p) => `- ${String(p).replace(/\n+/g, ' ')}`), '',
+      'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
+      '`approved:` above. `build` refuses until it does.', '',
+    ].join('\n'))
+    say(`  ${PLAN}: ## Unclosed now lists these ${problems.length}; the next review-specs carries them`)
+  }
   say(`\n${problems.length} hole(s) in ${specs.length} spec(s) — ${why}.`)
   say(`  spent ${formatAccounting(accounting)}`)
   process.exit(1)
@@ -4825,7 +11413,24 @@ function specTask(name, body) {
     const sec = body.split(/^## /m).find((x) => x.toLowerCase().startsWith(heading))
     return sec ? sec.split('\n').slice(1).filter((l) => l.startsWith('- ')).map((l) => l.slice(2)) : []
   }
-  return { slug: name, change: bullets('change'), done_when: bullets('done when') }
+  return {
+    slug: name.replace(/^\d+_/, '').replace(/\.md$/, ''),
+    title: body.match(/^title:\s*(.+)$/m)?.[1]?.trim() || name,
+    read: bullets('read'),
+    must_cover: bullets('must cover'),
+    change: bullets('change'),
+    done_when: bullets('done when'),
+  }
+}
+
+function specsPlanningLedger(specs) {
+  const tasks = specs.map((name) => specTask(name, readFileSync(join(QUEUE_DIR, name), 'utf8')))
+  const coverage = tasks.flatMap((task) => task.must_cover.map((caseText) => ({
+    case: caseText,
+    task: task.slug,
+    acceptance_criteria: [...task.done_when],
+  })))
+  return planningLedger({ tasks, coverage })
 }
 
 // `population` is enumerated once by the caller and handed down, never re-derived here — see
@@ -4834,7 +11439,61 @@ function specTask(name, body) {
 // population, and they were written by whoever wrote the specs. Measured on one project: both
 // specs for a ticket were written by hand and the ticket behind them understated its own
 // population by four sites.
-function judgeSpecs(description, f, text, population) {
+// The holes a plan review already found, handed to the next one by id. A plan reviewer is one
+// sample of a model, and without its predecessor's list a second sample that finds nothing
+// approved the same unchanged specs: silence closed what the first one raised. Measured on one
+// install, twice in a day, both one-task queues: `plan` reported 1 and then 5 holes — a real
+// one in each, among them a repository driven through a URLProtocol stub that the spec gave no
+// `init(client:)` — and `review-specs` ran enumerator and plan reviewer, got "no holes", and
+// approved byte-identical specs without the architect ever running. The first cost a red fast
+// gate and an extra executor round; the second was covered by luck. The task reviewer has had
+// this rule since round 2 existed — an id left out stays open — and this is that rule, one level
+// up.
+function unclosedHoles(planText) {
+  if (!planText) return []
+  const section = planText.match(/^## Unclosed[^\n]*\n([\s\S]*?)(?=^## |(?![\s\S]))/m)?.[1] || ''
+  const holes = []
+  for (const line of section.split('\n')) {
+    if (line.startsWith('- ')) holes.push(line.slice(2).trim())
+    else if (holes.length && line.startsWith('  ') && line.trim()) {
+      holes[holes.length - 1] += ` ${line.trim()}`
+    } else if (holes.length && !line.trim()) break
+  }
+  return holes.filter(Boolean).map((hole, index) => ({ id: `h${index + 1}`, hole }))
+}
+
+function carriedHolesIssue(carried, holes) {
+  if (!Array.isArray(carried)) return 'carried must be an array'
+  const known = new Set(holes.map((row) => row.id))
+  const seen = new Set()
+  for (const row of carried) {
+    if (!known.has(row?.id)) return `unknown carried hole id ${JSON.stringify(row?.id)}`
+    if (seen.has(row.id)) return `duplicate carried hole id ${JSON.stringify(row.id)}`
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) return `${row.id} has empty evidence`
+    seen.add(row.id)
+  }
+  const missing = holes.map((row) => row.id).filter((id) => !seen.has(id))
+  // Silence closes nothing: a hole left out is a hole still open, and the answer is refused
+  // rather than read as approval.
+  if (missing.length) return `missing carried hole id(s): ${missing.join(', ')}`
+  return null
+}
+
+function carriedHolesBlock(holes) {
+  if (!holes.length) {
+    return '\n\nNo earlier hole is carried into this review, so `carried` is empty.'
+  }
+  return [
+    '\n\nEarlier holes, carried by id. An earlier review of this queue raised each one. Fill',
+    ' `carried` with exactly one row per id BEFORE looking for anything new: whether the specs',
+    ' now close what was already raised is the question this review exists to answer, and an id',
+    ' you leave out stays open. `withdrawn` is there, and using it is not a defeat: a hole that',
+    ' was wrong when raised should be retracted, not carried.\n\n',
+    holes.map((row) => `- ${row.id}: ${row.hole}`).join('\n'),
+  ].join('')
+}
+
+function judgeSpecs(description, f, text, population, holes = []) {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to review')
 
@@ -4845,21 +11504,37 @@ function judgeSpecs(description, f, text, population) {
   const collided = collisions(
     specs.map((x) => specTask(x, readFileSync(join(QUEUE_DIR, x), 'utf8'))))
   sayCollisions(collided)
+  const ledger = specsPlanningLedger(specs)
 
-  const r = agent('plan-reviewer', [
+  const planReviewPrompt = [
     'Judge these task specs. There is no code for them yet: you are judging the split and its',
     ' coverage. They are already on disk and will be built as they stand unless you name a hole.',
     '\n\nRequest they are meant to satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they will run:\n\n' + bodies,
+    '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',
+    ' reliable complete delivery is an `unverifiable` hole; the engine will separately enforce',
+    ' its structural and sensitive-work floor when the executor starts.',
     '\n\nThese were written by hand, so there is no separate coverage mapping: each spec\'s',
     ' "## Must cover" block is its coverage claim, and a spec with no such block is claiming',
     ' nothing.',
+    '\n\nEngine-owned relation ledger. For hand-edited specs each case is conservatively linked',
+    ' to every Done when item in its task. Return exactly one `relations` row for every id:',
+    '\n\n' + JSON.stringify(ledger.relations, null, 2),
     populationBlock(population),
     collisionBlock(collided),
+    carriedHolesBlock(holes),
     '\n\nFill only the slots that apply; every slot you leave empty is your approval of that',
     ' dimension.',
-  ].join(''), SCHEMA.planReview, f)
+  ].join('')
+  const { value: r } = planningCanonicalCall(
+    'plan-reviewer', planReviewPrompt, SCHEMA.planReview, f, (value) => {
+      const issue = planRelationIssue(ledger, value.relations)
+      if (issue) schemaFailure('plan-reviewer', '$.relations', issue, value)
+      const carriedIssue = carriedHolesIssue(value.carried, holes)
+      if (carriedIssue) schemaFailure('plan-reviewer', '$.carried', carriedIssue, value)
+    })
 
   // The four other slots are built BEFORE the question is raised, so a verdict that stopped
   // the run still shows what else it found. It was paid for either way: the same call fills
@@ -4867,11 +11542,22 @@ function judgeSpecs(description, f, text, population) {
   // reordering and nothing else — the run still stops, because a fix written under an
   // unsettled question is a guess.
   const problems = [
+    ...r.relations.filter((row) => row.state === 'uncovered')
+      .map((row) => `uncovered relation [${row.id}] — ${row.evidence}`),
     ...(r.uncovered || []).map((x) => `uncovered — ${x}`),
     ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
     ...(r.misordered || []).map((x) => `misordered — ${x}`),
     ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+    // An earlier hole still open is a hole, whatever else this review found or did not.
+    ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
+      const hole = holes.find((h) => h.id === row.id)?.hole || row.id
+      return `still open [${row.id}] — ${hole} — ${row.evidence}`
+    }),
   ]
+  const settled = (r.carried || []).filter((row) => row.state !== 'open')
+  if (settled.length) {
+    say(`  earlier holes settled: ${settled.map((row) => `${row.id} ${row.state}`).join(', ')}`)
+  }
 
   if (r.undecidable?.length) {
     die(`the request itself does not settle:\n\n  - ${r.undecidable.join('\n  - ')}\n\n` +
@@ -4888,10 +11574,40 @@ function judgeSpecs(description, f, text, population) {
 // Approving the specs is exactly what the flag was waiting for, so this is where it flips.
 // No `--force` on `build` does this job: a flag that bypasses a gate is the one that gets
 // typed reflexively, whereas the cheap path here is also the correct one.
-function approveSpecs(specs) {
-  if (existsSync(PLAN)) {
+function ticketReviewRecord(description, specs, population, risk) {
+  const record = populationPlanRecord(population)
+  return withApprovedDigests([
+    '---',
+    'approved: true',
+    `population_state: ${record.state}`,
+    `population_returned: ${record.returned}`,
+    `population_repaired: ${record.repaired}`,
+    `population_dropped: ${record.dropped}`,
+    `population_retained: ${record.retained}`,
+    `population_witness_withdrawn: ${record.witness_withdrawn}`,
+    `population_digest: ${record.digest}`,
+    ...(risk ? Object.entries(riskPlanFields(risk)).map(([name, value]) => `${name}: ${value}`) : []),
+    '---', '',
+    '# Reviewed ticket queue', '',
+    'Written by `caw.mjs` after `review-specs` approved a queue supplied without a generated',
+    'plan. It records the request and exact spec digests that were judged; it does not claim',
+    'that CAW generated the tickets.', '',
+    '## Request', '', description, '',
+    ...(risk ? [
+      '## Project risk attestation', '',
+      '```json', JSON.stringify(risk, null, 2), '```', '',
+    ] : []),
+  ].join('\n'), specs)
+}
+
+function approveSpecs(specs, description, population, risk) {
+  if (!existsSync(PLAN)) {
+    writeFileSync(PLAN, ticketReviewRecord(description, specs, population, risk))
+    say(`\n  ${PLAN} — review recorded. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
+  } else {
     const before = readFileSync(PLAN, 'utf8')
-    if (/^approved:\s*false\s*$/m.test(before)) {
+    let approved = before
+    if (/^approved:\s*false\s*$/m.test(approved)) {
       // The holes leave with the flag they were holding down. A plan reading `approved:
       // true` while still listing what it was stopped on cannot be told apart from one a
       // hand flipped — and telling those apart is what build() does with exactly this
@@ -4900,21 +11616,307 @@ function approveSpecs(specs) {
       // Recorded here because this is the only moment anything knows which bytes were judged, and
       // the queue is deleted spec by spec after it. `build` compares against this; a plan approved
       // before the section existed simply has none, and is read as silence rather than tampering.
-      const judged = specs.map((s) => `- ${s}  ${specDigest(readFileSync(join(QUEUE_DIR, s), 'utf8'))}`)
-      const flipped = before
+      approved = approved
         .replace(/^approved:\s*false\s*$/m, 'approved: true')
         .replace(/\n## Undecidable[\s\S]*?(?=\n## |$)/, '\n')
         .replace(/\n## Unclosed[\s\S]*$/, '\n')
-        .split(APPROVED_HEAD)[0].trimEnd()
-      writeFileSync(PLAN, `${flipped}\n\n${APPROVED_HEAD}\n\n${judged.join('\n')}\n`)
-      // What was judged is the specs on disk. Nothing compared them to the task list inside
-      // PLAN.md, so a spec deleted by hand or added by one leaves the flag saying more than
-      // was checked.
-      say(`\n  ${PLAN} — approved: true. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
     }
+    writeFileSync(PLAN, withApprovedDigests(approved, specs))
+    // What was judged is the specs on disk. Nothing compares them to the task list inside
+    // PLAN.md; the digest section therefore records additions and byte changes directly.
+    say(`\n  ${PLAN} — approved: true. Judged: the ${specs.length} spec(s) in .caw-tasks/`)
   }
   say(`\n${specs.length} spec(s), no holes. Ready for: node caw.mjs build`)
   say(`  spent ${formatAccounting(accounting)}`)
+}
+
+const HUMAN_REVIEW_MAX = 1024 * 1024
+
+function exactObject(value, keys, where) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) die(`${where} must be an object`)
+  const extra = Object.keys(value).filter((key) => !keys.includes(key))
+  const missing = keys.filter((key) => !Object.prototype.hasOwnProperty.call(value, key))
+  if (extra.length || missing.length) {
+    die(`${where} is malformed${extra.length ? `; unknown ${extra.join(', ')}` : ''}` +
+      `${missing.length ? `; missing ${missing.join(', ')}` : ''}`)
+  }
+}
+
+function planningLedgerFromArtifact(text) {
+  const encoded = text.match(/## Planning relation ledger[\s\S]*?```json\n([\s\S]*?)\n```/)?.[1]
+  if (!encoded) die(`${PLAN} has no readable planning relation ledger`)
+  try { return JSON.parse(encoded) }
+  catch (error) { die(`${PLAN} planning relation ledger is invalid: ${error?.message || error}`) }
+}
+
+function humanReviewSigners(f) {
+  const configured = f.human_review_allowed_signers
+  if (!configured || isAbsolute(configured) || configured.split(/[\\/]+/).includes('..')) {
+    die('.caw/CAW.md human_review_allowed_signers must name a repository-relative allowed-signers file')
+  }
+  const root = realpathSync('.')
+  const candidate = resolve(root, configured)
+  try {
+    const stat = lstatSync(candidate)
+    if (!inside(root, candidate) || !stat.isFile() || stat.isSymbolicLink()) throw new Error('not regular')
+  } catch {
+    die(`human review allowed-signers file is missing or unsafe: ${configured}`)
+  }
+  return candidate
+}
+
+function writeHumanReviewTemplate(name, value) {
+  mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
+  const path = join(LOG_DIR, name)
+  writePrivateFile(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`), HUMAN_REVIEW_MAX)
+  say(`wrote ${path}`)
+  say(`fill every evidence field, then sign the exact file bytes:`)
+  say(`  ssh-keygen -Y sign -f <private-key> -n caw-review ${path}`)
+  say(`accept it with:`)
+  say(`  node caw.mjs human-review accept ${path} ${path}.sig`)
+}
+
+// Sign the task text and resolved policy contract, not just ordinal criterion ids.
+function humanTaskContract(file, spec) {
+  const topology = extractTaskTopology(spec)
+  const reviewPolicy = runProjectPolicy('review', {
+    spec, files: changedFiles(), criteria: topology.criteria,
+  })
+  const projectCriteria = (reviewPolicy?.output.criteria || []).map((item) => ({
+    ...item, id: `project:${reviewPolicy.policy.id}:${item.id}`, section: `Project: ${item.section}`,
+  }))
+  const acceptancePolicy = runProjectPolicy('acceptance', {
+    task: file, criteria: topology.criteria, surfaces: topology.surfaces,
+    transitions: topology.transitions,
+  })
+  const acceptanceCases = acceptancePolicy?.output.cases || []
+  const contractDigest = createHash('sha256').update(stableJson({
+    spec, topology, projectCriteria, acceptanceCases,
+  })).digest('hex')
+  return { topology, projectCriteria, acceptanceCases, contractDigest }
+}
+
+function prepareHumanReview(args) {
+  const [scope, targetOrIdentity, maybeIdentity] = args
+  const { f } = profile()
+  humanReviewSigners(f)
+  if (scope === 'plan') {
+    const identity = targetOrIdentity
+    if (f.planning_independence !== 'human-review') {
+      die('planning_independence is not human-review')
+    }
+    if (!identity || /[\r\n]/.test(identity) || !existsSync(PLAN)) {
+      die('usage: caw.mjs human-review prepare plan <identity>')
+    }
+    const text = readFileSync(PLAN, 'utf8')
+    const ledger = planningLedgerFromArtifact(text)
+    writeHumanReviewTemplate('human-review-plan.json', {
+      version: 1, scope: 'plan', identity, target: PLAN,
+      artifact_digest: createHash('sha256').update(text).digest('hex'),
+      decision: 'approve', statement: '',
+      relations: ledger.relations.map((relation) => ({
+        id: relation.id, state: 'covered', evidence: '',
+      })),
+    })
+    return
+  }
+  if (scope !== 'task') die('human-review scope must be plan or task')
+  const file = targetOrIdentity?.replace(/^(?:\.\/)?(?:\.caw-tasks\/)?/, '')
+  const identity = maybeIdentity
+  if (f.task_independence !== 'human-review') die('task_independence is not human-review')
+  if (!file || !identity || /[\r\n]/.test(identity) || !specFiles().includes(file)) {
+    die('usage: caw.mjs human-review prepare task <spec> <identity>')
+  }
+  if (!changedFiles().length) die('the delivery tree is clean — there is no task delivery to review')
+  const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
+  const { topology, projectCriteria, contractDigest } = humanTaskContract(file, spec)
+  const coreCriteria = topology.criteria
+  const resume = readRoundState(file)
+  writeHumanReviewTemplate(`human-review-${taskArtifactBase(file)}.json`, {
+    version: 3, scope: 'task', identity, target: file,
+    contract_digest: contractDigest,
+    artifact_digest: deliveryDigest(), decision: 'approve', statement: '',
+    criteria: [...coreCriteria, ...projectCriteria].map((criterion) => ({
+      id: criterion.id, state: 'met', evidence: '', evidence_refs: [],
+    })),
+    carried: openItems(resume?.history || []).map((item) => ({
+      id: item.id, state: 'closed', evidence: '', evidence_refs: [],
+    })),
+  })
+}
+
+function readSignedHumanReview(attestationPath, signaturePath, f) {
+  let bytes, value, signature
+  try {
+    const stat = lstatSync(attestationPath)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > HUMAN_REVIEW_MAX) throw new Error('unsafe')
+    bytes = readFileSync(attestationPath)
+    value = JSON.parse(bytes.toString('utf8'))
+    if (typeof value.identity !== 'string' || !value.identity || value.identity.length > 256 ||
+        /[\r\n]/.test(value.identity)) throw new Error('identity is invalid')
+    const signatureStat = lstatSync(signaturePath)
+    if (!signatureStat.isFile() || signatureStat.isSymbolicLink() ||
+        signatureStat.size > HUMAN_REVIEW_MAX) throw new Error('signature is unsafe')
+    signature = readFileSync(signaturePath)
+  } catch (error) { die(`cannot read human review attestation: ${error?.message || error}`) }
+  const signers = humanReviewSigners(f)
+  const verify = spawnSync(process.env.CAW_SSH_KEYGEN || 'ssh-keygen',
+    ['-Y', 'verify', '-f', signers, '-I', value.identity || '', '-n', 'caw-review', '-s', signaturePath],
+    { input: bytes, encoding: 'utf8', timeout: 10000 })
+  if (verify.error || verify.status !== 0) {
+    die(`human review signature is invalid: ${verify.error?.message || verify.stderr || verify.stdout}`)
+  }
+  return { value, bytes, signature }
+}
+
+function retainHumanReview(value, bytes, signature) {
+  const root = resolve(execFileSync('git', ['rev-parse', '--git-path', 'caw/human-reviews'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim())
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  writePrivateFile(join(root, `${digest}.json`), bytes, HUMAN_REVIEW_MAX)
+  writePrivateFile(join(root, `${digest}.sig`), signature, HUMAN_REVIEW_MAX)
+  return { identity: value.identity, attestation_digest: digest,
+    signature_digest: createHash('sha256').update(signature).digest('hex') }
+}
+
+function acceptHumanReview(attestationPath, signaturePath) {
+  if (!attestationPath || !signaturePath) {
+    die('usage: caw.mjs human-review accept <attestation.json> <attestation.json.sig>')
+  }
+  const { f } = profile()
+  const signed = readSignedHumanReview(attestationPath, signaturePath, f)
+  const a = signed.value
+  if (a.scope === 'plan') {
+    exactObject(a, ['version', 'scope', 'identity', 'target', 'artifact_digest', 'decision',
+      'statement', 'relations'], 'human plan review')
+    if (a.version !== 1 || a.target !== PLAN || a.decision !== 'approve' || !a.statement?.trim()) {
+      die('human plan review must be version 1, approve PLAN.md, and contain a statement')
+    }
+    if (f.planning_independence !== 'human-review') die('planning_independence is not human-review')
+    const text = readFileSync(PLAN, 'utf8')
+    if (createHash('sha256').update(text).digest('hex') !== a.artifact_digest) {
+      die('PLAN.md changed after the human attestation was prepared')
+    }
+    for (const [index, row] of (a.relations || []).entries()) {
+      exactObject(row, ['id', 'state', 'evidence'], `human plan review relations[${index}]`)
+    }
+    const issue = planRelationIssue(planningLedgerFromArtifact(text), a.relations)
+    if (issue || a.relations.some((row) => row.state !== 'covered')) {
+      die(`human plan review does not approve every relation${issue ? `: ${issue}` : ''}`)
+    }
+    retainHumanReview(a, signed.bytes, signed.signature)
+    const approved = text.replace(/^approved:\s*false\s*$/m, 'approved: true')
+      .replace(/\n## Unclosed — this plan was NOT approved[\s\S]*$/, '\n')
+    writeFileSync(PLAN, approved)
+    say(`${PLAN} approved by signed human review from ${a.identity}`)
+    return
+  }
+  exactObject(a, ['version', 'scope', 'identity', 'target', 'artifact_digest', 'decision',
+    'statement', 'contract_digest', 'criteria', 'carried'], 'human task review')
+  if (a.version !== 3 || a.scope !== 'task' || a.decision !== 'approve' || !a.statement?.trim()) {
+    die('human task review must be version 3, approve one task, and contain a statement')
+  }
+  if (f.task_independence !== 'human-review') die('task_independence is not human-review')
+  const file = a.target
+  requireTaskBranch(f)
+  if (!specFiles().includes(file) || !changedFiles().length) die('human-reviewed task is not pending')
+  const digest = deliveryDigest()
+  if (digest !== a.artifact_digest) die('task delivery changed after the human attestation was prepared')
+  const { risk, fullGateBaseline } = prepareTaskReviewRisk(f)
+  const spec = readFileSync(join(QUEUE_DIR, file), 'utf8')
+  const { topology, projectCriteria, acceptanceCases, contractDigest } = humanTaskContract(file, spec)
+  if (contractDigest !== a.contract_digest) {
+    die('task contract changed after the human attestation was prepared; prepare and sign it again')
+  }
+  const coreCriteria = topology.criteria
+  const gateContext = {
+    task: file, kind: 'fast', deliveryDigest: digest, criteria: coreCriteria, acceptanceCases,
+  }
+  let taskGate
+  let confirmationRuns = 0
+  let projectGateRetries = 0
+  let gateRedAttempts = 0
+  for (;;) {
+    taskGate = gate(f.gate_fast, file, undefined, f.gate_fast_timeout_ms, gateContext)
+    if (deliveryDigest() !== digest) {
+      die(`${file} — the fast gate changed the signed delivery tree; refusing acceptance`)
+    }
+    const policy = taskGatePolicy(file, f, taskGate, 0, confirmationRuns, projectGateRetries)
+    if (policy?.output.action === 'stop') {
+      die(`${file} — project gate policy ${policy.policy.id} stopped the run: ${policy.output.reason.trim()}`)
+    }
+    if (taskGate.ok) break
+    if (taskGate.state === 'red') {
+      gateRedAttempts++
+      if (decideGateFailure({ reviewOnly: true, confirmationRuns, executorRetries: 0, maxExecutorRetries: 0 }) ===
+          GateFailureAction.confirm) {
+        confirmationRuns++
+        continue
+      }
+      if (policy?.output.action === 'retry' && projectGateRetries < PROJECT_GATE_RETRIES_MAX) {
+        projectGateRetries++
+        confirmationRuns++
+        continue
+      }
+    }
+    die(`${file} — human-reviewed delivery has no current green gate (${taskGate.state})`)
+  }
+  const verdict = { criteria: a.criteria, carried: a.carried, broken: [], uncovered: [], weak: [], noted: [] }
+  for (const [index, row] of (a.criteria || []).entries()) {
+    exactObject(row, ['id', 'state', 'evidence', 'evidence_refs'], `human task review criteria[${index}]`)
+    if (!['met', 'broken', 'uncovered', 'weak'].includes(row.state)) {
+      die(`human task review criteria[${index}] has an invalid state`)
+    }
+  }
+  for (const [index, row] of (a.carried || []).entries()) {
+    exactObject(row, ['id', 'state', 'evidence', 'evidence_refs'], `human task review carried[${index}]`)
+    if (!['closed', 'open', 'withdrawn'].includes(row.state)) {
+      die(`human task review carried[${index}] has an invalid state`)
+    }
+  }
+  const criteriaIssue = reviewCriteriaIssue(spec, a.criteria, verdict, projectCriteria)
+  normalizePropertyKeys(verdict)
+  const contractIssue = criteriaIssue ? null : reviewContractIssue(verdict, {
+    criteria: [...coreCriteria, ...projectCriteria], surfaces: topology.surfaces,
+    transitions: topology.transitions, receipt: taskGate.receipt,
+  })
+  if (criteriaIssue || contractIssue || a.criteria.some((row) => row.state !== 'met')) {
+    die(`human task review does not approve every criterion${
+      criteriaIssue ? `: ${criteriaIssue}` : contractIssue ? `: ${contractIssue}` : ''}`)
+  }
+  const resume = readRoundState(file)
+  const history = resume?.history || []
+  validateCarriedSet(a.carried, openItems(history))
+  if (a.carried.some((row) => row.state === 'open' || !row.evidence.trim())) {
+    die('human task review must settle and evidence every carried item')
+  }
+  const authorRuntime = [...(resume?.runtime_history || [])].reverse()
+    .find((entry) => entry.role === 'executor') || null
+  requireTaskReviewIndependence(f, authorRuntime)
+  adjudicate(history, a.carried)
+  const human = { kind: 'human', ...retainHumanReview(a, signed.bytes, signed.signature) }
+  const round = (resume?.round || 0) + 1
+  const certification = recordTaskCertification({
+    task: file, round, criteria: a.criteria, open: openItems(history),
+    author: authorRuntime,
+    reviewer: human, reviewSurface: null, reviewBaseline: null,
+    weakVerification: resume?.weak_verification || null,
+    gateReceipt: taskGate.receipt,
+    acceptanceCases,
+    executorClaims: resume?.ex?.claims || [],
+    topology,
+  })
+  commit(file, spec, resume?.ex || null, f, round, gateRedAttempts, 'human', [], digest, certification)
+  finishReviewedTask(f, risk, fullGateBaseline)
+}
+
+function humanReview(args) {
+  const [action, ...rest] = args
+  if (action === 'prepare') return prepareHumanReview(rest)
+  if (action === 'accept') return acceptHumanReview(...rest)
+  die('usage: caw.mjs human-review prepare plan <identity> | prepare task <spec> <identity> | accept <json> <sig>')
 }
 
 function probeProvider(providerId) {
@@ -5102,13 +12104,67 @@ function probeProvider(providerId) {
       ...(reason ? { reason } : {}),
     }
     const path = writeProbeAttestation(providerId, attestation)
-    rmSync(parent, { recursive: true, force: true })
+    removeTree(parent)
     const summary = probeReasonSummary(reason)
     say(`${entry.probe.id}: ${green ? 'green' : 'unavailable'}${summary ? ` — ${summary}` : ''} — ${path}`)
   }
   if (!allGreen) {
     process.exitCode = 1
     say(`${providerId} remains unavailable for at least one configured role; no guarantee was weakened.`)
+  }
+}
+
+function smokeRoles(target) {
+  if (!target || (target !== 'all' && !ROLES.includes(target))) {
+    die(`usage: caw.mjs smoke <all|${ROLES.join('|')}>`)
+  }
+  const { f } = profile(false)
+  resolvedRuntime = loadRuntime(f)
+  preflightRuntime(f, true)
+  setProviderBudgetPhase('smoke')
+  const selected = target === 'all' ? ROLES : [target]
+  const schema = closeSchema({
+    type: 'object',
+    properties: { marker: { type: 'string', enum: ['caw-role-smoke'] } },
+    required: ['marker'],
+  })
+  for (const role of selected) {
+    const before = deliveryDigest()
+    const surface = createReviewSurface(f)
+    let value
+    try {
+      const reviewer = role === 'reviewer'
+      value = agent(role,
+        'Role smoke only. Read README.md, make no project change, and return marker ' +
+          '`caw-role-smoke` exactly. This validates the configured model and reasoning path.',
+        schema, f, null, {
+          workingRoot: surface.workingRoot,
+          scratchRoot: surface.scratchRoot,
+          surfaceId: surface.parent.split(/[\\/]/).pop(),
+          deniedReadPaths: surface.deniedReadPaths,
+          ...(reviewer ? { writeBoundary: {
+            kind: REVIEW_WRITE_BOUNDARY,
+            readOnlyDependencyRoots: [],
+          } } : {}),
+        })
+    } finally {
+      removeReviewSurface(surface)
+    }
+    if (value.marker !== 'caw-role-smoke' || deliveryDigest() !== before) {
+      die(`${role} smoke did not preserve the delivery tree`)
+    }
+    const binding = resolvedRuntime.value.roles[role]
+    const provider = resolvedRuntime.providers.get(binding.provider)
+    const runtime = runtimeIdentity(value)
+    const path = writeRoleSmoke(role, {
+      ...roleSmokeKey(role, binding, provider),
+      green: true,
+      created_at: new Date().toISOString(),
+      requested_native: runtime?.requested?.native || null,
+      observed_models: runtime?.models || [],
+      delivery_digest: before,
+    })
+    say(`${role}: green — ${path}`)
   }
 }
 
@@ -5128,7 +12184,21 @@ function artifacts(args) {
       ? readdirSync(ADAPTER_TRANSPORT_PARENT).filter((name) => adapterTransportPath(name))
         .map((name) => `transports/${name}`).sort()
       : []
-    say(`artifacts:\n${[...local, ...probes, ...surfaces, ...transports]
+    // Listed, because a record nobody is told about is one nobody reads: the failure prints its
+    // own path when it happens, and that terminal is gone by the time anyone asks. Not
+    // purgeable here, for the same reason the task audit is not — it is the durable record, and
+    // in the failure case it is the only copy of the spec or request the run was about.
+    let failures = []
+    for (const directory of ['contract-failures', 'executor-stops']) {
+      try {
+        const root = gitPrivatePath('caw', directory)
+        if (existsSync(root)) {
+          failures.push(...readdirSync(root).filter((name) => name.endsWith('.json'))
+            .map((name) => `${directory}/${name}`).sort())
+        }
+      } catch { /* outside a repository there is no private path to read */ }
+    }
+    say(`artifacts:\n${[...local, ...probes, ...surfaces, ...transports, ...failures]
       .map((name) => `  ${name}`).join('\n') || '  (none)'}`)
     return
   }
@@ -5142,7 +12212,7 @@ function artifacts(args) {
     if (!path || !existsSync(path) || !inside(realpathSync(root), realpathSync(path))) {
       die(`no retained probe evidence matches ${provider}`)
     }
-    rmSync(path, { recursive: true, force: true })
+    removeTree(path)
     say(`purged probes/${provider}`)
     return
   }
@@ -5168,7 +12238,9 @@ function artifacts(args) {
   }
   const runPath = join(LOG_DIR, target)
   if (target.startsWith('run-') && existsSync(runPath) && inside(resolve(LOG_DIR), resolve(runPath))) {
-    rmSync(runPath, { recursive: true, force: true })
+    try { exportRunMetrics(runPath) }
+    catch (error) { die(`could not export compact metrics before purging ${target}: ${error?.message || error}`) }
+    removeTree(runPath)
     say(`purged ${target}`)
     return
   }
@@ -5176,7 +12248,7 @@ function artifacts(args) {
   if (target.startsWith('surface-') && existsSync(surfacePath)) {
     const parent = realpathSync(REVIEW_SURFACE_PARENT)
     if (!inside(parent, realpathSync(surfacePath))) die(`refusing surface outside retention parent: ${target}`)
-    rmSync(surfacePath, { recursive: true, force: true })
+    removeTree(surfacePath)
     say(`purged ${target}`)
     return
   }
@@ -5198,6 +12270,7 @@ function artifacts(args) {
 
 async function main() {
 const [cmd, ...rest] = process.argv.slice(2)
+providerBudgetState.command = cmd || null
 const noFull = rest.includes('--no-full')
 const arg = rest.filter((x) => !x.startsWith('--')).join(' ')
 // Reading what this tool is cannot depend on the matrix being usable — the same rule that puts
@@ -5209,21 +12282,28 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
 
   caw.mjs plan "<description>"            architect + reviewers -> specs in ${QUEUE_DIR}/
   caw.mjs build [--no-full]               each spec: executor -> fast gate -> reviewer
+  caw.mjs autopilot [--no-full]           build, answering the stops whose answer is not in doubt
   caw.mjs ship "<description>"            both, without stopping to show you the plan
   caw.mjs review-specs "<description>"    judge hand-written specs in ${QUEUE_DIR}/
   caw.mjs round <NNN_slug.md>             one more review round on a stopped task
   caw.mjs review <NNN_slug.md>            review a task finished by hand, and commit
   caw.mjs done <NNN_slug.md>              remove a spec with no review at all
   caw.mjs probe <provider>                refresh machine-local live evidence
+  caw.mjs smoke <role|all>                verify exact model/reasoning role bindings
+  caw.mjs human-review prepare|accept ... signed human planning or task review
+  caw.mjs verify-project                  validate configured project policies
   caw.mjs artifacts list|purge <id>       inspect or remove retained artifacts
 
 Every pipeline command refuses until all five roles resolve and carry current green probe
 evidence. Run \`caw.mjs probe <provider>\` on the machine that will execute it.`
 
-const KNOWN = ['plan', 'build', 'ship', 'review-specs', 'round', 'review', 'done', 'probe',
-  'artifacts']
+const KNOWN = ['plan', 'build', 'autopilot', 'ship', 'review-specs', 'round', 'review', 'done', 'probe', 'smoke',
+  'human-review',
+  'verify-project', 'artifacts']
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { say(USAGE); return }
 if (cmd === '--version' || cmd === '-v') { say(VERSION); return }
+// Internal: the executor's gate broker, started by the engine itself beside an executor call.
+if (cmd === '__gate-broker') { runGateBroker(rest[0]); return }
 if (!KNOWN.includes(cmd)) die(`unknown command: ${cmd}\n\n${USAGE}`)
 
 // Recovery precedes every refusal. These sweeps need neither a usable runtime nor role guarantees,
@@ -5236,8 +12316,18 @@ pruneInvocationScratch()
 // valid binding and target CLI, but deliberately reaches probeProvider before role guarantees are
 // compared: repairing the matrix cannot depend on the matrix already being usable.
 if (cmd === 'artifacts') { artifacts(rest); return }
+if (cmd === 'verify-project') {
+  try { projectPolicySet = readProjectPolicies() }
+  catch (error) { die(error?.message || String(error)) }
+  verifyProjectPolicies(projectPolicySet)
+  return
+}
 await discoverAdapters()
 if (cmd === 'probe') { probeProvider(rest[0]); return }
+if (cmd === 'smoke') { smokeRoles(rest[0]); return }
+try { projectPolicySet = readProjectPolicies() }
+catch (error) { die(error?.message || String(error)) }
+if (cmd === 'human-review') { humanReview(rest); return }
 // Pipeline and queue commands retain the all-five preflight selected in slice 2.1.
 profile()
 
@@ -5249,12 +12339,19 @@ if (AGENT_TIMEOUT_MS !== AGENT_TIMEOUT_DEFAULT_MS) {
       `(default ${formatTimeout(AGENT_TIMEOUT_DEFAULT_MS)})`)
 }
 
-if (cmd === 'plan') { if (!arg) die('plan needs a description'); plan(arg) }
+if (cmd === 'plan') { if (!arg) die('plan needs a description'); activeRequest = arg; plan(arg) }
 else if (cmd === 'build') build(noFull)
-else if (cmd === 'ship') { if (!arg) die('ship needs a description'); plan(arg); build(noFull) }
+else if (cmd === 'autopilot') runAutopilot(noFull)
+else if (cmd === 'ship') {
+  if (!arg) die('ship needs a description')
+  activeRequest = arg
+  plan(arg)
+  build(noFull)
+}
 else if (cmd === 'round' || cmd === 'review') resumeTask(cmd, arg)
 else if (cmd === 'review-specs') {
   if (!arg) die('review-specs needs the request the specs are meant to satisfy')
+  activeRequest = arg
   reviewSpecs(arg, rest.includes('--no-fix'))
 }
 else if (cmd === 'done') {
@@ -5300,17 +12397,44 @@ else if (cmd === 'done') {
       unlinkSync(PLAN)
       say(`  cleared ${PLAN} — the queue it planned is empty`)
     }
+    clearRiskRecord()
   }
 }
 else die(USAGE)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => die(error?.message || String(error)))
+  main().catch((error) => {
+    // The single place a contract failure actually ends a run: planningCanonicalCall throws
+    // here after its repair, the reviewer loop reaches here through schemaFailure once its
+    // semantic repair is spent, and a role with no repair at all — the executor — arrives
+    // directly. Recording once, here, is what keeps one failure from being written twice.
+    const record = recordContractFailure(error)
+    if (record) {
+      console.error(`\ncaw: the role contract failure is retained at ${record}`)
+      console.error('  It carries the spec, the rejected value and the runtime that produced it,')
+      console.error('  because the commit that would have carried them never happened.')
+    }
+    die(error?.message || String(error))
+  })
 }
 
 export {
-  SCHEMA, addAccounting, deltaAccounting, formatAccounting, normalizeAccounting,
-  populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource, roleGuaranteeMismatch,
-  retainWeakVerificationEvents, zeroAccounting,
+  decideAutopilot,
+  GateFailureAction, PlanningAction, SCHEMA, addAccounting, adapterImplementationDigest,
+  buildTaskDossier,
+  canonicalAuthorityPaths, compactRunMetrics,
+  collectGateEvidence, retainGateEvidence,
+  decideGateFailure, decidePlanningAction, deltaAccounting, executorClaimsIssue,
+  effectiveExecutorBudgetClass, executorBudgetFloor, executorBudgetForSpec,
+  extractReviewCriteria, formatAccounting,
+  extractTaskTopology, groupFindings, mergeReviewPasses, normalizeAccounting, planRelationIssue, planningLedger,
+  reviewContractIssue, reviewCriteriaIssue,
+  populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
+  resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
+  retainWeakVerificationEvents,
+  boundedUtf8HeadTail, expiredCredentials, normalizePropertyKeys, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
+  requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
+  taskEvidenceLifecycleBlock, taskKey,
+  verifyProjectPolicies, zeroAccounting,
 }

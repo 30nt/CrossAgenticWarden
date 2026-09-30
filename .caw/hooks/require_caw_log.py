@@ -34,7 +34,7 @@ KEEP = 20
 # `review\b` would already match `review-specs`; both are spelled out so that reading this line
 # tells you which subcommands exist rather than which prefixes happen to collide.
 RUN = re.compile(
-    r"^node(?:\.exe)?\s+\S*caw\.mjs\s+(?:plan|build|review-specs|review|round|ship)\b"
+    r"^node(?:\.exe)?\s+\S*caw\.mjs\s+(?:plan|build|autopilot|review-specs|review|round|ship)\b"
 )
 SEGMENT = re.compile(r"[;&|\n]+")
 

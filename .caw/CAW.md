@@ -8,25 +8,102 @@ main_branch: main
 # Two conventions, both explained in docs/gate.md: exit 75 when the gate REFUSES to start
 # rather than fails, and read CAW_SPEC when the gate looks at .caw-tasks/ at all.
 gate_fast: npm test
+# Optional positive milliseconds. Empty means no engine timeout.
+gate_fast_timeout_ms:
+
+# Optional queue-level suite, run once after all task commits and before gate_full.
+# Put broad unit tests here when gate_fast contains focused checks only.
+gate_batch:
+gate_batch_timeout_ms:
 
 # Run once, at the end of a build. Leave empty when it is the same as gate_fast.
 gate_full:
+gate_full_timeout_ms:
 
-# Optional. Prints this project's CLOSED sets — the ones a script can list in full and a
+# Optional live Codex executor caps. The runner interrupts the provider as soon as either
+# observed boundary is reached. Empty leaves that dimension uncapped.
+executor_max_tool_events:
+executor_max_event_bytes:
+
+# Adaptive executor budgets. Configure all six or leave all six empty. New planning writes
+# an executor_budget class into every task; old or hand-written specs default to normal. The
+# engine raises database/security work and indivisible multi-surface tasks to large. These fields
+# cannot be combined with the two static limits above.
+executor_budget_small_tool_events: 120
+executor_budget_small_event_bytes: 1048576
+executor_budget_normal_tool_events: 180
+executor_budget_normal_event_bytes: 2097152
+executor_budget_large_tool_events: 260
+executor_budget_large_event_bytes: 4194304
+
+# When true, a refused or timed-out task gate receives one advisory reviewer pass. That pass
+# records findings but can never certify or commit the delivery.
+gate_unavailable_review: false
+
+# Optional strict weak verification. Configure both fields or leave both empty.
+# The source probe must print only {"loaded_paths":["/absolute/path", ...]} to stdout.
+# The positive control must change a tracked file so gate_fast becomes red.
+# Both commands run only in the isolated review surface.
+weak_source_probe_cmd:
+weak_positive_control_cmd:
+
+# Optional. Returns this project's CLOSED sets — the ones a script can list in full and a
 # model can only sample: every member of an enum, every caller, every migration, every
-# numbered section of a spec against the files citing it. Its stdout is handed to the
-# enumerator and to no other role. Leave empty and nothing changes.
+# numbered section of a spec against the files citing it. json-v1 is rendered and handed to
+# the enumerator and to no other role. Leave the command empty and nothing changes.
 # Whatever you write here must be verified against a count taken another way before you
 # trust it: on one project the obvious pattern for "every route" returned 22 of 90.
 index_cmd:
+# New profiles use strict, versioned JSON. Profiles without this field retain legacy text-v0.
+index_format: json-v1
+# Optional deterministic request-token/file index produced by the engine.
+builtin_index: request-v1
+# `planning` gives the same deterministic index to enumerator, architect, and plan-reviewer.
+index_audience: planning
 
-# Comma-separated ignored dependency roots exposed read-only inside task-review surfaces.
-# Every other ignored project path is absent there and denied through its delivery-tree path.
+# fast: existing specs -> executor -> focused gate -> reviewer.
+# standard: one enumerator/architect/plan-review pass, dynamic challengers, batch/full gates.
+# strict: bounded iterative planning and fixed challenger passes, plus batch/full gates.
+pipeline_mode: strict
+planning_max_rounds: 3
+
+# Comma-separated ignored dependency roots copied writable into task-review surfaces.
+# The delivery copies and every other ignored project path stay denied through their original path.
 review_dependency_roots:
 
 # Task specs, commit messages, notes. Stated explicitly because an agent otherwise
 # inherits whatever language preference the machine it runs on happens to carry.
 docs_language: English
+
+# Required separation between the author and reviewer bindings.
+planning_independence: same-provider
+task_independence: different-model
+# Required only when either independence mode is human-review. OpenSSH allowed-signers format.
+human_review_allowed_signers:
+
+# Blind reviewer passes after the primary pass. All passes receive the exact same delivery.
+# 1 means two total passes; allowed range is 0..2.
+review_challenger_passes: 1
+# fixed always runs the configured passes; risk adds them only for risky paths, broad changes,
+# carried findings, or a primary review that finds a blocker.
+review_challenger_policy: fixed
+review_challenger_file_threshold: 8
+
+# Require a successful role-specific provider call for the exact model/reasoning binding.
+# Run `node caw.mjs smoke all` after changing .caw/runtime.json.
+require_role_smoke: true
+
+# Provider-call budgets. Every limit is checked before a child process starts.
+# Defaults are finite; set smaller project limits here when cost needs a tighter boundary.
+budget_request_calls: 256
+budget_planning_calls: 16
+budget_task_calls: 16
+budget_unknown_cost_calls: 256
+budget_architect_calls: 128
+budget_enumerator_calls: 128
+budget_plan_reviewer_calls: 128
+budget_executor_calls: 128
+budget_reviewer_calls: 128
 ---
 
 # CAW profile

@@ -169,6 +169,18 @@ function observations(events) {
   }
 }
 
+function telemetry(stdout, events) {
+  const toolTypes = new Set([
+    'command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'tool_call', 'tool_use',
+  ])
+  return {
+    eventCount: events.length,
+    toolEventCount: events.reduce((count, event) =>
+      count + (toolTypes.has(event?.item?.type || event?.type) ? 1 : 0), 0),
+    eventBytes: Buffer.byteLength(stdout || ''),
+  }
+}
+
 function failureClass(text) {
   if (/unauthori[sz]ed|authentication|log(?:ged)? in|access token|api key|bearer|401\b/i.test(text)) {
     return 'authentication'
@@ -227,11 +239,13 @@ function createTransport(schema, authFile) {
 }
 
 export default {
-  apiVersion: 2,
+  apiVersion: 3,
   id: 'codex',
+  vendor: 'openai',
   features: {
     schemaTransport: 'file', resultTransport: 'file',
     reportsCost: false, reportsCacheCounters: true, reportsModels: false,
+    modelSelection: 'explicit-id', reasoningLevels: ['low', 'medium', 'high', 'max'],
   },
   resolveExecutable(env) { return env.CAW_CODEX || 'codex' },
   versionInvocation(executable) { return { executable, args: ['--version'] } },
@@ -345,6 +359,7 @@ export default {
         provider: 'codex',
         requested: { model: binding.model, reasoning: binding.reasoning, native: requestedNative },
         ...observations(events),
+        telemetry: telemetry(stdout, events),
         cost: null,
       },
       finalResponse: value,

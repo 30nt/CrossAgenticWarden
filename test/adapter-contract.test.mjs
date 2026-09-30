@@ -1,8 +1,10 @@
+import './isolated-tmp.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 import { SCHEMA, roleGuaranteeMismatch } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
@@ -73,6 +75,69 @@ test('every engine object schema requires every property at every nesting level'
 const descriptor = (role) => Object.fromEntries(Object.entries({
   ...expected[role], interaction: 'noninteractive', permissionEscalation: 'forbidden',
 }).map(([key, state]) => [key, { state, by: 'test' }]))
+
+test('every shipped adapter declares explicit model ids and bounded reasoning levels', () => {
+  for (const adapter of [claude, codex, third]) {
+    assert.equal(adapter.features.modelSelection, 'explicit-id')
+    assert.deepEqual(adapter.features.reasoningLevels, ['low', 'medium', 'high', 'max'])
+  }
+})
+
+test('adapter telemetry reports provider events only when the transport exposes them', () => {
+  const codexEvents = [
+    { type: 'item.completed', item: { type: 'command_execution' } },
+    { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+  const codexResult = codex.decodeSuccess(codexEvents, {
+    binding: { provider: 'codex', model: 'fixture', reasoning: 'low' },
+    requestedNative: {}, finalResponseText: '{}',
+  }).canonical
+  assert.deepEqual(codexResult.telemetry, {
+    eventCount: 2, toolEventCount: 1, eventBytes: Buffer.byteLength(codexEvents),
+  })
+
+  const claudeResult = claude.decodeSuccess(JSON.stringify({
+    structured_output: {}, usage: { input_tokens: 10 }, num_turns: 3,
+  }), {
+    binding: { provider: 'claude', model: 'fixture', reasoning: 'low' },
+    requestedNative: {},
+  }).canonical
+  assert.deepEqual(claudeResult.telemetry, {
+    eventCount: null, toolEventCount: null, eventBytes: null,
+  })
+
+  const claudeEvents = [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read' }] } },
+    { type: 'result', structured_output: {}, usage: { input_tokens: 10 } },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n'
+  const streamedClaude = claude.decodeSuccess(claudeEvents, {
+    binding: { provider: 'claude', model: 'fixture', reasoning: 'low' },
+    requestedNative: {},
+  }).canonical
+  assert.deepEqual(streamedClaude.telemetry, {
+    eventCount: 2, toolEventCount: 1, eventBytes: Buffer.byteLength(claudeEvents),
+  })
+})
+
+test('Claude runner enforces its live tool-event budget', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'caw-claude-runner-budget-'))
+  const fake = join(parent, 'events.mjs')
+  writeFileSync(fake, [
+    "process.on('SIGINT', () => process.exit(130))",
+    "const event = {type:'assistant',message:{content:[{type:'tool_use',name:'Read'}]}}",
+    'for (let i = 0; i < 20; i++) console.log(JSON.stringify(event))',
+    'setTimeout(() => process.exit(0), 5000)',
+  ].join('\n'))
+  const runner = join(process.cwd(), '.caw', 'adapters', 'claude', 'runner.mjs')
+  const result = spawnSync(process.execPath, [runner, process.execPath, fake], {
+    input: '', encoding: 'utf8', timeout: 3000,
+    env: { ...process.env, CAW_EXECUTOR_MAX_TOOL_EVENTS: '3' },
+  })
+  rmSync(parent, { recursive: true, force: true })
+
+  assert.equal(result.status, 86, result.stderr)
+  assert.match(result.stderr, /CAW_EXECUTOR_BUDGET_EXHAUSTED tool-events 3\/3/)
+})
 
 test('role guarantee matcher accepts every exact cell and rejects every missing or incomparable cell', () => {
   const incompatible = {
@@ -303,10 +368,16 @@ test('planning invocations keep repository reads and shell but grant writes only
         executable: '/fixture/claude',
         execution: {
           workingRoot, scratchRoot, writeBoundary: 'delivery-tree',
-          writeBoundaryBy: 'os-boundary', deniedReadPaths: [], env: { PWD: workingRoot },
+          writeBoundaryBy: 'os-boundary', deniedReadPaths: [], env: {
+            PWD: workingRoot, CAW_EXECUTOR_MAX_TOOL_EVENTS: '120',
+          },
         },
       })
       assert.equal(grants(executorInvocation, workingRoot), true)
+      assert.equal(executorInvocation.args.some((argument) =>
+        argument.endsWith('/claude/runner.mjs')), true)
+      assert.equal(executorInvocation.args[executorInvocation.args.indexOf('--output-format') + 1],
+        'stream-json')
     }
 
     if (platform() === 'darwin' && arch() === 'arm64') {

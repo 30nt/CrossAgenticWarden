@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
-import { rmSync } from 'node:fs'
 
-const [authCopyArg, executable, ...args] = process.argv.slice(2)
-if (!authCopyArg || !executable) {
-  process.stderr.write('Codex runner requires an auth-copy marker and executable\n')
+const [executable, ...args] = process.argv.slice(2)
+if (!executable) {
+  process.stderr.write('Claude runner requires an executable\n')
   process.exit(64)
 }
 
-const authCopyPath = authCopyArg === '-' ? null : authCopyArg
 const positiveLimit = (name) => {
   const raw = process.env[name]
   if (!raw) return null
@@ -18,12 +16,6 @@ const positiveLimit = (name) => {
 }
 const toolEventLimit = positiveLimit('CAW_EXECUTOR_MAX_TOOL_EVENTS')
 const eventByteLimit = positiveLimit('CAW_EXECUTOR_MAX_EVENT_BYTES')
-const toolTypes = new Set([
-  'command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'tool_call', 'tool_use',
-])
-const removeAuthCopy = () => {
-  if (authCopyPath) rmSync(authCopyPath, { force: true })
-}
 
 const child = spawn(executable, args, {
   cwd: process.cwd(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'],
@@ -43,28 +35,28 @@ const stopForBudget = (kind, observed, limit) => {
   child.kill('SIGINT')
   hardKill = setTimeout(() => child.kill('SIGKILL'), 2000)
 }
+
 child.stdout.on('data', (chunk) => {
-  const text = chunk.toString()
-  process.stdout.write(text)
+  const body = chunk.toString()
+  process.stdout.write(body)
   eventBytes += chunk.length
   if (eventByteLimit && eventBytes > eventByteLimit) {
     stopForBudget('event-bytes', eventBytes, eventByteLimit)
   }
-  pending += text
+  pending += body
   let newline
   while ((newline = pending.indexOf('\n')) !== -1) {
     const line = pending.slice(0, newline)
     pending = pending.slice(newline + 1)
     try {
       const event = JSON.parse(line)
-      if (event?.type === 'thread.started') removeAuthCopy()
-      if (toolTypes.has(event?.item?.type || event?.type)) {
-        toolEvents += 1
-        if (toolEventLimit && toolEvents >= toolEventLimit) {
-          stopForBudget('tool-events', toolEvents, toolEventLimit)
-        }
+      const content = event?.message?.content
+      toolEvents += Array.isArray(content)
+        ? content.filter((item) => item?.type === 'tool_use').length : 0
+      if (toolEventLimit && toolEvents >= toolEventLimit) {
+        stopForBudget('tool-events', toolEvents, toolEventLimit)
       }
-    } catch { /* non-JSON diagnostics are passed through unchanged */ }
+    } catch { /* non-JSON diagnostics pass through unchanged */ }
   }
 })
 
@@ -73,13 +65,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 child.on('error', (error) => {
-  removeAuthCopy()
   process.stderr.write(`${error.message}\n`)
   process.exitCode = 127
 })
 child.on('exit', (code, signal) => {
   if (hardKill) clearTimeout(hardKill)
-  removeAuthCopy()
   if (budgetExceeded) process.exitCode = 86
   else if (signal) process.kill(process.pid, signal)
   else process.exitCode = code ?? 1

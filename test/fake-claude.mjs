@@ -4,8 +4,8 @@
 // each invocation consumes one entry, records exactly what CAW transmitted, optionally changes
 // fixture files as an executor would, and returns the requested envelope. It never uses a network.
 
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { appendFileSync, chmodSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -48,7 +48,24 @@ const belongsTo = (entry) => {
   if (role === 'plan-reviewer') return value && 'unverifiable' in value && !('carried' in value)
   return true
 }
-const selected = queue.findIndex(belongsTo)
+const semanticRepairMatch = role === 'reviewer'
+  ? input.match(/^Semantic repair (\d+) for review pass (\d+) of \d+\./)
+  : null
+const reviewPass = role === 'reviewer'
+  ? Number(semanticRepairMatch?.[2] ||
+      input.match(/(?:^|\n\n)Review pass (\d+) of \d+\./)?.[1] || 1)
+  : 1
+const semanticRepair = Number(semanticRepairMatch?.[1] || 0)
+const matching = queue.map((entry, index) => belongsTo(entry) ? index : -1).filter((index) => index >= 0)
+const exactReviewerSelection = role === 'reviewer'
+  ? queue.findIndex((entry) => belongsTo(entry) &&
+      entry.reviewPass === reviewPass && Number(entry.semanticRepair || 0) === semanticRepair)
+  : -1
+const selected = exactReviewerSelection >= 0
+  ? exactReviewerSelection
+  : role === 'reviewer' && reviewPass > 1
+    ? (matching[reviewPass - 1] ?? matching[0] ?? -1)
+    : queue.findIndex(belongsTo)
 const index = selected === -1 ? 0 : selected
 const next = queue[index]
 
@@ -60,6 +77,15 @@ if (next.probeWrites) {
   const outside = JSON.parse(match[3])
   next.writeFiles = { ...(next.writeFiles || {}), [inside]: sentinel, [outside]: sentinel }
   next.ignoreWriteErrors = true
+}
+// A reviewer is confined to its isolated surface, so its append to the calls log is denied and
+// swallowed above: the prompt CAW sent that role reaches no test through `CAW_FAKE_CALLS`.
+// Anything a test needs to assert about it has to travel back inside the verdict, which is the
+// route `probeGateArtifacts` already takes.
+if (next.echoPromptMatch) {
+  const value = next.envelope?.structured_output ?? next.structured_output ?? next
+  const found = input.match(new RegExp(next.echoPromptMatch, 'g')) || []
+  value.noted = [...(value.noted || []), `fake-prompt-echo:${JSON.stringify(found)}`]
 }
 if (next.probeReads) {
   const value = next.envelope?.structured_output ?? next.structured_output ?? next
@@ -107,6 +133,28 @@ for (const [path, body] of Object.entries(next.writeFiles || {})) {
 
 if (next.commitOwnWork) commitOwnWork(String(next.commitOwnWork))
 
+// An executor asking the engine's gate broker for a gate run, as a shell call would. Each result
+// travels back in the delivery's notes, because that is what the test can read afterwards.
+for (const probe of next.gateProbes || []) {
+  const value = next.envelope?.structured_output ?? next.structured_output
+  const command = process.env.CAW_GATE_PROBE
+  // A shell call the role gave up on: the request is filed and nobody waits for the answer.
+  if (probe.abandon) {
+    spawn(command, [], { detached: true, stdio: 'ignore' }).unref()
+    const pause = new Int32Array(new SharedArrayBuffer(4))
+    Atomics.wait(pause, 0, 0, probe.abandon)
+    continue
+  }
+  const result = command
+    ? spawnSync(command, probe.mutation ? ['--mutation', '-'] : [], {
+      input: probe.mutation ? JSON.stringify(probe.mutation) : '', encoding: 'utf8',
+    })
+    : { status: null, stdout: '', stderr: 'CAW_GATE_PROBE is not set' }
+  value.notes = [...(value.notes || []), `fake-gate-probe:${JSON.stringify({
+    status: result.status, last: `${result.stdout}${result.stderr}`.trim().split('\n').pop(),
+  })}`]
+}
+
 const canonical = next.envelope?.structured_output ?? next.structured_output
 if (role === 'reviewer' && Array.isArray(canonical?.weak)) {
   for (const [index, item] of canonical.weak.entries()) {
@@ -150,6 +198,31 @@ if (role === 'reviewer' && Array.isArray(canonical?.weak)) {
   execFileSync('git', ['reset', '--hard', 'caw-review-baseline'], {
     cwd: process.cwd(), input: '',
   })
+}
+
+// Observe real artifact reads and denied mutations through the normal provider boundary.
+if (next.probeGateArtifacts) {
+  const files = JSON.parse(input.match(/## Read-only gate artifacts:\n(\[[^\n]*\])/)[1])
+  const attempt = (action) => {
+    try { action(); return null } catch (error) { return error.code }
+  }
+  const observations = files.map((file) => {
+    const content = readFileSync(file.path)
+    return {
+      id: file.id,
+      path: file.path,
+      content: content.toString('utf8'),
+      sha256: createHash('sha256').update(content).digest('hex'),
+      chmodError: attempt(() => chmodSync(file.path, 0o600)),
+      writeError: attempt(() => writeFileSync(file.path, 'tampered')),
+      removeError: attempt(() => unlinkSync(file.path)),
+    }
+  })
+  canonical.noted.push(`fake-gate-artifacts:${JSON.stringify({
+    observations,
+    privateReadErrors: (next.privateLogPaths || []).map((path) =>
+      attempt(() => readFileSync(path))),
+  })}`)
 }
 
 // A confined reviewer cannot update the harness call log outside its surface. Return this

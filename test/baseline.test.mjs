@@ -1,3 +1,4 @@
+import './isolated-tmp.mjs'
 import test, { afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
@@ -13,6 +14,7 @@ import {
   realpathSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
@@ -20,8 +22,11 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  populationBlock, providerLaunch, resolvePopulation, resolvePopulationSource,
-  retainWeakVerificationEvents,
+  adapterImplementationDigest, expiredCredentials,
+  extractTaskTopology, groupFindings, mergeReviewPasses,
+  planningLedger, populationBlock,
+  providerLaunch, readProjectPolicies, resolvePopulation, reviewCriteriaIssue,
+  resolvePopulationSource, retainWeakVerificationEvents, taskEvidenceLifecycleBlock,
 } from '../caw.mjs'
 import claude from '../.caw/adapters/claude/adapter.mjs'
 import {
@@ -51,14 +56,14 @@ const claudeOuterProfileSkip = () => CLAUDE_OUTER_PROFILE_HOST
   : 'this host publishes no bounded Claude row: the adapter resolves no outer profile'
 const boundedSurfaceSkip = () => claudeOuterProfileSkip() || symlinkSkip()
 
-function writeFixtureAttestation(adapterDir, provider, source) {
+function writeFixtureAttestation(adapterDir, provider) {
   const probeDir = join(adapterDir, 'probes')
   mkdirSync(probeDir)
   writeFileSync(join(probeDir, 'fixture-review-boundary-v2.json'), `${JSON.stringify({
     version: 1,
     provider,
     probe_id: 'fixture-review-boundary-v2',
-    adapter_digest: createHash('sha256').update(source).digest('hex'),
+    adapter_digest: adapterImplementationDigest(adapterDir, provider),
     os: `${platform()}-${arch()}`,
     executable: realpathSync(FAKE),
     cli_version: 'fake-claude 1.0.0',
@@ -108,7 +113,7 @@ const envelope = (value, overrides = {}) => ({
   },
 })
 
-const population = (cases = []) => ({ cases })
+const population = (cases = [], requestIssues = []) => ({ cases, request_issues: requestIssues })
 const requestSource = (excerpt, occurrence = 1) => ({ kind: 'request', excerpt, occurrence })
 const plan = () => ({
   tasks: [{
@@ -117,17 +122,97 @@ const plan = () => ({
     read: ['README.md'],
     change: ['Write the fixture output.'],
     done_when: ['The fixture output exists.'],
+    gate_checks: [],
+    surfaces: [{ id: 'fixture-output', responsibility: 'The generated fixture output.' }],
+    state_machines: [{
+      surface: 'fixture-output', states: ['absent', 'present'],
+      transitions: [{ from: 'absent', event: 'write fixture', to: 'present' }],
+    }],
+    indivisible_reason: '',
+    executor_budget: 'small',
   }],
-  coverage: [{ case: 'fixture output', task: 'baseline-task' }],
+  coverage: [{
+    case: 'fixture output', task: 'baseline-task',
+    acceptance_criteria: ['The fixture output exists.'],
+  }],
   blocked: '',
   resplit: [],
 })
-const planReview = () => ({
-  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [],
+const planReview = (subject = plan()) => ({
+  relations: planningLedger(subject).relations.map(({ id }) => ({
+    id, state: 'covered', evidence: 'the linked final-tree criterion establishes the case',
+  })),
+  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [], carried: [],
 })
-const delivery = (summary) => ({ summary, notes: [], blocked: '' })
-const verdict = ({ carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) =>
-  ({ carried, broken, uncovered, weak, noted })
+const delivery = (summary, claims = [], mutations = []) => ({ summary, notes: [], claims, mutations, blocked: '' })
+const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) => {
+  const criterionRows = criteria.map((row) => ({
+    ...row, evidence_refs: row.evidence_refs || ['repository:README.md'],
+  }))
+  const decorate = (item, slot) => {
+    const criterion = criterionRows.find((row) => row.state === slot)?.id ||
+      criterionRows.find((row) => row.state !== 'met')?.id || criterionRows[0]?.id || null
+    const path = String(item.where || 'README.md').replace(/:\d.*$/, '')
+    return {
+      criterion_ids: criterion ? [criterion] : [], surface_ids: [], transition_ids: [],
+      property_key: String(item.fix || slot).toLowerCase().replace(/[^a-z0-9.-]+/g, '-')
+        .replace(/^-+|-+$/g, '').slice(0, 128) || `${slot}-property`,
+      evidence_refs: [`repository:${path}`],
+      ...item,
+    }
+  }
+  return {
+    criteria: criterionRows,
+    carried: carried.map((row) => ({
+      criterion_ids: [],
+      ...row, evidence_refs: row.evidence_refs || ['review-experiment:carried-check'],
+    })),
+    broken: broken.map((item) => decorate(item, 'broken')),
+    uncovered: uncovered.map((item) => decorate(item, 'uncovered')),
+    weak: weak.map((item) => decorate(item, 'weak')),
+    noted,
+  }
+}
+
+test('review passes merge conservatively and mark challenger findings against one baseline', () => {
+  const criterion = { id: 'done_when:1', state: 'met', evidence: 'primary checked it' }
+  const verification = {
+    state: 'baseline-green', baseline: { state: 'green' }, mutations: [], failures: [],
+    replay_surface: { restores: 1 },
+  }
+  const merged = mergeReviewPasses([
+    {
+      verdict: verdict({
+        criteria: [criterion],
+        carried: [{ id: 'r1.1', state: 'closed', evidence: 'primary closed it' }],
+        broken: [{ where: 'src/a.js:1', fix: 'fix A', evidence: 'primary evidence' }],
+      }),
+      weakEvents: [], weakVerification: verification,
+    },
+    {
+      verdict: verdict({
+        criteria: [{ ...criterion, state: 'broken', evidence: 'challenger disproved it' }],
+        carried: [{ id: 'r1.1', state: 'open', evidence: 'challenger still reproduces it' }],
+        broken: [
+          { where: 'src/a.js:1', fix: 'fix A', evidence: 'duplicate evidence' },
+          { where: 'src/b.js:2', fix: 'fix B', evidence: 'late evidence' },
+        ],
+      }),
+      weakEvents: [], weakVerification: verification,
+    },
+  ], 'a'.repeat(64))
+  assert.equal(merged.verdict.criteria[0].state, 'broken')
+  assert.equal(merged.verdict.carried[0].state, 'open')
+  assert.equal(merged.verdict.broken.length, 3)
+  assert.equal(merged.verdict.broken[0].discovery, 'primary')
+  assert.equal(merged.verdict.broken[1].discovery, 'late-same-baseline')
+  assert.equal(merged.verdict.broken[2].discovery, 'late-same-baseline')
+  assert.equal(merged.verdict.broken[2].baseline_digest, 'a'.repeat(64))
+  const groups = groupFindings(merged.verdict.broken)
+  assert.equal(groups.length, 2)
+  assert.equal(groups[0].members.length, 2)
+  assert.equal(merged.weakVerification.replay_surface.surfaces_created, 2)
+})
 
 test('JavaScript provider paths use the current Node executable on every platform', () => {
   for (const platformName of ['darwin', 'linux', 'win32']) {
@@ -153,6 +238,31 @@ test('ordinary native provider paths pass through without a shell or extra argum
   })
 })
 
+test('adapter identity covers helper files, excludes evidence, and rejects symlinks',
+  { skip: symlinkSkip() }, () => {
+    const directory = mkdtempSync(join(tmpdir(), 'caw-adapter-identity-'))
+    TEMP_ROOTS.add(directory)
+    writeFileSync(join(directory, 'adapter.mjs'), 'export default {}\n')
+    writeFileSync(join(directory, 'runner.mjs'), 'export const version = 1\n')
+    const before = adapterImplementationDigest(directory, 'fixture')
+
+    writeFileSync(join(directory, 'runner.mjs'), 'export const version = 2\n')
+    const changed = adapterImplementationDigest(directory, 'fixture')
+    assert.notEqual(changed, before)
+
+    chmodSync(join(directory, 'runner.mjs'), 0o755)
+    const modeChanged = adapterImplementationDigest(directory, 'fixture')
+    assert.notEqual(modeChanged, changed)
+
+    mkdirSync(join(directory, 'probes'))
+    writeFileSync(join(directory, 'probes', 'evidence.json'), '{}\n')
+    assert.equal(adapterImplementationDigest(directory, 'fixture'), modeChanged)
+
+    symlinkSync('runner.mjs', join(directory, 'linked-runner.mjs'))
+    assert.throws(() => adapterImplementationDigest(directory, 'fixture'),
+      /adapter fixture contains unsupported symlink linked-runner\.mjs/)
+  })
+
 test('Windows command scripts are refused intentionally instead of being launched', () => {
   for (const extension of ['cmd', 'bat', 'ps1']) {
     assert.throws(
@@ -172,9 +282,26 @@ test('Windows command-script refusal names the native executable recovery settin
 function fixture({
   git = false,
   gateFast = 'node -e "process.exit(0)"',
+  gateFastTimeout = '',
+  gateBatch = '',
+  gateBatchTimeout = '',
   gateFull = '',
+  gateFullTimeout = '',
+  executorMaxToolEvents = '',
+  executorMaxEventBytes = '',
+  gateUnavailableReview = 'false',
   indexCmd = '',
+  indexFormat = '',
+  indexAudience = '',
+  builtinIndex = '',
+  pipelineMode = '',
+  planningMaxRounds = '',
+  challengerPolicy = '',
   reviewDependencies = '',
+  planningIndependence = '',
+  taskIndependence = '',
+  weakSourceProbe = '',
+  weakPositiveControl = '',
 } = {}) {
   const parent = mkdtempSync(join(tmpdir(), 'caw-baseline-'))
   TEMP_ROOTS.add(parent)
@@ -232,15 +359,35 @@ export default {
 }
 `
   writeFileSync(join(testAdapterDir, 'adapter.mjs'), testAdapterSource)
-  writeFixtureAttestation(testAdapterDir, 'test-claude', testAdapterSource)
+  writeFileSync(join(testAdapterDir, 'runner.mjs'), '// fixture adapter helper\n')
+  writeFixtureAttestation(testAdapterDir, 'test-claude')
   writeFileSync(join(root, '.caw', 'CAW.md'), `---
 name: Baseline fixture
 main_branch: main
 gate_fast: ${gateFast}
+gate_fast_timeout_ms: ${gateFastTimeout}
+gate_batch: ${gateBatch}
+gate_batch_timeout_ms: ${gateBatchTimeout}
 gate_full: ${gateFull}
+gate_full_timeout_ms: ${gateFullTimeout}
+executor_max_tool_events: ${executorMaxToolEvents}
+executor_max_event_bytes: ${executorMaxEventBytes}
+gate_unavailable_review: ${gateUnavailableReview}
 index_cmd: ${indexCmd}
+index_format: ${indexFormat}
+index_audience: ${indexAudience}
+builtin_index: ${builtinIndex}
+pipeline_mode: ${pipelineMode}
+planning_max_rounds: ${planningMaxRounds}
 review_dependency_roots: ${reviewDependencies}
 docs_language: English
+planning_independence: ${planningIndependence}
+task_independence: ${taskIndependence}
+review_challenger_passes: 0
+review_challenger_policy: ${challengerPolicy}
+require_role_smoke: false
+weak_source_probe_cmd: ${weakSourceProbe}
+weak_positive_control_cmd: ${weakPositiveControl}
 ---
 
 # CAW profile
@@ -280,6 +427,111 @@ Deterministic baseline fixture.
   return { parent, root, queue, calls }
 }
 
+function configureProjectPolicies(f, source, stages = ['planning', 'review', 'gate', 'commit'],
+  apiVersion = 1) {
+  const root = join(f.root, '.caw', 'project')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(join(root, 'policy.mjs'), source)
+  writeFileSync(join(root, 'manifest.json'), `${JSON.stringify({
+    api_version: apiVersion,
+    policies: Object.fromEntries(stages.map((stage) => [stage, {
+      id: `${stage}-policy`, command: ['node', '.caw/project/policy.mjs'], timeout_ms: 2000,
+    }])),
+  }, null, 2)}\n`)
+  execFileSync('git', ['add', '.caw/project'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure project policies'], { cwd: f.root })
+}
+
+function configureProfileFields(f, fields) {
+  const path = join(f.root, '.caw', 'CAW.md')
+  const lines = Object.entries(fields).map(([key, value]) => `${key}: ${value}`).join('\n')
+  const text = readFileSync(path, 'utf8').replace('\n---\n\n# CAW profile',
+    `\n${lines}\n---\n\n# CAW profile`)
+  writeFileSync(path, text)
+}
+
+const projectPolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+const outputs = {
+  planning: request.context.request?.includes('blocked')
+    ? { issues: ['project planning is blocked'], instructions: [] }
+    : { issues: [], instructions: ['apply the project planning constraint'] },
+  review: {
+    criteria: [{ id: 'privacy', section: 'Privacy', criterion: 'No private value is logged.' }],
+    instructions: ['trace the project privacy boundary'],
+  },
+  gate: request.context.task?.includes('policy-stop')
+    ? { action: 'stop', reason: 'project gate policy rejected this task' }
+    : { action: 'continue', reason: '' },
+  commit: { subject: 'project: delivered safely' },
+}
+process.stdout.write(JSON.stringify(outputs[request.stage]))
+`
+
+const riskPolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+let output
+if (request.stage === 'planning' && request.context.phase === 'request') {
+  output = {
+    issues: [],
+    instructions: ['treat the request as regulated'],
+    risk: {
+      class: 'regulated',
+      population_requirement: 'complete',
+      require_full_gate_baseline: true,
+    },
+  }
+} else if (request.stage === 'planning') {
+  output = {
+    issues: [],
+    instructions: ['preserve every attested case'],
+    attestation: {
+      state: process.env.CAW_TEST_POPULATION_STATE || 'complete',
+      population_digest: process.env.CAW_TEST_WRONG_DIGEST || request.context.population.digest,
+      evidence: 'project index closes the regulated case set',
+    },
+  }
+} else if (request.stage === 'review') {
+  output = { criteria: [], instructions: [] }
+} else if (request.stage === 'gate') {
+  output = { action: 'continue', reason: '' }
+} else {
+  output = { subject: '' }
+}
+process.stdout.write(JSON.stringify(output))
+`
+
+const cacheableRiskPolicySource = `
+import { createHash as policyHash } from 'node:crypto'
+import { readFileSync as policyRead } from 'node:fs'
+` + riskPolicySource.replace(
+  "output = { action: 'continue', reason: '' }",
+  `output = {
+    action: 'continue', reason: '',
+    ...(request.context.kind === 'full-baseline-inputs'
+      ? { baseline_inputs_digest: policyHash('sha256').update(policyRead(
+          new URL('../../.caw-logs/baseline-cache-input.txt', import.meta.url)
+        )).digest('hex') }
+      : {}),
+  }`,
+)
+
+const flakyGatePolicySource = `
+let text = ''
+process.stdin.setEncoding('utf8')
+for await (const chunk of process.stdin) text += chunk
+const request = JSON.parse(text)
+process.stdout.write(JSON.stringify(request.context.state === 'red'
+  ? { action: 'retry', classification: 'flaky', reason: 'allowlisted intermittent fixture' }
+  : { action: 'continue', reason: '' }))
+`
+
 function run(f, args, responses, extraEnv = {}) {
   writeFileSync(f.queue, `${JSON.stringify(responses, null, 2)}\n`)
   const env = {
@@ -306,6 +558,11 @@ function run(f, args, responses, extraEnv = {}) {
 
 function calls(f) {
   return readFileSync(f.calls, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+}
+
+function latestTaskAudit(f) {
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim()
+  return JSON.parse(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`), 'utf8'))
 }
 
 function codexCalls(f) {
@@ -462,7 +719,7 @@ test('population repair uses exact first-line then longest-block anchors and rec
     { envelope: envelope(plan()) },
     { envelope: envelope(planReview()) },
   ])
-  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
   assert.match(result.stdout, /repaired 1 anchor\(s\) by unique exact search/)
   const reviewCall = calls(f).find((call) => call.role === 'plan-reviewer')
   assert.match(reviewCall.input, /README\.md:1 — "# fixture"/)
@@ -1045,10 +1302,22 @@ test('current plan path constructs three Claude calls and persists an approved q
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), true)
   const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
   assert.match(planText, /approved: true/)
+  assert.match(planText, /population_state: none/)
+  assert.match(planText, /population_digest: [0-9a-f]{64}/)
   assert.match(planText, /## Runtime provenance/)
   assert.match(planText, /"role": "enumerator"/)
   assert.match(planText, /"role": "architect"/)
   assert.match(planText, /"role": "plan-reviewer"/)
+  assert.match(planText, /## Planning relation ledger/)
+  assert.match(planText, /plan-relation-[0-9a-f]{12}/)
+  assert.match(planText, /plan-requirement-[0-9a-f]{12}/)
+  assert.match(planText, /^## Approved — the queue as it was judged$/m)
+  assert.match(planText, /^- 001_baseline-task\.md  [0-9a-f]{12}$/m)
+  const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
+  assert.match(specText, /^executor_budget_requested: small$/m)
+  assert.match(specText, /^executor_budget: small$/m)
+  assert.match(specText, /## Acceptance links/)
+  assert.match(specText, /plan-case-[0-9a-f]{12}/)
 
   const runNames = readdirSync(join(f.root, '.caw-logs')).filter((name) => name.startsWith('run-'))
   assert.equal(runNames.length, 1)
@@ -1056,6 +1325,29 @@ test('current plan path constructs three Claude calls and persists an approved q
   const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'completed')
   assert.equal(manifest.calls.length, 3)
+  assert.deepEqual(manifest.stages.map(({ kind, name, state }) => [kind, name, state]), [
+    ['provider', 'enumerator', 'success'],
+    ['provider', 'architect', 'success'],
+    ['provider', 'plan-reviewer', 'success'],
+  ])
+  assert.deepEqual(manifest.review_independence.map(({ scope, mode, satisfied }) =>
+    [scope, mode, satisfied]), [
+    ['planning', 'same-provider', true],
+    ['task', 'same-provider', true],
+  ])
+  assert.deepEqual(manifest.calls.map(({ status }) => status), ['success', 'success', 'success'])
+  assert.deepEqual(manifest.calls.map(({ usage_state }) => usage_state),
+    ['reported', 'reported', 'reported'])
+  assert.equal(new Set(manifest.calls.map(({ attempt_id }) => attempt_id)).size, 3)
+  for (const call of manifest.calls) {
+    assert.match(call.attempt_id, /^provider-\d{3}$/)
+    assert.equal(existsSync(join(runPath, call.attempt_file)), true)
+    const attempt = JSON.parse(readFileSync(join(runPath, call.attempt_file), 'utf8'))
+    assert.equal(attempt.attempt_id, call.attempt_id)
+    assert.equal(attempt.status, 'started')
+    assert.equal(attempt.requested.model, 'opus')
+    assert.equal(typeof attempt.requested.native.model, 'string')
+  }
   const callFiles = readdirSync(runPath).filter((name) => name.startsWith('call-'))
   assert.equal(callFiles.length, 3)
   const retained = JSON.parse(readFileSync(join(runPath, callFiles[0]), 'utf8'))
@@ -1077,6 +1369,995 @@ test('current plan path constructs three Claude calls and persists an approved q
   const purged = run(f, ['artifacts', 'purge', runNames[0]], [])
   assert.equal(purged.status, 0)
   assert.equal(existsSync(runPath), false)
+})
+
+test('review-specs records a hand-written queue and build reports later edits', () => {
+  const f = fixture({ git: true })
+  const description = 'Ship the hand-written ticket'
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_hand-written.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), [
+    '---', 'title: Hand-written ticket', '---', '',
+    '## Change', '', '- Implement the requested behavior.', '',
+    '## Done when', '', '- The requested behavior works.', '',
+  ].join('\n'))
+
+  let result = run(f, ['review-specs', description], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...planReview(), relations: [] }) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const recordPath = join(f.root, '.caw-tasks', 'PLAN.md')
+  const record = readFileSync(recordPath, 'utf8')
+  assert.match(record, /^approved: true$/m)
+  assert.match(record, /^# Reviewed ticket queue$/m)
+  assert.match(record, new RegExp(`^- ${spec}  [0-9a-f]{12}$`, 'm'))
+  assert.match(record, new RegExp(description))
+
+  writeFileSync(join(f.root, '.caw-tasks', spec), `${readFileSync(
+    join(f.root, '.caw-tasks', spec), 'utf8')}\nChanged after review.\n`)
+  writeFileSync(join(f.root, 'README.md'), '# dirty fixture\n')
+  result = run(f, ['build', '--no-full'], [])
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /001_hand-written\.md — edited since it was approved/)
+  assert.match(result.stderr, /working tree is dirty/)
+})
+
+test('architect repairs one duplicate coverage row without repeating enumeration', () => {
+  const f = fixture({ git: true })
+  const rejected = plan()
+  rejected.coverage.push({ ...rejected.coverage[0] })
+  const result = run(f, ['plan', 'Repair duplicate coverage'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout,
+    /architect canonical inconsistency; retrying once: \$\.coverage each case must appear exactly once/)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 2)
+  assert.equal(seen.filter((call) => call.role === 'plan-reviewer').length, 1)
+  const repair = seen.find((call) => call.role === 'architect' &&
+    call.input.startsWith('Canonical repair 1 for architect.'))
+  assert.match(repair.input, /failed the engine canonical validation at \$\.coverage/)
+  assert.match(repair.input, /Rejected canonical value:/)
+  assert.equal((repair.input.match(/"case": "fixture output"/g) || []).length, 2)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  const architectCalls = manifest.calls.filter((call) => call.role === 'architect')
+  assert.deepEqual(architectCalls.map((call) => call.status), ['success', 'success'])
+  assert.equal(manifest.calls.length, 4)
+  const diagnostics = manifest.diagnostics.filter((item) =>
+    item.role === 'architect' && item.kind === 'canonical-validation')
+  assert.equal(diagnostics.length, 1)
+  const diagnostic = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    diagnostics[0].file), 'utf8'))
+  assert.equal(diagnostic.path, '$.coverage')
+  assert.equal(diagnostic.message, 'each case must appear exactly once')
+  assert.equal(diagnostic.attempt_id, architectCalls[0].attempt_id)
+})
+
+test('architect canonical repair is bounded to one additional call', () => {
+  const f = fixture()
+  const rejected = plan()
+  rejected.coverage.push({ ...rejected.coverage[0] })
+  const result = run(f, ['plan', 'Bound duplicate coverage repair'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(rejected) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr,
+    /architect returned invalid canonical output at \$\.coverage: each case must appear exactly once/)
+  assert.equal(calls(f).filter((call) => call.role === 'architect').length, 2)
+  assert.equal(calls(f).filter((call) => call.role === 'plan-reviewer').length, 0)
+})
+
+test('architect canonical repair also recovers a structural schema failure', () => {
+  const f = fixture()
+  const result = run(f, ['plan', 'Repair malformed coverage'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), coverage: 'not-an-array' }) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 2)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  const architectCalls = manifest.calls.filter((call) => call.role === 'architect')
+  assert.deepEqual(architectCalls.map((call) => [call.status, call.failure_kind || null]), [
+    ['failure', 'schema-validation'],
+    ['success', null],
+  ])
+})
+
+test('plan reviewer repairs one incomplete relation ledger without repeating the architect', () => {
+  const f = fixture()
+  const rejected = { ...planReview(), relations: [] }
+  const result = run(f, ['plan', 'Repair plan review relations'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(rejected) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  assert.equal(seen.filter((call) => call.role === 'enumerator').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'architect').length, 1)
+  assert.equal(seen.filter((call) => call.role === 'plan-reviewer').length, 2)
+  const repair = seen.find((call) => call.role === 'plan-reviewer' &&
+    call.input.startsWith('Canonical repair 1 for plan-reviewer.'))
+  assert.match(repair.input, /failed the engine canonical validation at \$\.relations/)
+  assert.match(repair.input, /missing relation id/)
+})
+
+test('planning raises an undersized executor budget and preserves the architect proposal', () => {
+  const f = fixture()
+  const proposed = plan()
+  proposed.tasks[0].surfaces.push({
+    id: 'fixture-index', responsibility: 'The index that exposes the generated fixture output.',
+  })
+  proposed.tasks[0].state_machines.push({
+    surface: 'fixture-index', states: ['absent', 'present'],
+    transitions: [{ from: 'absent', event: 'index fixture', to: 'present' }],
+  })
+  proposed.tasks[0].indivisible_reason = 'The output and its index must become visible together.'
+
+  const result = run(f, ['plan', 'Create and index the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(proposed) },
+    { envelope: envelope(planReview(proposed)) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const specText = readFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'utf8')
+  assert.match(specText, /^executor_budget_requested: small$/m)
+  assert.match(specText, /^executor_budget: large$/m)
+
+  const reviewCall = calls(f).find((call) => call.role === 'plan-reviewer')
+  assert.match(reviewCall.input, /Engine-owned executor budget selections/)
+  assert.match(reviewCall.input, /"requested": "small"/)
+  assert.match(reviewCall.input, /"floor": "large"/)
+  assert.match(reviewCall.input, /"effective": "large"/)
+  assert.match(reviewCall.input, /2 indivisible surfaces make this cross-layer work/)
+})
+
+test('request, planning and role budgets stop before the next provider process', () => {
+  const cases = [
+    ['budget_request_calls', 2, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(planReview()) },
+    ], 2],
+    ['budget_planning_calls', 2, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(planReview()) },
+    ], 2],
+    ['budget_architect_calls', 1, [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope({ ...planReview(), uncovered: ['one more case'] }) },
+      { envelope: envelope(plan()) },
+    ], 3],
+  ]
+  for (const [field, limit, responses, expectedCalls] of cases) {
+    const f = fixture()
+    configureProfileFields(f, { [field]: limit })
+    const result = run(f, ['plan', 'Create the fixture output'], responses)
+    assert.equal(result.status, 1, `${field}: ${result.stderr || result.stdout}`)
+    const output = `${result.stdout}\n${result.stderr}`
+    assert.match(output, new RegExp(`${field} reached`))
+    assert.match(output, /no (?:plan-reviewer|architect) provider call was started/)
+    assert.equal(calls(f).length, expectedCalls, field)
+  }
+})
+
+test('planning roles receive the task-versus-queue evidence lifecycle', () => {
+  const fullGate = 'node scripts/full-suite.mjs'
+  const f = fixture({ gateFull: fullGate })
+  const result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const block = taskEvidenceLifecycleBlock({
+    gate_fast: 'node -e "process.exit(0)"', gate_full: fullGate,
+  })
+  assert.match(block, /Before each task review, CAW runs only gate_fast/)
+  assert.match(block, /After every task is reviewed and committed, CAW runs gate_full once/)
+  assert.match(block, /proof files are not substitutes/)
+
+  const planningCalls = calls(f).filter((call) =>
+    call.role === 'architect' || call.role === 'plan-reviewer')
+  assert.equal(planningCalls.length, 2)
+  for (const call of planningCalls) {
+    assert.match(call.input, /Engine-owned verification lifecycle/)
+    assert.match(call.input, /node scripts\/full-suite\.mjs/)
+    assert.match(call.input, /evidence unavailable at task review and is unverifiable/)
+  }
+})
+
+test('task budget preserves delivery and stops before reviewer', () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { budget_task_calls: 1 })
+  execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure task budget'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_budget.md'), 'title: Budgeted task\n')
+  const result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'delivery.txt': 'kept\n' }, envelope: envelope(delivery('kept delivery')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /budget_task_calls reached \(1\/1\)/)
+  assert.match(result.stderr, /no reviewer provider call was started/)
+  assert.equal(calls(f).length, 1)
+  assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'kept\n')
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_budget.md.json')), true)
+})
+
+test('unknown-cost budget uses observed completed calls and keeps unknown distinct from estimated', () => {
+  const f = fixture()
+  configureProfileFields(f, { budget_unknown_cost_calls: 1 })
+  const result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: { structured_output: population() } },
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /budget_unknown_cost_calls reached \(1\/1\)/)
+  assert.equal(calls(f).length, 1)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls[0].usage_state, 'unknown')
+  assert.equal(manifest.provider_budgets.consumed.unknown_cost_calls, 1)
+})
+
+test('population cache reuses exact inputs and misses after canonical authority changes', () => {
+  const f = fixture({ git: true })
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, `${readFileSync(profilePath, 'utf8')}\n## Canonical docs\n\n- CANONICAL.md\n`)
+  writeFileSync(join(f.root, 'CANONICAL.md'), 'The fixture output is required.\n')
+  execFileSync('git', ['add', '.caw/CAW.md', 'CANONICAL.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add canonical authority'], { cwd: f.root })
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['plan-reviewer'])
+  let manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  const hit = manifests.find((manifest) => manifest.population_cache?.state === 'hit')
+  assert.ok(hit)
+  assert.match(hit.population_cache.inputs.repository.head, /^[0-9a-f]{40}$/)
+  assert.match(hit.population_cache.inputs.repository.delivery_digest, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.canonical_authority
+    .find(({ path }) => path === 'CANONICAL.md').sha256, /^[0-9a-f]{64}$/)
+  assert.equal(hit.population_cache.inputs.runtime.provider, 'test-claude')
+  assert.match(hit.population_cache.inputs.runtime.adapter_digest, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.instructions_sha256, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.schema_sha256, /^[0-9a-f]{64}$/)
+  assert.match(hit.population_cache.inputs.engine_sha256, /^[0-9a-f]{64}$/)
+
+  writeFileSync(join(f.root, 'CANONICAL.md'), 'The fixture output and audit marker are required.\n')
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.doesNotMatch(result.stdout, /population cache hit/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator', 'plan-reviewer'])
+  manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  assert.equal(manifests.some((manifest) =>
+    manifest.population_cache?.state === 'miss' && manifest.population_cache?.stored === true), true)
+})
+
+// The stage that dies mid-way pays again for every role that had already finished. Measured on
+// one install: enumerator $2.08 and architect $2.70 both completed, the plan-reviewer died on an
+// expired token, and the rerun started from zero — $4.78 for nothing.
+test('a plan rerun after a mid-stage death reuses the roles that already answered', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const enumeratorAnswer = { envelope: envelope(population([{
+    case: 'fixture output', source: requestSource(description),
+  }])) }
+
+  // The plan-reviewer never answers: its response is missing from the queue, exactly as a role
+  // dying mid-stage leaves it.
+  let result = run(f, ['plan', description], [
+    enumeratorAnswer,
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(result.status, 1)
+  // The plan-reviewer call is not recorded: the double has no response left for it.
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator', 'architect'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), false)
+
+  // The rerun asks neither of the two roles that already answered, and completes on the one
+  // response it was missing.
+  writeFileSync(f.calls, '')
+  result = run(f, ['plan', description], [{ envelope: envelope(planReview()) }])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  assert.match(result.stdout, /planning cache hit [0-9a-f]{12} — architect call skipped/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['plan-reviewer'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), true)
+
+  const manifests = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-'))
+    .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  const hit = manifests.flatMap((manifest) => manifest.planning_cache || [])
+    .find((entry) => entry.state === 'hit' && entry.role === 'architect')
+  assert.ok(hit, 'the run manifest must record the architect cache hit')
+  assert.match(hit.key, /^[0-9a-f]{64}$/)
+})
+
+test('a planning cache entry misses when anything the role was asked about changes', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const responses = () => [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ]
+  let result = run(f, ['plan', description], responses())
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  rmSync(join(f.root, '.caw-tasks'), { recursive: true, force: true })
+
+  // A different request is a different question, so neither cache answers it.
+  writeFileSync(f.calls, '')
+  result = run(f, ['plan', 'Create the fixture output and an audit marker'], responses())
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.doesNotMatch(result.stdout, /planning cache hit/)
+  assert.deepEqual(calls(f).map(({ role }) => role),
+    ['enumerator', 'architect', 'plan-reviewer'])
+})
+
+// A plan reviewer is one sample. Without its predecessor's holes, a second sample that found
+// nothing approved the same unchanged specs. Measured on one install, twice in a day: `plan`
+// reported 1 and then 5 holes, each with a real one, and `review-specs` approved byte-identical
+// specs without the architect ever running.
+const withUnclosedHole = (f, hole) => {
+  const plan = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+    .replace(/^approved:\s*true\s*$/m, 'approved: false')
+  writeFileSync(join(f.root, '.caw-tasks', 'PLAN.md'),
+    `${plan.replace(/\n+$/, '')}\n\n## Unclosed — this plan was NOT approved\n\n- ${hole}\n`)
+}
+const HOLE = 'uncovered — the question repository is driven through a stub but has no init(client:)'
+const plannedQueue = (f, description) => {
+  const result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+}
+
+test('review-specs hands the earlier holes to the plan reviewer and approves only when settled', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'task 001 now declares init(client:) in its Change',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /carrying 1 earlier hole\(s\)/)
+  assert.match(result.stdout, /earlier holes settled: h1 closed/)
+  const reviewer = calls(f).find((call) => call.role === 'plan-reviewer')
+  assert.ok(reviewer.input.includes(`- h1: ${HOLE}`), 'the hole must reach the re-judge by id')
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: true$/m)
+})
+
+test('a re-judge that says nothing about an earlier hole does not approve the queue', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  // Silence twice: the answer and its one repair both leave `carried` empty.
+  const result = run(f, ['review-specs', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(planReview()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /\$\.carried: missing carried hole id\(s\): h1/)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: false$/m)
+})
+
+test('an earlier hole still open stops the review and stays written for the next one', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  plannedQueue(f, description)
+  withUnclosedHole(f, HOLE)
+
+  const result = run(f, ['review-specs', '--no-fix', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'open', evidence: 'no spec declares init(client:) for the question repository',
+    }] }) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /still open \[h1\]/)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.match(planText, /^approved: false$/m)
+  // Written down, so the next review-specs carries it instead of starting blind.
+  assert.match(planText, /## Unclosed — this plan was NOT approved\n\n- still open \[h1\]/)
+})
+
+test('a plan round hands the previous round\'s holes to the next plan reviewer', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope({ ...planReview(), uncovered: ['the fixture output has no failure path'] }) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'the revised task covers the failure path',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const reviewers = calls(f).filter((call) => call.role === 'plan-reviewer')
+  assert.equal(reviewers.length, 2)
+  assert.ok(!reviewers[0].input.includes('Earlier holes, carried by id'))
+  assert.ok(reviewers[1].input.includes('- h1: uncovered — the fixture output has no failure path'))
+})
+
+test('request preflight stops after enumerator and before architect', () => {
+  const f = fixture({ git: true })
+  const issue = {
+    issue: 'The request conflicts with project authority.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: '.caw/CAW.md', occurrence: 1, excerpt: '# CAW profile',
+    }],
+  }
+
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.deepEqual(calls(f).map((call) => call.role), ['enumerator'])
+  assert.match(result.stdout, /request preflight stopped before architect; 1 issue/)
+  assert.match(result.stdout, /request#1/)
+  assert.match(result.stdout, /\.caw\/CAW\.md:/)
+  assert.match(result.stderr, /No architect or plan-reviewer call ran/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
+})
+
+// A link in `.caw/CAW.md` is written to be clicked from that file, so `../docs/x.md` means
+// `docs/x.md`. Measured on one install: an enumerator cited a canonical document by its real path
+// and was refused because the authority set held the link target verbatim, `../docs/...`.
+test('a canonical doc written as a link from .caw/ is cited by its repository path', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, 'docs', 'center'), { recursive: true })
+  writeFileSync(join(f.root, 'docs', 'center', 'sync-handler.md'),
+    '# Sync handler\n\nA refused message is journalled under the key that refused it.\n')
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, `${readFileSync(profilePath, 'utf8')}\n## Canonical docs\n\n` +
+    '- [docs/center/sync-handler.md](../docs/center/sync-handler.md) — the handler contract\n')
+  execFileSync('git', ['add', '-A'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'link the canonical handler doc'], { cwd: f.root })
+
+  const issue = {
+    issue: 'The handler journals a refusal under the key that caused it.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: 'docs/center/sync-handler.md', occurrence: 1,
+      excerpt: 'A refused message is journalled under the key that refused it.',
+    }],
+  }
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+  // The preflight stops as designed, on the issue — not on the path of its source.
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stderr, /invalid canonical output/)
+  assert.match(result.stdout, /request preflight stopped before architect; 1 issue/)
+  assert.match(result.stdout, /docs\/center\/sync-handler\.md/)
+})
+
+// validateRequestIssues judged one field and threw with no value, so the record retained for a
+// refused answer held `"rejected_value": "null"` — on one install the refused answer carried two
+// real defects in the project's normative document.
+test('a refused enumerator answer is retained with its value and diagnostic', () => {
+  const f = fixture({ git: true })
+  const issue = {
+    issue: 'A finding the operator will want to read later.',
+    request_source: { kind: 'request', occurrence: 1, excerpt: 'do a thing' },
+    authority_sources: [{
+      kind: 'repository', path: 'docs/not-listed.md', occurrence: 1, excerpt: 'anything',
+    }],
+  }
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([], [issue])) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /is not \.caw\/CAW\.md or listed under ## Canonical docs/)
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const record = JSON.parse(readFileSync(join(root, readdirSync(root)[0]), 'utf8'))
+  assert.equal(record.role, 'enumerator')
+  assert.notEqual(record.rejected_value, 'null')
+  assert.match(record.rejected_value, /A finding the operator will want to read later/)
+  assert.equal(record.diagnostics.length, 1)
+  assert.equal(record.diagnostics[0].kind, 'request-issue-validation')
+})
+
+test('project planning policy can stop or add instructions before provider calls', () => {
+  const stopped = fixture({ git: true })
+  configureProjectPolicies(stopped, projectPolicySource)
+  const refused = run(stopped, ['plan', 'blocked request'], [])
+  assert.equal(refused.status, 1)
+  assert.equal(calls(stopped).length, 0)
+  assert.match(refused.stdout, /project planning policy planning-policy stopped before enumerator/)
+
+  const allowed = fixture({ git: true })
+  configureProjectPolicies(allowed, projectPolicySource)
+  const result = run(allowed, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  for (const call of calls(allowed)) {
+    assert.match(call.input, /apply the project planning constraint/)
+  }
+  const runName = readdirSync(join(allowed.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(allowed.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.match(manifest.project_policies.manifest_digest, /^[0-9a-f]{64}$/)
+  assert.deepEqual(manifest.policy_calls.map(({ stage, status }) => [stage, status]),
+    [['planning', 'success']])
+})
+
+test('a v2 gate policy can retry a confirmed allowlisted flaky failure without an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateCount = join(tmpdir(), `caw-flaky-gate-${process.pid}-${Date.now()}.txt`)
+  TEMP_ROOTS.add(gateCount)
+  const gateFast = `node -e "const fs=require('fs');const p=process.env.CAW_GATE_COUNT;` +
+    `const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;` +
+    `fs.writeFileSync(p,String(n+1));process.exit(n<2?1:0)"`
+  const f = fixture({ git: true, gateFast })
+  configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_flaky.md'), `---
+title: Flaky gate
+---
+
+## Change
+
+- Write the fixture output.
+
+## Done when
+
+- The fixture output exists.
+`)
+  const criteria = [
+    { id: 'change-1', state: 'met', evidence: 'traced the fixture output' },
+    { id: 'done-when-1', state: 'met', evidence: 'ran the fixture gate' },
+  ]
+
+  const result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria })) },
+  ], { CAW_GATE_COUNT: gateCount })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /classified the confirmed failure as flaky — retry 1\/2/)
+  assert.equal(readFileSync(gateCount, 'utf8'), '3')
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor'])
+  const runName = readdirSync(join(f.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.policy_calls.filter(({ stage }) => stage === 'gate')
+    .map(({ decision }) => [decision.action, decision.classification]), [
+    ['retry', 'flaky'], ['retry', 'flaky'], ['continue', null],
+  ])
+})
+
+test('project flaky retries are engine-bounded when the gate stays red', () => {
+  const gateCount = join(tmpdir(), `caw-flaky-cap-${process.pid}-${Date.now()}.txt`)
+  TEMP_ROOTS.add(gateCount)
+  const gateFast = `node -e "const fs=require('fs');const p=process.env.CAW_GATE_COUNT;` +
+    `const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;` +
+    `fs.writeFileSync(p,String(n+1));process.exit(1)"`
+  const f = fixture({ git: true, gateFast })
+  configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_flaky.md'), 'title: Flaky gate\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', '001_flaky.md'], [], { CAW_GATE_COUNT: gateCount })
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /project flaky retry cap reached \(2\)/)
+  assert.match(`${result.stdout}\n${result.stderr}`, /review baseline stayed red/)
+  assert.equal(readFileSync(gateCount, 'utf8'), '4')
+  assert.equal(calls(f).length, 0)
+})
+
+test('v2 risk policy attests a complete population and requires full-gate baselines',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.match(planText, /^risk_class: regulated$/m)
+  assert.match(planText, /^risk_population_attestation: complete$/m)
+  assert.match(planText, /^risk_require_full_gate_baseline: true$/m)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), true)
+  let manifestNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  let manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', manifestNames.at(-1), 'manifest.json'), 'utf8'))
+  assert.equal(manifest.risk.class, 'regulated')
+  assert.deepEqual(manifest.policy_calls.filter(({ stage }) => stage === 'planning')
+    .map(({ phase }) => phase), ['request', 'population'])
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['build', '--no-full'], [], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /requires gate_full before and after the build/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(fullLog), false)
+
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'output.txt'), 'hand delivery\n')
+  result = run(f, ['review', '001_baseline-task.md'], [], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /has no green full-gate baseline; start with build/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(fullLog), false)
+  rmSync(join(f.root, 'src', 'output.txt'))
+
+  result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+      { id: 'change-1', state: 'met', evidence: 'traced Write the fixture output.' },
+      { id: 'done-when-1', state: 'met', evidence: 'ran The fixture output exists.' },
+    ] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /required full-gate baseline \(regulated\)/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
+  manifestNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  manifest = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', manifestNames.at(-1), 'manifest.json'), 'utf8'))
+  assert.equal(manifest.full_gate_baseline.state, 'green')
+  assert.equal(manifest.full_gate_baseline.head.length, 40)
+})
+
+test('a stopped high-risk build keeps its baseline through round recovery',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+  const criteria = [
+    { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+    { id: 'change-1', state: 'met', evidence: 'traced Write the fixture output.' },
+    { id: 'done-when-1', state: 'met', evidence: 'ran The fixture output exists.' },
+  ]
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'round one\n' }, envelope: envelope(delivery('first pass')) },
+    { envelope: envelope(verdict({ criteria, broken: [{
+      where: 'src/output.txt:1', fix: 'write the final value', evidence: 'read round one',
+    }] })) },
+    { writeFiles: { 'src/output.txt': 'round two\n' }, envelope: envelope(delivery('second pass')) },
+    { envelope: envelope(verdict({ criteria, carried: [{
+      id: 'r1.1', state: 'open', evidence: 'the final value is still absent',
+    }] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /round 2 closed none/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+  const riskPath = join(f.root, '.caw-tasks', '.risk.json')
+  const risk = JSON.parse(readFileSync(riskPath, 'utf8'))
+  assert.equal(risk.full_gate_baseline.state, 'green')
+
+  result = run(f, ['round', '001_baseline-task.md'], [
+    { writeFiles: { 'src/output.txt': 'final\n' }, envelope: envelope(delivery('final pass')) },
+    { envelope: envelope(verdict({ criteria, carried: [{
+      id: 'r1.1', state: 'closed', evidence: 'read final',
+    }] })) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /full gate:/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  assert.equal(existsSync(riskPath), false)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', 'PLAN.md')), false)
+})
+
+test('required full-gate baseline cache needs exact engine and project input digests',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, cacheableRiskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const projectInput = join(f.root, '.caw-logs', 'baseline-cache-input.txt')
+  writeFileSync(projectInput, 'sdk-one\n')
+
+  const blockedDelivery = {
+    ...delivery('could not proceed'),
+    blocked: 'the fixture deliberately stops before writing',
+  }
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /executor stopped/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+  let risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.match(risk.full_gate_baseline.inputs_digest, /^[0-9a-f]{64}$/)
+  assert.equal(risk.full_gate_baseline.project_inputs_digest,
+    createHash('sha256').update('sdk-one\n').digest('hex'))
+
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 1)
+
+  writeFileSync(projectInput, 'sdk-two\n')
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+
+  writeFileSync(join(f.root, 'README.md'), '# fixture changed\n')
+  execFileSync('git', ['add', 'README.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'change a baseline input'], { cwd: f.root })
+  result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+    CAW_FULL_LOG: fullLog,
+  })
+  assert.equal(result.status, 1)
+  assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 3)
+  risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline.head,
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim())
+})
+
+test('a project that supplies no external-input digest never reuses a full-gate baseline',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync(process.env.CAW_FULL_LOG,'full\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+  const fullLog = join(f.parent, 'full-gate.log')
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ], { CAW_FULL_LOG: fullLog })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const blockedDelivery = {
+    ...delivery('could not proceed'),
+    blocked: 'the fixture deliberately stops before writing',
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    result = run(f, ['build'], [{ envelope: envelope(blockedDelivery) }], {
+      CAW_FULL_LOG: fullLog,
+    })
+    assert.equal(result.status, 1)
+    assert.doesNotMatch(result.stdout, /reused green result for exact inputs/)
+  }
+  assert.equal(readFileSync(fullLog, 'utf8').trim().split('\n').length, 2)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline.inputs_digest, null)
+  assert.equal(risk.full_gate_baseline.project_inputs_digest, null)
+})
+
+test('a cacheable baseline stops if project-owned inputs change while its gate runs',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').writeFileSync(process.env.CAW_PROJECT_INPUT,'sdk-two\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, cacheableRiskPolicySource, ['planning', 'gate'], 2)
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const projectInput = join(f.root, '.caw-logs', 'baseline-cache-input.txt')
+  writeFileSync(projectInput, 'sdk-one\n')
+  writeFileSync(f.calls, '')
+
+  result = run(f, ['build'], [], { CAW_PROJECT_INPUT: projectInput })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /project inputs changed while the gate ran; no executor ran/)
+  assert.equal(calls(f).length, 0)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline, null)
+})
+
+test('a required baseline that mutates protected project state stops before executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFull = `node -e "require('fs').appendFileSync('README.md','changed\\n')"`
+  const f = fixture({ git: true, gateFull })
+  configureProjectPolicies(f, riskPolicySource, ['planning'], 2)
+  const description = 'Create the fixture output'
+
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  writeFileSync(f.calls, '')
+
+  result = run(f, ['build'], [])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr,
+    /required full-gate baseline changed HEAD, delivery, CAW, policies, or the task queue/)
+  assert.equal(calls(f).length, 0)
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.equal(risk.full_gate_baseline, null)
+})
+
+test('v2 risk policy cannot satisfy complete population with a sample attestation', () => {
+  const f = fixture({ git: true })
+  const samplePolicy = riskPolicySource.replace(
+    "process.env.CAW_TEST_POPULATION_STATE || 'complete'", "'sample'")
+  configureProjectPolicies(f, samplePolicy, ['planning'], 2)
+  const description = 'Create the fixture output'
+
+  const result = run(f, ['plan', description], [{
+    envelope: envelope(population([{
+      case: 'fixture output', source: requestSource(description),
+    }])),
+  }])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /risk class regulated requires population complete.*attested sample/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['enumerator'])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
+})
+
+test('review-specs refreshes PLAN risk metadata when the project policy changes',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, riskPolicySource, ['planning'], 2)
+  const description = 'Create the fixture output'
+  const populationResponse = () => ({ envelope: envelope(population([{
+    case: 'fixture output', source: requestSource(description),
+  }])) })
+
+  let result = run(f, ['plan', description], [
+    populationResponse(),
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const policyPath = join(f.root, '.caw', 'project', 'policy.mjs')
+  writeFileSync(policyPath, readFileSync(policyPath, 'utf8')
+    .replace("class: 'regulated'", "class: 'sensitive'"))
+  result = run(f, ['review-specs', description], [
+    populationResponse(),
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const planText = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  const risk = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+  assert.match(planText, /^risk_class: sensitive$/m)
+  assert.match(planText, new RegExp(`^risk_policy_digest: ${risk.policy_digest}$`, 'm'))
+  assert.equal((planText.match(/^## Project risk attestation$/gm) || []).length, 1)
+  assert.match(planText, /"class": "sensitive"/)
+
+  configureProjectPolicies(f, projectPolicySource, ['planning'], 1)
+  result = run(f, ['review-specs', description], [
+    populationResponse(),
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const downgradedPlan = readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8')
+  assert.doesNotMatch(downgradedPlan, /^risk_/m)
+  assert.doesNotMatch(downgradedPlan, /^## Project risk attestation$/m)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.risk.json')), false)
 })
 
 test('non-executable JavaScript provider fixture runs through Node for version and roles', () => {
@@ -1157,7 +2438,11 @@ test('Codex executor uses file transport and returns the canonical result throug
 
   result = run(f, ['build', '--no-full'], [
     { role: 'executor', value: delivery('written by Codex'), writeFiles: { 'output.txt': 'done\n' } },
-    { role: 'reviewer', envelope: envelope(verdict()) },
+    { role: 'reviewer', envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced the fixture output case' },
+      { id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation' },
+      { id: 'done-when-1', state: 'met', evidence: 'traced the output and its gate' },
+    ] })) },
   ])
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'done\n')
@@ -1190,8 +2475,8 @@ test('Codex executor uses file transport and returns the canonical result throug
 
   const runNames = readdirSync(join(f.root, '.caw-logs')).filter((name) => name.startsWith('run-')).sort()
   const latest = join(f.root, '.caw-logs', runNames.at(-1))
-  const retainedPath = readdirSync(latest).map((name) => join(latest, name)).find((path) =>
-    path.endsWith('-executor.json'))
+  const retainedPath = readdirSync(latest).filter((name) => name.startsWith('call-'))
+    .map((name) => join(latest, name)).find((path) => path.endsWith('-executor.json'))
   const retained = JSON.parse(readFileSync(retainedPath, 'utf8'))
   assert.equal(retained.provider, 'codex')
   assert.deepEqual(retained.requested.native, {
@@ -1647,6 +2932,338 @@ test('missing runtime refuses with a complete five-role legacy migration', () =>
   assert.equal(parsed.roles.reviewer.reasoning, 'medium')
 })
 
+test('project review independence is enforced before provider calls', () => {
+  const allowed = fixture({ taskIndependence: 'different-model' })
+  const result = run(allowed, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout,
+    /task independence: different-model — anthropic\/sonnet -> anthropic\/opus/)
+
+  const sameModel = fixture({ taskIndependence: 'different-model' })
+  const runtimePath = join(sameModel.root, '.caw', 'runtime.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.roles.reviewer.model = runtime.roles.executor.model
+  writeFileSync(runtimePath, `${JSON.stringify(runtime, null, 2)}\n`)
+  const refused = run(sameModel, ['plan', 'x'], [])
+  assert.equal(refused.status, 1)
+  assert.match(refused.stderr, /task independence requires different-model/)
+  assert.equal(calls(sameModel).length, 0)
+
+  const crossVendor = fixture({ taskIndependence: 'cross-vendor' })
+  const crossRefused = run(crossVendor, ['plan', 'x'], [])
+  assert.equal(crossRefused.status, 1)
+  assert.match(crossRefused.stderr, /task independence requires cross-vendor/)
+  assert.match(crossRefused.stderr, /anthropic\/sonnet -> anthropic\/opus/)
+  assert.equal(calls(crossVendor).length, 0)
+
+})
+
+test('human planning review is signed, exact to PLAN.md, and runs no plan reviewer', () => {
+  const f = fixture({ git: true, planningIndependence: 'human-review' })
+  const key = join(f.parent, 'human-review-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  const publicKey = readFileSync(`${key}.pub`, 'utf8').trim()
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'), `reviewer@example ${publicKey}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  const planned = run(f, ['plan', 'human-reviewed plan'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(plan()) },
+  ])
+  assert.equal(planned.status, 1)
+  assert.match(`${planned.stdout}\n${planned.stderr}`, /signed human planning review required/)
+  assert.equal(calls(f).some((call) => call.role === 'plan-reviewer'), false)
+
+  const prepared = run(f, ['human-review', 'prepare', 'plan', 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-plan.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed the plan and its complete relation ledger.'
+  for (const relation of attestation.relations) relation.evidence = 'checked against request and task'
+  writeFileSync(packet, `${JSON.stringify(attestation, null, 2)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], {
+    stdio: 'ignore',
+  })
+  const accepted = run(f, ['human-review', 'accept', packet, `${packet}.sig`], [])
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: true$/m)
+  const retained = readdirSync(join(f.root, '.git', 'caw', 'human-reviews'))
+  assert.equal(retained.some((name) => name.endsWith('.json')), true)
+  assert.equal(retained.some((name) => name.endsWith('.sig')), true)
+})
+
+test('human task review verifies a signed exact delivery and commits without an agent reviewer', () => {
+  const f = fixture({ git: true, taskIndependence: 'human-review' })
+  const key = join(f.parent, 'human-task-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'),
+    `reviewer@example ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_human.md'), `---
+title: Human task
+---
+
+## Change
+
+- Change the fixture heading.
+
+## Done when
+
+- README contains the human heading.
+`)
+  writeFileSync(join(f.root, 'README.md'), '# human heading\n')
+  const stopped = run(f, ['review', '001_human.md'], [])
+  assert.equal(stopped.status, 1)
+  assert.match(`${stopped.stdout}\n${stopped.stderr}`, /automated task review is disabled/)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
+
+  const prepared = run(f,
+    ['human-review', 'prepare', 'task', '001_human.md', 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  assert.equal(attestation.version, 3)
+  attestation.statement = 'I reviewed the exact delivery and its gate.'
+  for (const criterion of attestation.criteria) {
+    criterion.evidence = 'read README and checked the criterion'
+    criterion.evidence_refs = ['repository:README.md']
+  }
+  writeFileSync(packet, `${JSON.stringify(attestation, null, 2)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], {
+    stdio: 'ignore',
+  })
+  const accepted = run(f, ['human-review', 'accept', packet, `${packet}.sig`], [])
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout)
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: f.root, encoding: 'utf8' }), '')
+  const audit = latestTaskAudit(f)
+  assert.equal(audit.review.certification.reviewer.kind, 'human')
+  assert.equal(audit.review.certification.reviewer.identity, 'reviewer@example')
+  assert.match(audit.review.certification.reviewer.attestation_digest, /^[0-9a-f]{64}$/)
+})
+
+function signedHumanTask(options = {}, configure = () => {}) {
+  const f = fixture({ git: true, taskIndependence: 'human-review', ...options })
+  configure(f)
+  const key = join(f.parent, 'human-task-key')
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key])
+  writeFileSync(join(f.root, '.caw', 'human-reviewers'),
+    `reviewer@example ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`)
+  configureProfileFields(f, { human_review_allowed_signers: '.caw/human-reviewers' })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const file = '001_human.md'
+  const specPath = join(f.root, '.caw-tasks', file)
+  writeFileSync(specPath, '---\ntitle: Human task\n---\n\n## Done when\n\n- README has a heading.\n')
+  writeFileSync(join(f.root, 'README.md'), '# human heading\n')
+  const prepared = run(f, ['human-review', 'prepare', 'task', file, 'reviewer@example'], [])
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout)
+  const packet = join(f.root, '.caw-logs', 'human-review-001_human.json')
+  const attestation = JSON.parse(readFileSync(packet, 'utf8'))
+  attestation.statement = 'I reviewed this delivery against the task contract.'
+  for (const criterion of attestation.criteria) {
+    criterion.evidence = 'read README against the requirement'
+    criterion.evidence_refs = ['repository:README.md']
+  }
+  writeFileSync(packet, `${JSON.stringify(attestation)}\n`)
+  execFileSync('ssh-keygen', ['-Y', 'sign', '-f', key, '-n', 'caw-review', packet], { stdio: 'ignore' })
+  return { ...f, packet, key, file, specPath }
+}
+
+function acceptSignedTask(f) {
+  return run(f, ['human-review', 'accept', f.packet, `${f.packet}.sig`], [])
+}
+
+for (const change of ['requirement', 'read-section', 'project-criterion']) {
+  test(`human task signature rejects a changed ${change} with unchanged criterion ids`, () => {
+    const f = signedHumanTask({}, (f) => {
+      if (change !== 'project-criterion') return
+      // The policy resolves an external input without changing repository delivery bytes.
+      const policyInput = join(f.parent, 'criterion.txt')
+      writeFileSync(policyInput, 'No private value is logged.')
+      configureProjectPolicies(f, `
+        import { readFileSync } from 'node:fs'
+        process.stdout.write(JSON.stringify({
+          criteria: [{ id: 'privacy', section: 'Privacy', criterion: readFileSync(${JSON.stringify(policyInput)}, 'utf8') }],
+          instructions: [],
+        }))
+      `, ['review'])
+    })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    if (change === 'project-criterion') {
+      writeFileSync(join(f.parent, 'criterion.txt'), 'Every private value is logged.')
+    } else {
+      const spec = readFileSync(f.specPath, 'utf8')
+      writeFileSync(f.specPath, change === 'requirement'
+        ? spec.replace('README has a heading.', 'README has a different required heading.')
+        : spec + '\n## Read\n\n- another-contract.md\n')
+    }
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /task contract changed/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  })
+}
+
+test('signed task acceptance enforces main branch protection and stopping gate policies', () => {
+  for (const reason of ['main', 'policy']) {
+    const f = signedHumanTask({}, (f) => {
+      if (reason === 'policy') configureProjectPolicies(f,
+        `process.stdout.write(JSON.stringify({ action: 'stop', reason: 'review is not releasable' }))`,
+        ['gate'])
+    })
+    if (reason === 'main') execFileSync('git', ['branch', '-m', 'main'], { cwd: f.root })
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, reason === 'main' ? /on main — branch first/ : /project gate policy .* stopped/)
+    assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+    assert.equal(existsSync(f.specPath), true)
+  }
+})
+
+for (const finalState of ['missing-baseline', 'green', 'red']) {
+  test(`signed task acceptance preserves required full gates: ${finalState}`, () => {
+    const f = signedHumanTask({ gateFull: 'exit 0' }, (f) => {
+      const statusPath = join(f.parent, 'full-status.txt')
+      const logPath = join(f.parent, 'full-log.txt')
+      writeFileSync(statusPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); fs.appendFileSync(${JSON.stringify(logPath)}, "full\\n"); process.exit(Number(fs.readFileSync(${JSON.stringify(statusPath)}, "utf8")))'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_full: exit 0', `gate_full: ${cmd}`))
+      execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+      execFileSync('git', ['commit', '-q', '-m', 'configure full gate'], { cwd: f.root })
+      configureProjectPolicies(f, riskPolicySource, ['planning', 'gate'], 2)
+      const description = 'Create the fixture output'
+      const planned = run(f, ['plan', description], [
+        { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+        { envelope: envelope(plan()) }, { envelope: envelope(planReview()) },
+      ])
+      assert.equal(planned.status, 0, planned.stderr || planned.stdout)
+      if (finalState === 'missing-baseline') return
+      const stopped = run(f, ['build'], [{
+        writeFiles: { 'delivery.txt': 'implemented\n' }, envelope: envelope(delivery('Write output')),
+      }])
+      assert.equal(stopped.status, 1)
+      assert.match(stopped.stderr, /automated task review is disabled/)
+      assert.equal(JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.risk.json'), 'utf8'))
+        .full_gate_baseline.state, 'green')
+    })
+    if (finalState === 'red') writeFileSync(join(f.parent, 'full-status.txt'), '1')
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' })
+    const result = acceptSignedTask(f)
+    if (finalState === 'missing-baseline') {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /has no green full-gate baseline/)
+      assert.equal(existsSync(f.specPath), true)
+      assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }), before)
+      assert.equal(existsSync(join(f.parent, 'full-log.txt')), false)
+    } else {
+      assert.equal(result.status, finalState === 'green' ? 0 : 1, result.stderr || result.stdout)
+      if (finalState === 'red') assert.match(result.stderr, /full gate is RED after a green required baseline/)
+      assert.equal(readFileSync(join(f.parent, 'full-log.txt'), 'utf8'), 'full\nfull\n')
+      assert.equal(existsSync(f.specPath), false)
+      assert.equal(latestTaskAudit(f).review.certification.population.state, 'complete')
+    }
+  })
+}
+
+for (const flaky of [false, true]) {
+  test(`signed task gates use bounded provider-free ${flaky ? 'policy retries' : 'confirmation'}`, () => {
+    const f = signedHumanTask({}, (f) => {
+      const countPath = join(f.parent, 'fast-count.txt')
+      writeFileSync(countPath, '0')
+      const cmd = `node -e 'const fs = require("fs"); const n = Number(fs.readFileSync(${JSON.stringify(countPath)}, "utf8")) + 1; fs.writeFileSync(${JSON.stringify(countPath)}, String(n)); process.exit(${flaky ? '1' : 'n === 1 ? 1 : 0'})'`
+      const profilePath = join(f.root, '.caw', 'CAW.md')
+      writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace(/^gate_fast:.*$/m, `gate_fast: ${cmd}`))
+      if (flaky) configureProjectPolicies(f, flakyGatePolicySource, ['gate'], 2)
+    })
+    const result = acceptSignedTask(f)
+    assert.equal(result.status, flaky ? 1 : 0, result.stderr || result.stdout)
+    assert.equal(readFileSync(join(f.parent, 'fast-count.txt'), 'utf8'), flaky ? '4' : '2')
+    assert.equal(calls(f).length, 0)
+    if (!flaky) assert.equal(latestTaskAudit(f).gate.earlier_red_attempts, 1)
+    else assert.equal(existsSync(f.specPath), true)
+  })
+}
+
+function pausedAuthoredTask() {
+  const f = fixture({ git: true, taskIndependence: 'different-model', gateFast: 'exit 75' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const file = '001_resume.md'
+  writeFileSync(join(f.root, '.caw-tasks', file),
+    '---\ntitle: Resume\n---\n\n## Done when\n\n- Output exists.\n')
+  const stopped = run(f, ['build', '--no-full'], [{
+    writeFiles: { 'output.txt': 'result\n' }, envelope: envelope(delivery('Write output')),
+  }])
+  assert.equal(stopped.status, 1)
+  assert.match(stopped.stdout + stopped.stderr, /fast gate DID NOT RUN/)
+  const profilePath = join(f.root, '.caw', 'CAW.md')
+  writeFileSync(profilePath, readFileSync(profilePath, 'utf8').replace('gate_fast: exit 75', 'gate_fast: exit 0'))
+  return { ...f, file, profilePath, statePath: join(f.root, '.caw-tasks', `.round-${file}.json`) }
+}
+
+for (const scenario of ['same-author-model', 'same-author-vendor', 'independent', 'legacy-author']) {
+  test(`resumed task independence uses its recorded author: ${scenario}`, () => {
+    const f = pausedAuthoredTask()
+    const state = JSON.parse(readFileSync(f.statePath, 'utf8'))
+    assert.equal(state.runtime_history[0].vendor, 'anthropic')
+    if (scenario === 'legacy-author') {
+      delete state.runtime_history[0].vendor
+      writeFileSync(f.statePath, JSON.stringify(state))
+    }
+    const runtimePath = join(f.root, '.caw', 'runtime.json')
+    const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+    runtime.roles.executor.model = 'opus'
+    runtime.roles.reviewer.model = scenario === 'same-author-model' ? 'sonnet' : 'opus'
+    writeFileSync(runtimePath, JSON.stringify(runtime))
+    if (scenario === 'same-author-vendor') {
+      writeFileSync(f.profilePath, readFileSync(f.profilePath, 'utf8')
+        .replace('task_independence: different-model', 'task_independence: cross-vendor'))
+    }
+    const result = run(f, ['review', f.file], [{ envelope: envelope(verdict({ criteria: [
+      { id: 'done-when-1', state: 'met', evidence: 'read output' },
+    ] })) }])
+    if (scenario.startsWith('same-author')) {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is anthropic\/sonnet/)
+      assert.equal(calls(f).filter((call) => call.role === 'reviewer').length, 0)
+      assert.equal(existsSync(f.statePath), true)
+      assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'result\n')
+    } else {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.independence.satisfied, true)
+      assert.equal(certification.independence.author.model, 'sonnet')
+      assert.equal(certification.independence.reviewer.model, 'opus')
+    }
+  })
+}
+
+for (const mode of ['same-provider', 'different-model', 'cross-vendor']) {
+  test(`review with an unknown author obeys ${mode} independence`, () => {
+    const f = fixture({ git: true, taskIndependence: mode })
+    mkdirSync(join(f.root, '.caw-tasks'))
+    writeFileSync(join(f.root, '.caw-tasks', '001_hand.md'), '---\ntitle: Hand delivery\n---\n')
+    writeFileSync(join(f.root, 'output.txt'), 'hand delivery\n')
+    const result = run(f, ['review', '001_hand.md'], [{ envelope: envelope(verdict()) }])
+    if (mode === 'same-provider') {
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const certification = latestTaskAudit(f).review.certification
+      assert.equal(certification.state, 'limited')
+      assert.equal(certification.independence.author.model, null)
+      assert.ok(certification.limitations.includes('author-runtime-unobserved'))
+    } else {
+      assert.equal(result.status, 1)
+      assert.match(result.stderr, /recorded author is unknown\/unknown/)
+      assert.equal(calls(f).length, 0)
+    }
+  })
+}
+
 test('runtime rejects legacy mixing, unknown fields and incomplete or invalid rows', () => {
   const cases = [
     ['unknown document field', (v) => { v.fallback = 'claude' }, /unknown field.*fallback/],
@@ -1813,8 +3430,8 @@ test('probe command writes bounded Git-private evidence that unblocks exact pref
   assert.match(olderBuild.stdout,
     /test-claude: probe evidence observed on CLI fake-claude 0\.0\.1-from-an-older-build; running fake-claude 1\.0\.0/)
 
-  const adapterPath = join(f.root, '.caw', 'adapters', 'test-claude', 'adapter.mjs')
-  writeFileSync(adapterPath, `${readFileSync(adapterPath, 'utf8')}\n// digest changed\n`)
+  const runnerPath = join(f.root, '.caw', 'adapters', 'test-claude', 'runner.mjs')
+  writeFileSync(runnerPath, `${readFileSync(runnerPath, 'utf8')}// implementation changed\n`)
   const stale = run(f, ['build', '--no-full'], [])
   assert.equal(stale.status, 1)
   assert.match(stale.stderr, /lacks current green probe evidence/)
@@ -2093,7 +3710,7 @@ test('adapter discovery rejects malformed contracts before execution', () => {
   const legacyResult = run(legacy, ['plan', 'x'], [])
   assert.equal(legacyResult.status, 1)
   assert.match(legacyResult.stderr,
-    /adapter test-claude has malformed contract; API version is 1, expected 2/)
+    /adapter test-claude has malformed contract; API version is 1, expected 3/)
   assert.equal(calls(legacy).length, 0)
 
   const f = fixture()
@@ -2180,6 +3797,205 @@ test('an independent third adapter completes the public contract without an engi
   assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /test-third/)
 })
 
+test('challenger review uses the same delivery and retains late findings before an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { review_challenger_passes: 1 })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_challenger.md'), 'title: Challenger review\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_challenger.md'], [
+    { envelope: envelope(verdict()) },
+    { envelope: envelope(verdict({ broken: [{
+      where: 'README.md:1', fix: 'restore the contract', evidence: 'challenger reproduced it',
+    }] })) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /one round this command runs is done/)
+  assert.match(result.stdout, /origin: pass 1 test-claude\/opus runtime=[0-9a-f]{12}/)
+  assert.match(result.stdout, /origin: pass 2 test-claude\/opus runtime=[0-9a-f]{12}/)
+  assert.doesNotMatch(result.stdout, /origin: undefined\/\? runtime=\?/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 2)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks',
+    '.round-001_challenger.md.json'), 'utf8'))
+  assert.equal(saved.history.length, 1)
+  assert.equal(saved.history[0].discovery, 'late-same-baseline')
+  assert.equal(saved.history[0].review_pass, 2)
+  assert.match(saved.history[0].baseline_digest, /^[0-9a-f]{64}$/)
+  const reviewers = saved.runtime_history.filter((entry) => entry.role === 'reviewer')
+  assert.equal(reviewers.length, 2)
+  assert.equal(reviewers[0].baseline_digest, reviewers[1].baseline_digest)
+  assert.equal(reviewers[0].baseline_digest, saved.history[0].baseline_digest)
+})
+
+test('reviewer semantic repair preserves the pass and still runs the challenger',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { review_challenger_passes: 1 })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_semantic-repair.md'),
+    'title: Semantic repair\n\n## Done when\n- Delivery is complete.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const met = [{ id: 'done-when-1', state: 'met', evidence: 'delivery inspected' }]
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_semantic-repair.md'], [
+    { reviewPass: 1, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1,
+      envelope: envelope(verdict({ criteria: met })) },
+    { reviewPass: 2, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: met })) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runPath = join(f.root, '.caw-logs', runName)
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 3)
+  assert.equal(manifest.diagnostics.filter((item) =>
+    item.role === 'reviewer' && item.kind === 'semantic-validation').length, 1)
+})
+
+// A task stopped by a role contract failure never commits, so nothing carries its spec: the
+// commit that would have is the commit that did not happen, and the audit is written there too.
+// Measured on one install, the spec of the task that failed was already gone from the queue and
+// the log holding the diagnostic sat one pipeline run from the newest-twenty prune.
+test('a role contract failure is retained outside the rotation that sweeps the run record',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const specText = 'title: Durable failure\n\n## Done when\n- Delivery is complete.\n'
+  writeFileSync(join(f.root, '.caw-tasks', '001_durable-failure.md'), specText)
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_durable-failure.md'], [
+    { reviewPass: 1, semanticRepair: 0, envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1, envelope: envelope(verdict({ criteria: invalid })) },
+  ])
+  assert.equal(result.status, 1)
+
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1, `expected one retained failure, got ${names.join(', ')}`)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+
+  assert.equal(record.version, 1)
+  assert.equal(record.role, 'reviewer')
+  assert.equal(record.path, '$.criteria')
+  assert.equal(record.task, '001_durable-failure.md')
+  assert.equal(record.command, 'review')
+  // The spec verbatim, which is the thing that dies first.
+  assert.equal(record.spec, specText)
+  assert.equal(record.spec_truncated, false)
+  // The rejected value, so the failure can be read without the transcript.
+  assert.match(record.rejected_value, /claim lacks its required blocking item/)
+  // Both repair attempts, so a failure that survived its own repair reads as that rather than
+  // as one bad draw.
+  assert.equal(record.diagnostics.length, 2)
+  assert.ok(record.diagnostics.every((row) => row.kind === 'semantic-validation'))
+  assert.equal(record.runtime.provider, 'test-claude')
+  assert.equal(record.runtime.model, 'opus')
+  assert.match(record.runtime.runtime_digest, /^[0-9a-f]{64}$/)
+  // The path is printed, because a record nobody is told about is one nobody reads.
+  assert.match(result.stderr, /role contract failure is retained at/)
+
+  // The point of the record: it outlives the run record it was derived from.
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  assert.equal(record.run_id, runName)
+  rmSync(join(f.root, '.caw-logs', runName), { recursive: true, force: true })
+  assert.equal(readdirSync(root).length, 1, 'the retained failure must not live in .caw-logs')
+
+  // Findable after the terminal that printed the path is gone.
+  const listed = run(f, ['artifacts', 'list'], [])
+  assert.equal(listed.status, 0, listed.stderr || listed.stdout)
+  assert.match(listed.stdout, new RegExp(`contract-failures/${names[0]}`))
+})
+
+test('a planning contract failure retains the request it was about',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const result = run(f, ['plan', 'add a durable failure record'], [
+    { envelope: envelope({ cases: [] }) },
+    { envelope: envelope({ tasks: [], coverage: 'not an array' }) },
+    { envelope: envelope({ tasks: [], coverage: 'still not an array' }) },
+  ])
+  assert.equal(result.status, 1)
+
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1, `expected one retained failure, got ${names.join(', ')}`)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+
+  // The enumerator is the first planning role to answer, so an invalid draw there is the one
+  // that stops the run; which role it was is not the point of this case.
+  assert.equal(record.role, 'enumerator')
+  assert.equal(record.command, 'plan')
+  // `plan` writes nothing until both planning roles return, so the queue is empty here and the
+  // request is the only statement of what the run was for.
+  assert.equal(record.request, 'add a durable failure record')
+  assert.equal(record.task, null)
+  assert.equal(record.spec, null)
+})
+
+test('reviewer semantic repair budget is bounded',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_semantic-budget.md'),
+    'title: Semantic budget\n\n## Done when\n- Delivery is complete.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const invalid = [{
+    id: 'done-when-1', state: 'weak', evidence: 'claim lacks its required blocking item',
+  }]
+  const result = run(f, ['review', '001_semantic-budget.md'], [
+    { reviewPass: 1, semanticRepair: 0,
+      envelope: envelope(verdict({ criteria: invalid })) },
+    { reviewPass: 1, semanticRepair: 1,
+      envelope: envelope(verdict({ criteria: invalid })) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /reviewer returned invalid canonical output at \$\.criteria/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName,
+    'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.filter((call) => call.role === 'reviewer').length, 2)
+  assert.equal(manifest.diagnostics.filter((item) =>
+    item.role === 'reviewer' && item.kind === 'semantic-validation').length, 2)
+})
+
+test('role smoke is exact to model and reasoning and model changes fail before a provider call',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { require_role_smoke: 'true' })
+  const marker = { marker: 'caw-role-smoke' }
+  const smoked = run(f, ['smoke', 'all'], [
+    ...['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
+      .map((role) => ({ role, envelope: envelope(marker) })),
+  ])
+  assert.equal(smoked.status, 0, smoked.stderr || smoked.stdout)
+  const smokeRoot = join(f.root, '.git', 'caw', 'role-smoke')
+  for (const role of ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']) {
+    const evidence = JSON.parse(readFileSync(join(smokeRoot, `${role}.json`), 'utf8'))
+    assert.equal(evidence.green, true)
+    assert.equal(evidence.role, role)
+    assert.match(evidence.engine_digest, /^[0-9a-f]{64}$/)
+  }
+  writeFileSync(f.calls, '')
+  const runtimePath = join(f.root, '.caw', 'runtime.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.roles.reviewer.model = 'new-explicit-model-id'
+  writeFileSync(runtimePath, `${JSON.stringify(runtime, null, 2)}\n`)
+  const refused = run(f, ['plan', 'must not launch'], [])
+  assert.equal(refused.status, 1)
+  assert.match(refused.stderr, /lacks role smoke evidence.*reviewer/s)
+  assert.equal(calls(f).length, 0)
+})
+
 test('current build stop and round resume preserve carried findings and commit',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })
@@ -2196,14 +4012,19 @@ title: Baseline task
 
 - The fixture output exists.
 `)
+  const criteria = [{
+    id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation',
+  }, {
+    id: 'done-when-1', state: 'met', evidence: 'traced the fixture output and its gate',
+  }]
 
   const first = run(f, ['build', '--no-full'], [
     { writeFiles: { 'src/output.txt': 'round one\n' }, envelope: envelope(delivery('first pass')) },
-    { recordReviewProbe: true, envelope: envelope(verdict({ broken: [{
+    { recordReviewProbe: true, envelope: envelope(verdict({ criteria, broken: [{
       where: 'src/output.txt:1', fix: 'write the final value', evidence: 'read round one',
     }] })) },
     { writeFiles: { 'src/output.txt': 'round two\n' }, envelope: envelope(delivery('second pass')) },
-    { recordReviewProbe: true, envelope: envelope(verdict({ carried: [{
+    { recordReviewProbe: true, envelope: envelope(verdict({ criteria, carried: [{
       id: 'r1.1', state: 'open', evidence: 'the final value is still absent',
     }] })) },
   ])
@@ -2214,7 +4035,7 @@ title: Baseline task
   assert.equal(existsSync(state), true)
   const saved = JSON.parse(readFileSync(state, 'utf8'))
   assert.equal(saved.history[0].id, 'r1.1')
-  assert.equal(saved.state_version, 3)
+  assert.equal(saved.state_version, 6)
   assert.match(saved.runtime_digest, /^[0-9a-f]{64}$/)
   assert.equal(saved.runtime_history.some((entry) => entry.role === 'reviewer'), true)
   assert.equal(saved.history[0].origin_runtime.provider, 'test-claude')
@@ -2238,13 +4059,13 @@ title: Baseline task
   mkdirSync(otherAdapterDir)
   const otherSource = readFileSync(originalAdapter, 'utf8').replaceAll('test-claude', 'other')
   writeFileSync(join(otherAdapterDir, 'adapter.mjs'), otherSource)
-  writeFixtureAttestation(otherAdapterDir, 'other', otherSource)
+  writeFixtureAttestation(otherAdapterDir, 'other')
   changedRuntime.roles.reviewer.provider = 'other'
   changedRuntime.roles.reviewer.model = 'opus-next'
   changedRuntime.roles.reviewer.reasoning = 'medium'
   writeFileSync(runtimePath, `${JSON.stringify(changedRuntime, null, 2)}\n`)
 
-  const unpricedReview = envelope(verdict({ carried: [{
+  const unpricedReview = envelope(verdict({ criteria, carried: [{
     id: 'r1.1', state: 'closed', evidence: 'read final',
   }] }))
   delete unpricedReview.total_cost_usd
@@ -2260,7 +4081,7 @@ title: Baseline task
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), false)
   assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'final\n')
   assert.match(execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' }),
-    /Review: approved, round 3/)
+    /Review: accepted with LIMITED certification, round 3/)
   assert.match(second.stdout, /at least \$1\.00, plus 1 unpriced Other call on this task/)
 
   const seen = calls(f)
@@ -2319,10 +4140,55 @@ test('one resumed carried set preserves and renders several runtime origins',
   }])
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /RUNTIME DIVERGENCE/)
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
-  const observation = JSON.parse(message.match(/fake-review-probe:(\{.*\})/)[1])
+  const observationText = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-review-probe:'))
+  const observation = JSON.parse(observationText.slice('fake-review-probe:'.length))
   assert.deepEqual(observation.inputMatches,
     Object.fromEntries(expectedOrigins.map((origin) => [origin, true])))
+})
+
+test('version-4 task state migrates finding provenance without dropping legacy fields',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_legacy-finding.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Legacy finding\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'ready\n')
+  const legacy = {
+    id: 'r1.1', slot: 'broken', round: 1, where: 'delivery.txt:1',
+    fix: 'preserve the old instruction', evidence: 'legacy observed evidence',
+    state: 'open', origin_runtime: null,
+  }
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 4,
+    round: 1,
+    history: [legacy],
+    noted: [],
+    accounting: { priced: {}, unpriced: {} },
+    runtime_history: [],
+    ex: { summary: 'legacy delivery', notes: [] },
+  }, null, 2)}\n`)
+
+  const result = run(f, ['review', spec], [{
+    envelope: envelope(verdict({
+      carried: [{ id: 'r1.1', state: 'open', evidence: 'legacy issue still reproduces' }],
+    })),
+  }])
+
+  assert.equal(result.status, 1)
+  const saved = JSON.parse(readFileSync(
+    join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(saved.state_version, 6)
+  assert.equal(saved.history.length, 1)
+  for (const field of ['id', 'slot', 'round', 'where', 'fix', 'evidence', 'state']) {
+    assert.equal(saved.history[0][field], legacy[field])
+  }
+  assert.deepEqual(saved.history[0].evidence_refs, [])
+  assert.equal(saved.history[0].property_key, null)
+  assert.match(saved.history[0].work_package_id, /^wp-[0-9a-f]{12}$/)
+  assert.deepEqual(saved.history[0].checked_evidence_refs,
+    ['review-experiment:carried-check'])
+  assert.deepEqual(saved.ex.claims, [])
 })
 
 test('fake provider can expose malformed output and structured failures without a network', () => {
@@ -2341,26 +4207,51 @@ test('fake provider can expose malformed output and structured failures without 
   assert.match(refusal.stderr, /authentication refused/)
   assert.match(refusal.stderr, /terminal_reason: authentication/)
   assert.match(refusal.stderr, /provider stderr/)
+  const runName = readdirSync(join(failed.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runPath = join(failed.root, '.caw-logs', runName)
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.length, 1)
+  assert.equal(manifest.calls[0].status, 'failure')
+  assert.equal(manifest.calls[0].failure_kind, 'nonzero-exit')
+  assert.equal(manifest.calls[0].usage_state, 'estimated')
+  assert.equal(existsSync(join(runPath, manifest.calls[0].attempt_file)), true)
+  const failure = JSON.parse(readFileSync(join(runPath, manifest.calls[0].file), 'utf8'))
+  assert.equal(failure.attempt_id, manifest.calls[0].attempt_id)
+  assert.equal(failure.exit_status, 1)
+  assert.equal(failure.usage_estimate.method, 'utf8-bytes-div-4')
+  assert.equal(manifest.stages[0].name, 'enumerator')
+  assert.equal(manifest.stages[0].state, 'failure')
 })
 
 test('engine structural validation rejects missing, mistyped, and unknown canonical fields', () => {
   const mistyped = fixture()
   const wrongArray = run(mistyped, ['plan', 'x'], [
-    { envelope: envelope({ cases: 'not-an-array' }) },
+    { envelope: envelope({ cases: 'not-an-array', request_issues: [] }) },
   ])
   assert.equal(wrongArray.status, 1)
   assert.match(wrongArray.stderr, /invalid canonical output at \$\.cases: expected array/)
+  const mistypedRun = readdirSync(join(mistyped.root, '.caw-logs'))
+    .find((name) => name.startsWith('run-'))
+  const mistypedManifest = JSON.parse(readFileSync(
+    join(mistyped.root, '.caw-logs', mistypedRun, 'manifest.json'), 'utf8'))
+  assert.equal(mistypedManifest.calls[0].status, 'failure')
+  assert.equal(mistypedManifest.calls[0].failure_kind, 'schema-validation')
+  assert.equal(mistypedManifest.calls[0].usage_state, 'reported')
+  const mistypedFailure = JSON.parse(readFileSync(join(
+    mistyped.root, '.caw-logs', mistypedRun, mistypedManifest.calls[0].file), 'utf8'))
+  assert.equal(mistypedFailure.attempt_id, mistypedManifest.calls[0].attempt_id)
+  assert.equal(mistypedFailure.cost.amount, 0.2)
 
   const missing = fixture()
   const missingSource = run(missing, ['plan', 'x'], [
-    { envelope: envelope({ cases: [{ case: 'one' }] }) },
+    { envelope: envelope({ cases: [{ case: 'one' }], request_issues: [] }) },
   ])
   assert.equal(missingSource.status, 1)
   assert.match(missingSource.stderr, /\$\.cases\[0\]\.source: required field is missing/)
 
   const unknown = fixture()
   const extra = run(unknown, ['plan', 'x'], [
-    { envelope: envelope({ cases: [], provider_only: true }) },
+    { envelope: envelope({ cases: [], request_issues: [], provider_only: true }) },
   ])
   assert.equal(extra.status, 1)
   assert.match(extra.stderr, /\$\.provider_only: unknown field/)
@@ -2381,6 +4272,7 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const blockedPlaceholder = run(placeholder, ['plan', 'x'], [
     { envelope: envelope(population()) },
     { envelope: envelope({ ...plan(), blocked: 'none' }) },
+    { envelope: envelope({ ...plan(), blocked: 'none' }) },
   ])
   assert.equal(blockedPlaceholder.status, 1)
   assert.match(blockedPlaceholder.stderr, /\$\.blocked: use the empty string/)
@@ -2389,11 +4281,87 @@ test('engine semantic validation rejects blocker placeholders and invalid plan r
   const relation = fixture()
   const unknownTask = run(relation, ['plan', 'x'], [
     { envelope: envelope(population()) },
-    { envelope: envelope({ ...plan(), coverage: [{ case: 'fixture output', task: 'missing' }] }) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'missing',
+      acceptance_criteria: ['The fixture output exists.'],
+    }] }) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'missing',
+      acceptance_criteria: ['The fixture output exists.'],
+    }] }) },
   ])
   assert.equal(unknownTask.status, 1)
   assert.match(unknownTask.stderr, /names unknown task/)
   assert.equal(existsSync(join(relation.root, '.caw-tasks')), false)
+
+  const acceptance = fixture()
+  const unknownCriterion = run(acceptance, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'baseline-task',
+      acceptance_criteria: ['A criterion the task does not contain.'],
+    }] }) },
+    { envelope: envelope({ ...plan(), coverage: [{
+      case: 'fixture output', task: 'baseline-task',
+      acceptance_criteria: ['A criterion the task does not contain.'],
+    }] }) },
+  ])
+  assert.equal(unknownCriterion.status, 1)
+  assert.match(unknownCriterion.stderr, /unknown done_when criterion/)
+  assert.equal(existsSync(join(acceptance.root, '.caw-tasks')), false)
+
+  const multipleSurfaces = fixture()
+  const missingIndivisibility = plan()
+  missingIndivisibility.tasks[0].surfaces.push({
+    id: 'fixture-display', responsibility: 'Display the generated fixture output.',
+  })
+  missingIndivisibility.tasks[0].state_machines.push({
+    surface: 'fixture-display', states: ['hidden', 'visible'],
+    transitions: [{ from: 'hidden', event: 'show fixture', to: 'visible' }],
+  })
+  const noReason = run(multipleSurfaces, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(missingIndivisibility) },
+    { envelope: envelope(missingIndivisibility) },
+  ])
+  assert.equal(noReason.status, 1)
+  assert.match(noReason.stderr, /indivisible_reason/)
+
+  const transition = fixture()
+  const unknownState = plan()
+  unknownState.tasks[0].state_machines[0].transitions[0].to = 'deleted'
+  const badTransition = run(transition, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope(unknownState) },
+    { envelope: envelope(unknownState) },
+  ])
+  assert.equal(badTransition.status, 1)
+  assert.match(badTransition.stderr, /declared states/)
+})
+
+test('plan reviewer must adjudicate every engine relation id exactly once', () => {
+  const valid = planReview()
+  const variants = [
+    ['missing', { ...valid, relations: [] }, /missing relation id/],
+    ['duplicate', { ...valid, relations: [valid.relations[0], valid.relations[0]] },
+      /duplicate relation id/],
+    ['unknown', { ...valid, relations: [{
+      ...valid.relations[0], id: 'plan-relation-000000000000',
+    }] }, /unknown relation id/],
+  ]
+
+  for (const [name, review, expected] of variants) {
+    const f = fixture()
+    const result = run(f, ['plan', `relation ${name}`], [
+      { envelope: envelope(population()) },
+      { envelope: envelope(plan()) },
+      { envelope: envelope(review) },
+      { envelope: envelope(review) },
+    ])
+    assert.equal(result.status, 1, name)
+    assert.match(result.stderr, expected)
+    assert.equal(existsSync(join(f.root, '.caw-tasks')), false)
+  }
 })
 
 function reviewedOnceWithOpenItem() {
@@ -2439,6 +4407,40 @@ test('reviewer must adjudicate every open carried id exactly once',
   assert.match(invented.stderr, /unknown or settled id "r9\.9"/)
 })
 
+test('an open carried finding supports the same non-met criterion in the next round',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_carried-criterion.md'
+  const criterion = 'Delivery is complete.'
+  writeFileSync(join(f.root, '.caw-tasks', spec),
+    `title: Carried criterion\n\n## Done when\n- ${criterion}\n`)
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  const brokenCriterion = [{
+    id: 'done-when-1', state: 'broken', evidence: 'the delivery remains incomplete',
+  }]
+  const first = run(f, ['review', spec], [{ envelope: envelope(verdict({
+    criteria: brokenCriterion,
+    broken: [{
+      where: 'delivery.txt:1', fix: 'complete it',
+      evidence: `Observed failure. Criterion: ${criterion}`,
+    }],
+  })) }])
+  assert.equal(first.status, 1)
+
+  const second = run(f, ['review', spec], [{ envelope: envelope(verdict({
+    criteria: brokenCriterion,
+    carried: [{ id: 'r1.1', state: 'open', evidence: 'still incomplete' }],
+  })) }])
+  assert.equal(second.status, 1)
+  assert.doesNotMatch(second.stderr, /invalid canonical output/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(saved.round, 2)
+  assert.equal(saved.history.length, 1)
+  assert.equal(saved.history[0].id, 'r1.1')
+  assert.equal(saved.history[0].state, 'open')
+})
+
 test('legacy numeric round spend migrates to known USD without losing recovery',
   { skip: claudeOuterProfileSkip() }, () => {
   const f = fixture({ git: true })
@@ -2454,6 +4456,393 @@ test('legacy numeric round spend migrates to known USD without losing recovery',
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /\$1\.45 on this task/)
   assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), false)
+})
+
+test('review confirms a red gate once without waking an executor', () => {
+  const gateFast = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'red\\n');process.exit(1)"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_baseline-task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`,
+    /review baseline stayed red after one provider-free confirmation/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
+  assert.equal(readFileSync(join(f.root, 'delivery.txt'), 'utf8'), 'hand delivery\n')
+})
+
+function assertGateArtifactReview(repairAndChallenge = false) {
+  const f = fixture({ git: true, gateFast: 'node .caw/gate-evidence.mjs' })
+  if (repairAndChallenge) configureProfileFields(f, { review_challenger_passes: 1 })
+  writeFileSync(join(f.root, '.caw', 'gate-evidence.mjs'), [
+    "import { writeFileSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    "writeFileSync(join(process.env.CAW_GATE_ARTIFACTS_DIR, 'result.txt'), 'green result\\n')",
+    'writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({',
+    '  version: 1, checks: [{',
+    "    id: 'ui-check', criterion_ids: ['done-when-1'],",
+    "    acceptance_case_ids: ['ui-case'], selector: 'settings.language',",
+    "    evidence_kind: 'xcui-result', state: 'passed',",
+    "    summary: 'mounted consumer changed language',",
+    "    artifacts: [{ id: 'ui-result', path: 'result.txt' }],",
+    '  }],',
+    '}))',
+    '',
+  ].join('\n'))
+  execFileSync('git', ['add', '.caw/CAW.md', '.caw/gate-evidence.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'configure evidence gate'], { cwd: f.root })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'ui-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'SettingsView', scenario: 'switch language',",
+    "  observable: 'mounted label changes', mutation: 'disable locale propagation',",
+    "  evidence_kind: 'xcui-result', selector: 'settings.language',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_acceptance.md'), [
+    '---', 'title: Acceptance', '---', '',
+    '## Surfaces',
+    '- `settings-language` — mounted language consumer', '',
+    '## State machines',
+    '- `settings-language`: states `english`, `ukrainian`',
+    '  - `english` -- select Ukrainian --> `ukrainian`', '',
+    '## Done when',
+    '- The mounted settings consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  mkdirSync(join(f.root, '.caw-logs'), { recursive: true })
+  const privateLog = join(f.root, '.caw-logs', 'private-control.txt')
+  writeFileSync(privateLog, 'unrelated private log')
+  const reviewer = (reviewPass, semanticRepair = 0, valid = true) => ({
+    reviewPass, semanticRepair,
+    probeGateArtifacts: true, privateLogPaths: [privateLog],
+    envelope: envelope(verdict({ criteria: valid ? [{
+      id: 'done-when-1',
+      state: 'met',
+      evidence: 'the engine gate artifact records the mounted consumer',
+      evidence_refs: ['gate-artifact:ui-result'],
+    }] : [] })),
+  })
+  const result = run(f, ['review', '001_acceptance.md'], repairAndChallenge
+    ? [reviewer(1, 0, false), reviewer(1, 1), reviewer(2)] : [reviewer(1)])
+  if (repairAndChallenge) assert.match(result.stdout, /retrying pass 1 once/)
+
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const audit = latestTaskAudit(f)
+  const certification = audit.review.certification
+  const observations = audit.delivery.reviewer_notes
+    .filter((note) => note.includes('fake-gate-artifacts:'))
+    .map((note) => JSON.parse(note.slice(note.indexOf('fake-gate-artifacts:') + 'fake-gate-artifacts:'.length)))
+  assert.equal(observations.length, repairAndChallenge ? 2 : 1)
+  const paths = new Set()
+  for (const observation of observations) {
+    assert.equal(observation.observations.length, 1)
+    const file = observation.observations[0]
+    paths.add(file.path)
+    assert.equal(file.id, 'ui-result')
+    assert.equal(file.content, 'green result\n')
+    assert.equal(file.sha256, certification.gate_receipt.artifacts[0].sha256)
+    for (const error of [file.chmodError, file.writeError, file.removeError, ...observation.privateReadErrors]) {
+      assert.ok(DENIED_BY_BOUNDARY.has(error), `boundary should refuse access, got ${error}`)
+    }
+    assert.equal(existsSync(file.path), false, 'the artifact copy is cleaned up with its review surface')
+  }
+  assert.equal(paths.size, observations.length, 'each pass has its own artifact copies')
+  assert.equal(certification.version, 3)
+  // The topology the ids in this record belong to, so a later reader can say what a finding's
+  // transition id MEANT without re-deriving the engine's hashing over the spec.
+  assert.deepEqual(certification.topology.surfaces.map((row) => row.id), ['settings-language'])
+  assert.equal(certification.topology.transitions.length, 1)
+  assert.match(certification.topology.transitions[0].id, /^transition-[0-9a-f]{12}$/)
+  assert.equal(certification.topology.transitions[0].surface, 'settings-language')
+  assert.deepEqual(certification.open_items, [])
+  assert.deepEqual(certification.acceptance_cases.map((row) => row.id), ['ui-case'])
+  assert.equal(certification.gate_receipt.owner, 'caw-engine')
+  assert.equal(certification.gate_receipt.manifest.checks[0].id, 'ui-check')
+  assert.match(certification.gate_receipt.receipt_id, /^[0-9a-f]{64}$/)
+  const artifact = certification.gate_receipt.artifacts[0]
+  assert.equal(artifact.id, 'ui-result')
+  assert.match(artifact.sha256, /^[0-9a-f]{64}$/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  assert.equal(readFileSync(join(f.root, '.caw-logs', runName, artifact.private_file), 'utf8'),
+    'green result\n')
+}
+
+test('v3 acceptance matrix is enforced by an engine-owned gate receipt', () => {
+  assertGateArtifactReview()
+})
+
+test('gate artifact copies survive semantic repair and remain readable in challenger passes', () => {
+  assertGateArtifactReview(true)
+})
+
+test('v3 acceptance matrix refuses a green gate without its required evidence', () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'required-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'Consumer', scenario: 'scenario', observable: 'observable',",
+    "  mutation: 'mutation', evidence_kind: 'test-result', selector: 'consumer.selector',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_missing-evidence.md'), [
+    '## Surfaces',
+    '- `consumer` — production consumer', '',
+    '## State machines',
+    '- `consumer`: states `before`, `after`',
+    '  - `before` -- act --> `after`', '',
+    '## Done when',
+    '- Consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '001_missing-evidence.md'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /gate evidence refused:.*acceptance matrix/s)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
+})
+
+test('v3 acceptance matrix still refuses a missing gate during pipeline preflight', () => {
+  const f = fixture({ git: true, gateFast: '' })
+  configureProjectPolicies(f, [
+    "let text = ''",
+    'for await (const chunk of process.stdin) text += chunk',
+    'const { context } = JSON.parse(text)',
+    'process.stdout.write(JSON.stringify({ cases: [{',
+    "  id: 'required-case', criterion_ids: ['done-when-1'],",
+    '  surface_id: context.surfaces[0].id, transition_id: context.transitions[0].id,',
+    "  production_consumer: 'Consumer', scenario: 'scenario', observable: 'observable',",
+    "  mutation: 'mutation', evidence_kind: 'test-result', selector: 'consumer.selector',",
+    '}] }))',
+    '',
+  ].join('\n'), ['acceptance'], 3)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_missing-gate.md'), [
+    '## Surfaces',
+    '- `consumer` — production consumer', '',
+    '## State machines',
+    '- `consumer`: states `before`, `after`',
+    '  - `before` -- act --> `after`', '',
+    '## Done when',
+    '- Consumer updates.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '001_missing-gate.md'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`, /sets no gate_fast — refusing/)
+  assert.equal(calls(f).some((call) => call.role === 'reviewer'), false)
+})
+
+test('project review criteria are additive and commit policy only changes the subject',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-review.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), `---
+title: Core title
+---
+
+## Done when
+- Delivery exists.
+`)
+  writeFileSync(join(f.root, 'delivery.txt'), 'safe delivery\n')
+
+  const result = run(f, ['review', spec], [{
+    recordReviewProbe: true,
+    observeInputStrings: [
+      'project:review-policy:privacy', 'trace the project privacy boundary',
+    ],
+    envelope: envelope(verdict({ criteria: [
+      { id: 'done-when-1', state: 'met', evidence: 'traced Delivery exists.' },
+      {
+        id: 'project:review-policy:privacy', state: 'met',
+        evidence: 'traced No private value is logged.',
+      },
+    ] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /^project: delivered safely\n/)
+  assert.match(message, /Review: accepted with LIMITED certification, round 1/)
+  assert.doesNotMatch(message, /--- spec/)
+  assert.doesNotMatch(message, /fake-review-probe/)
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim()
+  const audit = JSON.parse(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`), 'utf8'))
+  assert.match(audit.spec, /title: Core title/)
+  assert.match(audit.delivery.reviewer_notes.join('\n'), /"project:review-policy:privacy":true/)
+  assert.match(audit.delivery.reviewer_notes.join('\n'), /"trace the project privacy boundary":true/)
+  const auditDigest = createHash('sha256')
+    .update(readFileSync(join(f.root, '.git', 'caw', 'audit', `${head}.json`))).digest('hex')
+  assert.match(message, new RegExp(`CAW-Audit: sha256:${auditDigest}`))
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.policy_calls.map(({ stage }) => stage), ['gate', 'review', 'commit'])
+  assert.equal(manifest.certifications[0].state, 'limited')
+  assert.equal(manifest.audits[0].commit, head)
+  assert.deepEqual(manifest.certifications[0].limitations,
+    ['population-unknown', 'author-runtime-unobserved'])
+})
+
+test('a planned task retains an approved certification with population and criterion ledger',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, taskIndependence: 'different-model' })
+  let result = run(f, ['plan', 'Create the fixture output'], [
+    { envelope: envelope(population([{
+      case: 'fixture output', source: requestSource('Create the fixture output'),
+    }])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  result = run(f, ['build', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [
+      { id: 'must-cover-1', state: 'met', evidence: 'traced fixture output' },
+      { id: 'change-1', state: 'met', evidence: 'traced the fixture output implementation' },
+      { id: 'done-when-1', state: 'met', evidence: 'ran the fixture gate' },
+    ] })) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  const runNames = readdirSync(join(f.root, '.caw-logs'))
+    .filter((name) => name.startsWith('run-')).sort()
+  const runPath = join(f.root, '.caw-logs', runNames.at(-1))
+  const manifest = JSON.parse(readFileSync(join(runPath, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.certifications.length, 1)
+  assert.equal(manifest.certifications[0].state, 'approved')
+  const certification = JSON.parse(readFileSync(
+    join(runPath, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.population.state, 'sample')
+  assert.equal(certification.population.retained, 1)
+  assert.equal(certification.author.role, 'executor')
+  assert.equal(certification.reviewer.provider, 'test-claude')
+  assert.equal(certification.independence.mode, 'different-model')
+  assert.deepEqual(certification.criteria.map(({ id }) => id),
+    ['must-cover-1', 'change-1', 'done-when-1'])
+  assert.match(certification.review_surface.baseline_commit, /^[0-9a-f]{40}$/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  // A plain approval is the pipeline working, not something a reader of `git log` acts on.
+  assert.doesNotMatch(message, /^Review:/m)
+  // And the full gate is queue-final: at task-commit time it has not run BY DESIGN, so the
+  // commit no longer carries a "Not run" that history would keep after it went green.
+  assert.match(message, /^Gate: .* — green\.$/m)
+  assert.doesNotMatch(message, /Not run:/)
+  assert.match(message, /^CAW-Audit: sha256:[0-9a-f]{64}$/m)
+})
+
+// The Review line stays where it carries something: here, a tree no executor produced under the
+// pipeline's eye, approved by `review`.
+test('a hand-finished approval still says so in its commit', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_hand.md'),
+    '---\ntitle: Hand\n---\n\n## Done when\n- The output exists.\n')
+  writeFileSync(join(f.root, 'README.md'), '# finished by hand\n')
+  const result = run(f, ['review', '001_hand.md'], [
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the output',
+      evidence_refs: ['repository:README.md'],
+    }] })) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /^Review: .*, round 1 — approved by `review`: no executor ran/m)
+  assert.doesNotMatch(message, /Not run:/)
+})
+
+test('project gate policy can stop a green core gate before reviewer', () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-stop.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Policy stop\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [])
+
+  assert.equal(result.status, 1)
+  assert.equal(calls(f).length, 0)
+  assert.match(result.stdout,
+    /project gate policy gate-policy stopped the run: project gate policy rejected this task/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), true)
+})
+
+test('resume reports a project policy source change even when the manifest is unchanged',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  configureProjectPolicies(f, projectPolicySource)
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const spec = '001_policy-divergence.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Policy divergence\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'safe delivery\n')
+
+  const set = readProjectPolicies(f.root)
+  const snapshot = {
+    api_version: set.apiVersion,
+    manifest_digest: set.manifestDigest,
+    policies: Object.fromEntries(Object.entries(set.policies)
+      .map(([stage, policy]) => [stage, { id: policy.id, digest: policy.digest }])),
+  }
+  snapshot.set_digest = createHash('sha256').update(JSON.stringify(snapshot)).digest('hex')
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 4,
+    round: 1,
+    history: [{
+      id: 'r1.1', slot: 'broken', round: 1, where: 'delivery.txt:1',
+      fix: 'keep the safe delivery', evidence: 'read the delivery', state: 'open',
+    }],
+    noted: [],
+    accounting: { priced: {}, unpriced: {} },
+    runtime_history: [],
+    project_policies: snapshot,
+    ex: { summary: 'safe delivery', notes: [] },
+  }, null, 2)}\n`)
+
+  const policyPath = join(f.root, '.caw', 'project', 'policy.mjs')
+  writeFileSync(policyPath, `${readFileSync(policyPath, 'utf8')}\n// policy revision\n`)
+  execFileSync('git', ['add', '.caw/project/policy.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'revise project policy'], { cwd: f.root })
+
+  const result = run(f, ['review', spec], [{
+    envelope: envelope(verdict({
+      criteria: [{
+        id: 'project:review-policy:privacy', state: 'met',
+        evidence: 'traced No private value is logged.',
+      }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'safe delivery remains' }],
+    })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /PROJECT POLICY DIVERGENCE: saved [0-9a-f]{12}/)
 })
 
 test('weak canonical values without a mutation object fail before history ingestion',
@@ -2475,7 +4864,10 @@ test('weak canonical values without a mutation object fail before history ingest
 test('oversized successful final values are rejected instead of truncated and consumed', () => {
   const f = fixture()
   const result = run(f, ['plan', 'x'], [{
-    envelope: envelope({ cases: [{ case: 'x'.repeat(4 * 1024 * 1024), source: 'request' }] }),
+    envelope: envelope({
+      cases: [{ case: 'x'.repeat(4 * 1024 * 1024), source: 'request' }],
+      request_issues: [],
+    }),
   }])
   assert.equal(result.status, 1)
   assert.match(result.stderr, /final canonical value is .* limit is 4194304/)
@@ -2548,11 +4940,18 @@ title: Baseline task
       'src/reviewer-leak.txt': 'mutation made after the green gate\n',
       // A malicious absolute address back into the delivery is denied by Seatbelt.
       [join(f.root, 'src', 'escaped.txt')]: 'must not escape\n',
-      'node_modules/fixture/index.js': 'must remain read-only\n',
+      [join(f.root, 'node_modules', 'fixture', 'escaped.js')]: 'must not escape through dependencies\n',
+      // Dependency-local caches and mutations must work without reaching the delivery copy.
+      'node_modules/.vite-temp/config.mjs': 'generated config\n',
+      'node_modules/fixture/index.js': 'review-only dependency mutation\n',
     },
     ignoreWriteErrors: true,
     recordReviewProbe: true,
-    envelope: envelope(verdict()),
+    envelope: envelope(verdict({ criteria: [{
+      id: 'change-1', state: 'met', evidence: 'traced the intended output implementation',
+    }, {
+      id: 'done-when-1', state: 'met', evidence: 'traced the intended output and its gate',
+    }] })),
   }])
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
@@ -2563,24 +4962,23 @@ title: Baseline task
   assert.equal(existsSync(join(f.root, 'src', 'reviewer-leak.txt')), false)
   assert.equal(existsSync(join(f.root, 'src', 'escaped.txt')), false)
   assert.equal(readFileSync(join(f.root, 'node_modules', 'fixture', 'index.js'), 'utf8'), 'dependency\n')
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
-    cwd: f.root, encoding: 'utf8',
-  })
-  const observation = message.match(/fake-review-probe:(\{.*\})/)
-  assert.ok(observation, message)
-  const probe = JSON.parse(observation[1])
+  const observation = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-review-probe:'))
+  assert.ok(observation)
+  const probe = JSON.parse(observation.slice('fake-review-probe:'.length))
   const canonicalSurfaceParent = join(realpathSync(tmpdir()), 'caw-review-surfaces')
   const fromSurfaceParent = relative(canonicalSurfaceParent, probe.cwd)
   assert.equal(fromSurfaceParent.startsWith('..') || isAbsolute(fromSurfaceParent), false)
   assert.equal(probe.sectionOffsets.pipeline, 0)
   assert.equal(probe.sectionOffsets.capabilities < probe.sectionOffsets.language, true)
   assert.deepEqual(probe.writes['src/reviewer-leak.txt'], { ok: true, error: null })
-  // Which errno the refusal carries is the outer profile's business — seatbelt says EPERM,
-  // bubblewrap's read-only root says EROFS. What this case pins is that the write did not land.
-  for (const path of [join(f.root, 'src', 'escaped.txt'), 'node_modules/fixture/index.js']) {
-    assert.equal(probe.writes[path].ok, false)
-    assert.ok(DENIED_BY_BOUNDARY.has(probe.writes[path].error), probe.writes[path].error)
-  }
+  assert.equal(probe.writes[join(f.root, 'src', 'escaped.txt')].ok, false)
+  assert.ok(DENIED_BY_BOUNDARY.has(probe.writes[join(f.root, 'src', 'escaped.txt')].error))
+  assert.equal(probe.writes[join(f.root, 'node_modules', 'fixture', 'escaped.js')].ok, false)
+  assert.ok(DENIED_BY_BOUNDARY.has(
+    probe.writes[join(f.root, 'node_modules', 'fixture', 'escaped.js')].error))
+  assert.deepEqual(probe.writes['node_modules/.vite-temp/config.mjs'], { ok: true, error: null })
+  assert.deepEqual(probe.writes['node_modules/fixture/index.js'], { ok: true, error: null })
 })
 
 const readmeMutation = (replacement) => `diff --git a/README.md b/README.md
@@ -2610,7 +5008,9 @@ title: Baseline task
   writeFileSync(join(f.root, '.env'), 'SECRET=delivery-only\n')
 
   const result = run(f, ['review', '001_baseline-task.md'], [{
-    envelope: envelope(verdict({ weak: [
+    envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'traced the delivery review path',
+    }], weak: [
       {
         where: 'README.md:1',
         fix: 'make the gate observe the fixture heading',
@@ -2636,16 +5036,23 @@ title: Baseline task
     item.mutation_event.state === 'confirmed-weak'), true)
   assert.equal(state.weak_verification.state, 'baseline-green')
   assert.equal(state.weak_verification.mutations.length, 2)
+  assert.deepEqual(state.weak_verification.replay_surface, {
+    strategy: 'single-reusable-surface', surfaces_created: 1, restores: 3,
+  })
   assert.equal(new Set(state.history.map((item) => item.mutation_event.patch_sha256)).size, 2)
   const gateCalls = readFileSync(gateLog, 'utf8').trim().split('\n')
   assert.equal(gateCalls.length, 4) // delivery, one unmutated baseline, then two mutations
+  assert.equal(new Set(gateCalls).size, 2) // delivery plus one reused replay surface
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
   assert.equal(readFileSync(join(f.root, 'node_modules', 'fixture', 'index.js'), 'utf8'), 'dependency\n')
 })
 
 test('a committed task retains its confirmed weak verification in the run record',
   { skip: claudeOuterProfileSkip() }, () => {
-  const f = fixture({ git: true })
+  // Round two must really close the finding: the engine replays the reviewer's heading mutation
+  // on it, and a delivery its gate does not watch the heading on goes back to the executor.
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
   mkdirSync(join(f.root, '.caw-tasks'))
   writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
 
@@ -2656,11 +5063,12 @@ test('a committed task retains its confirmed weak verification in the run record
       evidence: 'mutated the heading in the isolated surface',
       mutation: { patch: readmeMutation('confirmed'), breaks: 'the fixture heading' },
     }] })) },
-    { writeFiles: { 'delivery.txt': 'round two\n' }, envelope: envelope(delivery('fixed weakness')) },
+    { writeFiles: { 'delivery.txt': 'round two\n', 'src/heading-check': 'on\n' },
+      envelope: envelope(delivery('fixed weakness')) },
     { envelope: envelope(verdict({ carried: [{
       id: 'r1.1', state: 'closed', evidence: 'the delivery now observes the heading',
     }] })) },
-  ])
+  ], { CAW_GATE_LOG: gateLog })
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), false)
@@ -2678,6 +5086,11 @@ test('a committed task retains its confirmed weak verification in the run record
   assert.equal(manifest.weak_verification.events[0].state, 'baseline-green')
   assert.equal(manifest.weak_verification.events[1].task, '001_baseline-task.md')
   assert.equal(manifest.weak_verification.events[1].state, 'confirmed-weak')
+  assert.match(manifest.weak_verification.events[1].patch_file, /^weak-.*\.patch$/)
+  const retainedPatch = readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.weak_verification.events[1].patch_file))
+  assert.equal(createHash('sha256').update(retainedPatch).digest('hex'),
+    manifest.weak_verification.events[1].patch_sha256)
 })
 
 test('weak verification retention reports every event lost beyond its ceiling', () => {
@@ -2690,7 +5103,140 @@ test('weak verification retention reports every event lost beyond its ceiling', 
   assert.equal(retained.events.length, 32)
 })
 
-test('a nonescaping weak mutation that makes the gate red is downgraded to noted',
+test('configured weak controls prove review source use and gate sensitivity',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `node -e "const f=require('fs');process.exit(f.readFileSync('control.txt','utf8')==='ok\\n'?0:1)"`
+  const weakSourceProbe = `node -e "const p=require('path');console.error('probe diagnostic');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const weakPositiveControl = `node -e "require('fs').writeFileSync('control.txt','broken\\n')"`
+  const f = fixture({
+    git: true, gateFast, weakSourceProbe, weakPositiveControl,
+  })
+  writeFileSync(join(f.root, 'control.txt'), 'ok\n')
+  execFileSync('git', ['add', 'control.txt'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add weak control'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the heading',
+      evidence: 'changed README.md in the isolated review surface',
+      mutation: { patch: readmeMutation('controlled'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 1)
+  const state = JSON.parse(readFileSync(
+    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
+  assert.equal(state.weak_verification.state, 'controlled-green')
+  assert.deepEqual(state.weak_verification.controls.source_probe.loaded_paths, ['README.md'])
+  assert.equal(state.weak_verification.controls.positive_control.gate.state, 'red')
+  assert.deepEqual(state.weak_verification.controls.positive_control.paths, ['control.txt'])
+  assert.equal(state.weak_verification.replay_surface.restores, 3)
+  assert.equal(state.history[0].mutation_event.state, 'confirmed-weak')
+  assert.equal(readFileSync(join(f.root, 'control.txt'), 'utf8'), 'ok\n')
+})
+
+test('a weak source probe cannot claim a file outside the review surface',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "console.log(JSON.stringify({loaded_paths:[process.execPath]}))"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl: 'false' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the fixture heading',
+      evidence: 'claimed a source outside the review surface',
+      mutation: { patch: readmeMutation('outside-source'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /source probe invalid/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-source-probe-invalid')
+  assert.match(certification.weak_verification.controls.source_probe.reason,
+    /outside review source/)
+})
+
+test('a weak source probe that mutates the review surface is unavailable',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "const f=require('fs'),p=require('path');f.writeFileSync('README.md','# probe mutation\\n');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl: 'false' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'keep source discovery read-only',
+      evidence: 'the source probe changed a tracked file',
+      mutation: { patch: readmeMutation('mutating-source'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /source probe mutated/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-source-probe-mutated')
+  assert.match(certification.weak_verification.controls.source_probe.reason,
+    /source probe changed the review surface/)
+  assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
+})
+
+test('a green positive control makes weak evidence unavailable and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const weakSourceProbe = `node -e "const p=require('path');console.log(JSON.stringify({loaded_paths:[p.resolve('README.md')]}))"`
+  const weakPositiveControl = `node -e "require('fs').writeFileSync('README.md','# control-still-green\\n')"`
+  const f = fixture({ git: true, weakSourceProbe, weakPositiveControl })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the heading',
+      evidence: 'changed README.md in the isolated review surface',
+      mutation: { patch: readmeMutation('unverified-control'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /positive control green/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-positive-control-green')
+  assert.equal(certification.weak_verification.mutations.length, 0)
+})
+
+test('weak controls must be configured as one pair before provider calls', () => {
+  const f = fixture({ git: true, weakSourceProbe: 'node source-probe.mjs' })
+  const result = run(f, ['plan', 'x'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /must configure weak_source_probe_cmd and weak_positive_control_cmd together/)
+  assert.equal(calls(f).length, 0)
+})
+
+test('a nonescaping weak mutation that makes the gate red is refuted and noted',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.readFileSync('README.md','utf8').includes('# fixture');if(!ok)process.stdout.write('MUTATION CAUGHT\\n');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
@@ -2708,11 +5254,9 @@ test('a nonescaping weak mutation that makes the gate red is downgraded to noted
 
   assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /open now 0,  noted 1/)
-  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
-    cwd: f.root, encoding: 'utf8',
-  })
-  assert.match(message, /weak downgraded to noted/)
-  assert.match(message, /weak mutation made the gate red/)
+  const auditNotes = latestTaskAudit(f).delivery.reviewer_notes.join('\n')
+  assert.match(auditNotes, /weak refuted experiment, noted only/)
+  assert.match(auditNotes, /weak mutation made the gate red/)
   assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json')), false)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
@@ -2778,17 +5322,62 @@ test('a malformed captured weak is noted without discarding an independent valid
   assert.equal(state.history[0].fix, 'retain the reproducible weakness')
   assert.equal(state.history[0].mutation_event.gate_status, 0)
   assert.equal(state.noted.length, 1)
-  assert.match(state.noted[0], /weak downgraded to noted/)
+  assert.match(state.noted[0], /weak verification unavailable, noted only/)
   assert.match(state.noted[0], /retain why this mutation was not reproducible/)
   assert.match(state.noted[0], /the second mutation has a malformed hunk/)
   assert.equal(readFileSync(join(f.root, 'README.md'), 'utf8'), '# fixture\n')
+})
+
+test('a weak mutation against another component is unavailable and never reaches an executor',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, 'src'))
+  writeFileSync(join(f.root, 'src', 'expected.js'), 'export const expected = true\n')
+  execFileSync('git', ['add', 'src/expected.js'], { cwd: f.root })
+  execFileSync('git', ['commit', '-q', '-m', 'add expected component'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'src/expected.js:1',
+      fix: 'make the expected component observable',
+      evidence: 'changed a different component in the isolated review surface',
+      mutation: { patch: readmeMutation('wrong-component'), breaks: 'the expected component' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /changes README\.md but reviewer location names src\/expected\.js/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls.map(({ role }) => role), ['reviewer'])
+  assert.equal(manifest.weak_verification.events.at(-1).kind, 'mutation-unavailable')
+  assert.equal(manifest.weak_verification.events.at(-1).state, 'unavailable')
+  assert.match(manifest.weak_verification.events.at(-1).patch_file, /^weak-.*\.patch$/)
+  assert.equal(existsSync(join(f.root, '.caw-logs', runName,
+    manifest.weak_verification.events.at(-1).patch_file)), true)
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-replay')
+  assert.equal(certification.limitations.includes('unverified-mutation-replay'), true)
+  assert.equal(certification.weak_verification.failures[0].patch_file,
+    manifest.weak_verification.events.at(-1).patch_file)
 })
 
 const activeSurfaceNames = () => existsSync(REVIEW_SURFACE_PARENT)
   ? readdirSync(REVIEW_SURFACE_PARENT).filter((name) => name.startsWith('surface-'))
   : []
 
-test('red weak baseline carries findings as unverified with status and output',
+test('red weak baseline records non-blocking unavailable evidence with limited certification',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.existsSync('.env');if(!ok)process.stdout.write('BASELINE MISSING SECRET\\n');process.exit(ok?0:1)"`
   const f = fixture({ git: true, gateFast })
@@ -2805,21 +5394,18 @@ test('red weak baseline carries findings as unverified with status and output',
     }] })),
   }])
 
-  assert.equal(result.status, 1)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.match(result.stdout, /weak verification unavailable: unmutated surface gate status 1/)
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /downgraded to noted/)
-  const state = JSON.parse(readFileSync(
-    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
-  assert.equal(state.weak_verification.state, 'unverified-baseline-red')
-  assert.equal(state.weak_verification.baseline.gate_status, 1)
-  assert.match(state.weak_verification.baseline.gate_output, /BASELINE MISSING SECRET/)
-  assert.equal(state.weak_verification.mutations.length, 0)
-  assert.equal(state.noted.length, 0)
-  assert.equal(state.history.length, 1)
-  assert.equal(state.history[0].slot, 'weak')
-  assert.equal(state.history[0].state, 'open')
-  assert.equal(state.history[0].mutation_event.state, 'unverified')
-  assert.equal(state.history[0].mutation_event.reason, 'baseline-red')
+  assert.match(result.stdout, /recording 1 finding\(s\) as non-blocking unavailable evidence/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  assert.equal(existsSync(
+    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json')), false)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /weak verification unavailable, noted only/)
 
   const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
   const runManifest = JSON.parse(readFileSync(
@@ -2829,6 +5415,11 @@ test('red weak baseline carries findings as unverified with status and output',
   assert.equal(runManifest.weak_verification.events[0].state, 'unverified-baseline-red')
   assert.equal(runManifest.weak_verification.events[0].gate_status, 1)
   assert.match(runManifest.weak_verification.events[0].gate_output, /BASELINE MISSING SECRET/)
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, runManifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-baseline-red')
+  assert.equal(certification.limitations.includes('unverified-baseline-red'), true)
 
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
   assert.equal(retained.length, 1)
@@ -2839,7 +5430,7 @@ test('red weak baseline carries findings as unverified with status and output',
   assert.match(manifest.weak_gate.output, /BASELINE MISSING SECRET/)
 })
 
-test('mutation gate status 75 stays unverified instead of becoming a red downgrade',
+test('mutation gate refusal is non-blocking unavailable evidence',
   { skip: claudeOuterProfileSkip() }, () => {
   const gateFast = `node -e "const f=require('fs');const ok=f.readFileSync('README.md','utf8').includes('# fixture');if(!ok)process.stdout.write('MUTATION REFUSED\\n');process.exit(ok?0:75)"`
   const f = fixture({ git: true, gateFast })
@@ -2855,18 +5446,25 @@ test('mutation gate status 75 stays unverified instead of becoming a red downgra
     }] })),
   }])
 
-  assert.equal(result.status, 1)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /weak mutation made the gate red/)
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /downgraded to noted/)
-  const state = JSON.parse(readFileSync(
-    join(f.root, '.caw-tasks', '.round-001_baseline-task.md.json'), 'utf8'))
-  assert.equal(state.weak_verification.state, 'unverified-mutation-refused')
-  assert.equal(state.weak_verification.mutations[0].state, 'unverified-refused')
-  assert.equal(state.weak_verification.mutations[0].gate_status, 75)
-  assert.match(state.weak_verification.mutations[0].gate_output, /MUTATION REFUSED/)
-  assert.equal(state.noted.length, 0)
-  assert.equal(state.history[0].mutation_event.state, 'unverified')
-  assert.equal(state.history[0].mutation_event.reason, 'mutation-gate-refused')
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], {
+    cwd: f.root, encoding: 'utf8',
+  })
+  assert.match(message, /Review: accepted with LIMITED certification/)
+  assert.match(latestTaskAudit(f).delivery.reviewer_notes.join('\n'),
+    /weak verification unavailable, noted only/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const runManifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, runManifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-refused')
+  assert.equal(certification.weak_verification.mutations[0].state, 'unverified-refused')
+  assert.equal(certification.weak_verification.mutations[0].gate_status, 75)
+  assert.match(certification.weak_verification.mutations[0].gate_output, /MUTATION REFUSED/)
 
   const retained = activeSurfaceNames().filter((name) => !before.has(name))
   assert.equal(retained.length, 1)
@@ -2875,6 +5473,63 @@ test('mutation gate status 75 stays unverified instead of becoming a red downgra
   assert.equal(manifest.state, 'weak-gate-refused')
   assert.equal(manifest.weak_gate.status, 75)
   assert.match(manifest.weak_gate.output, /MUTATION REFUSED/)
+})
+
+test('weak baseline timeout is non-blocking and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `test -f .env || exec node -e "setTimeout(()=>{},5000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '1000' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  writeFileSync(join(f.root, '.env'), 'ignored surface input\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the heading', evidence: 'mutated the heading',
+      mutation: { patch: readmeMutation('timeout'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /weak verification DID NOT COMPLETE/)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-baseline-timeout')
+  assert.equal(certification.weak_verification.baseline.gate_timeout_ms, 1000)
+})
+
+test('weak mutation timeout is non-blocking and limits certification',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const gateFast = `grep -q '^# fixture$' README.md || exec node -e "setTimeout(()=>{},5000)"`
+  const f = fixture({ git: true, gateFast, gateFastTimeout: '1000' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+
+  const result = run(f, ['review', '001_baseline-task.md'], [{
+    envelope: envelope(verdict({ weak: [{
+      where: 'README.md:1', fix: 'observe the heading', evidence: 'mutated the heading',
+      mutation: { patch: readmeMutation('timeout'), breaks: 'the fixture heading' },
+    }] })),
+  }])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /open now 0,  noted 1/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const certification = JSON.parse(readFileSync(join(
+    f.root, '.caw-logs', runName, manifest.certifications[0].file), 'utf8'))
+  assert.equal(certification.state, 'limited')
+  assert.equal(certification.weak_verification.state, 'unverified-mutation-timeout')
+  assert.equal(certification.weak_verification.mutations[0].state, 'unverified-timeout')
+  assert.equal(certification.weak_verification.mutations[0].gate_timeout_ms, 1000)
 })
 
 test('reviewer timeout retains a bounded interrupted surface',
@@ -2918,7 +5573,21 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
     await new Promise((done) => setTimeout(done, 20))
   }
   assert.equal(appeared, true)
-  await new Promise((done) => setTimeout(done, 150))
+  let runName = null
+  for (let attempt = 0; attempt < 150; attempt++) {
+    if (existsSync(join(f.root, '.caw-logs'))) {
+      runName = readdirSync(join(f.root, '.caw-logs')).find((name) => {
+        if (!name.startsWith('run-')) return false
+        try {
+          return JSON.parse(readFileSync(
+            join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')).calls.length === 1
+        } catch { return false }
+      }) || null
+    }
+    if (runName) break
+    await new Promise((done) => setTimeout(done, 20))
+  }
+  assert.ok(runName, 'reviewer provider attempt did not start before SIGINT')
   process.kill(-child.pid, 'SIGINT')
   const exit = await new Promise((done) => child.once('exit', (code, signal) => done({ code, signal })))
   assert.equal([1, 130].includes(exit.code), true)
@@ -2926,6 +5595,13 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
   assert.equal(retained.length, 1)
   assert.equal(JSON.parse(readFileSync(
     join(REVIEW_SURFACE_PARENT, retained[0], 'manifest.json'), 'utf8')).state, 'interrupted')
+  const runManifest = JSON.parse(readFileSync(
+    join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(runManifest.calls.length, 1)
+  assert.equal(runManifest.calls[0].status, 'interrupted')
+  assert.equal(runManifest.calls[0].usage_state, 'estimated')
+  assert.equal(existsSync(join(f.root, '.caw-logs', runName,
+    runManifest.calls[0].attempt_file)), true)
 })
 
 test('current timeout override refuses invalid input and kills an over-cap child', () => {
@@ -2949,6 +5625,13 @@ test('current timeout override refuses invalid input and kills an over-cap child
   assert.equal(timedOut.status, 1)
   assert.match(timedOut.stderr, /enumerator did not finish within/)
   assert.match(timedOut.stdout, /agent timeout:/)
+  const runName = readdirSync(join(slow.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(
+    join(slow.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.calls.length, 1)
+  assert.equal(manifest.calls[0].status, 'failure')
+  assert.equal(manifest.calls[0].failure_kind, 'timeout')
+  assert.equal(manifest.calls[0].usage_state, 'estimated')
 })
 
 test('current timeout override is one per-child value across every role in a command', () => {
@@ -3029,6 +5712,39 @@ test('index_cmd output goes to the enumerator and to no other role', () => {
   }
 })
 
+test('planning index audience sends one deterministic index to all planning roles', () => {
+  const marker = 'PLANNING-INDEX-MARKER-4d21'
+  const f = fixture({ git: true, indexCmd: 'cat index-fixture.txt', indexAudience: 'planning' })
+  writeFileSync(join(f.root, 'index-fixture.txt'), `${marker}\n`)
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const seen = calls(f)
+  for (const role of ['enumerator', 'architect', 'plan-reviewer']) {
+    assert.equal(seen.find((call) => call.role === role).input.includes(marker), true, role)
+  }
+})
+
+test('builtin request index gives planning roles a bounded deterministic file map', () => {
+  const f = fixture({ git: true, builtinIndex: 'request-v1', indexAudience: 'planning' })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'language-authority.swift'), 'profile language authority\n')
+  execFileSync('git', ['add', 'src/language-authority.swift'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add authority fixture'], { cwd: f.root })
+  const result = run(f, ['plan', 'make profile language authoritative'], [
+    { envelope: envelope(population([])) }, { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  for (const call of calls(f).filter((entry) =>
+    ['enumerator', 'architect', 'plan-reviewer'].includes(entry.role))) {
+    assert.match(call.input, /src\/language-authority\.swift/)
+  }
+})
+
 test('index_cmd that exits non-zero enumerates without it and says so', () => {
   const f = fixture({ indexCmd: 'node -e "console.log(\\"partial\\"); process.exit(3)"' })
   const result = indexPlan(f)
@@ -3055,18 +5771,1221 @@ test('index_cmd over the cap is truncated, and the run says how much was dropped
   assert.match(result.stdout, /The sets are cut and the enumerator is told so/)
 })
 
+test('json-v1 project index is validated, rendered, and sent only to the enumerator', () => {
+  const marker = 'POST /orders/CLOSED-SET-9d2a'
+  const f = fixture({
+    git: true,
+    indexCmd: 'cat index-fixture.json',
+    indexFormat: 'json-v1',
+  })
+  writeFileSync(join(f.root, 'index-fixture.json'), `${JSON.stringify({
+    api_version: 1,
+    sets: [{
+      id: 'public-routes',
+      label: 'Public routes',
+      source: 'scripts/project-index.mjs',
+      members: ['GET /health', marker],
+    }],
+  })}\n`)
+
+  const result = run(f, ['plan', 'do a thing'], [
+    { envelope: envelope(population([])) },
+    { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /project index json-v1: 1 set\(s\)/)
+  const seen = calls(f)
+  assert.match(seen.find((call) => call.role === 'enumerator').input,
+    /## \[public-routes\] Public routes/)
+  assert.equal(seen.find((call) => call.role === 'enumerator').input.includes(marker), true)
+  for (const call of seen.filter((entry) => entry.role !== 'enumerator')) {
+    assert.equal(call.input.includes(marker), false)
+  }
+})
+
+test('invalid json-v1 project indexes stop before provider calls', () => {
+  const cases = [
+    ['malformed', '{', /invalid JSON/],
+    ['wrong-version', JSON.stringify({ api_version: 2, sets: [] }), /api_version must be 1/],
+    ['unknown-field', JSON.stringify({ api_version: 1, sets: [], extra: true }), /unknown field/],
+    ['duplicate-member', JSON.stringify({
+      api_version: 1,
+      sets: [{ id: 'routes', label: 'Routes', source: 'indexer', members: ['same', 'same'] }],
+    }), /duplicates an earlier member/],
+  ]
+  for (const [name, body, message] of cases) {
+    const f = fixture({ indexCmd: 'cat index-fixture.json', indexFormat: 'json-v1' })
+    writeFileSync(join(f.root, 'index-fixture.json'), body)
+    const result = indexPlan(f)
+    assert.equal(result.status, 1, `${name}: ${result.stderr || result.stdout}`)
+    assert.match(result.stderr, message, name)
+    assert.match(result.stderr, /No provider call ran/, name)
+    assert.equal(calls(f).length, 0, name)
+  }
+})
+
+test('json-v1 project index command failures are fatal before provider calls', () => {
+  const f = fixture({
+    indexCmd: 'printf index-broke >&2; exit 3',
+    indexFormat: 'json-v1',
+  })
+  const result = indexPlan(f)
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /project index json-v1 exited 3/)
+  assert.match(result.stderr, /index-broke/)
+  assert.equal(calls(f).length, 0)
+})
+
+test('unknown project index formats fail before provider calls', () => {
+  const f = fixture({ indexCmd: 'node -e "0"', indexFormat: 'json-v2' })
+  const result = indexPlan(f)
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /index_format must be text-v0 or json-v1/)
+  assert.equal(calls(f).length, 0)
+})
+
 // `gate_full` had no coverage at all. The three outcomes below are the whole of its interface,
 // and the second is the one with a measured cost behind it: an install whose gate used exit 1 for
 // both a failure and a refusal sent a reader bisecting a range where no test had executed.
-const buildOneTask = (f, extraResponses = [], args = ['build']) => {
+const buildOneTask = (f, extraResponses = [], args = ['build'], extraEnv = {}) => {
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
   writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
   return run(f, args, [
     { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
     { envelope: envelope(verdict()) },
     ...extraResponses,
-  ])
+  ], extraEnv)
 }
+
+// Measured on one install: an executor returned `blocked` as exactly two quote characters on a
+// complete, gate-green delivery. The predicate read them as a reason, the branch runs before the
+// gate, and the work went to a blocked patch unjudged. `none` bare used to end the run as a
+// contract failure with no repair, which stops the same delivery by a different road.
+for (const placeholder of ['""', "''", '"none"', 'none', '``']) {
+  test(`an executor placeholder blocker ${JSON.stringify(placeholder)} still sends the delivery to the gate and the reviewer`, () => {
+    const f = fixture({ git: true })
+    mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+    writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+    const result = run(f, ['build'], [
+      { writeFiles: { 'src/output.txt': 'done\n' },
+        envelope: envelope({ ...delivery('did it'), blocked: placeholder }) },
+      { envelope: envelope(verdict()) },
+    ])
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stdout, /executor wrote a placeholder in blocked/)
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /executor stopped/)
+    assert.match(result.stdout, /committed {2}[0-9a-f]{7}/)
+    assert.equal(existsSync(join(f.root, '.git', 'caw', 'executor-stops')), false)
+  })
+}
+
+test('a planning role placeholder blocker in quotes is refused like a bare one', () => {
+  const f = fixture()
+  const result = run(f, ['plan', 'x'], [
+    { envelope: envelope(population()) },
+    { envelope: envelope({ ...plan(), blocked: '""' }) },
+    { envelope: envelope({ ...plan(), blocked: '""' }) },
+  ])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /\$\.blocked: use the empty string/)
+})
+
+test('a real executor stop is retained outside rotation and offers review before clearing', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const specText = '---\ntitle: Task\n---\n\nDo it.\n'
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), specText)
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'partial\n' },
+      envelope: envelope({ ...delivery('stopped'), blocked: 'the spec contradicts itself' }) },
+  ])
+  assert.equal(result.status, 1)
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.match(output, /executor stopped/)
+  // The command that keeps the tree comes before the advice that clears it.
+  const reviewAt = output.indexOf('node caw.mjs review 001_task.md')
+  const clearAt = output.indexOf('<clear the tree, fix the spec>')
+  assert.ok(reviewAt > 0 && clearAt > reviewAt, output)
+
+  const root = join(f.root, '.git', 'caw', 'executor-stops')
+  const names = readdirSync(root)
+  assert.equal(names.length, 1)
+  const record = JSON.parse(readFileSync(join(root, names[0]), 'utf8'))
+  assert.equal(record.reason, 'the spec contradicts itself')
+  assert.equal(record.task, '001_task.md')
+  assert.equal(record.spec, specText)
+  assert.equal(JSON.parse(record.response).blocked, 'the spec contradicts itself')
+  assert.match(record.blocked_patch || '', /blocked-001_task/)
+  assert.match(output, /full response is retained at/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  rmSync(join(f.root, '.caw-logs', runName), { recursive: true, force: true })
+  const listed = run(f, ['artifacts', 'list'], [])
+  assert.match(listed.stdout, new RegExp(`executor-stops/${names[0]}`))
+})
+
+// Two installs' worth of the same shape: a reviewer that could record `met` without trying to
+// break the code found the missed half one item per round, and re-derived the same `noted`
+// observations every round because they were never shown back. Measured on one install: two of
+// four tasks stopped at the round ceiling with one open item each, $94.07 of a $187.11 build,
+// and one stale-comment note appeared seven times in a single task's log.
+// The commit carries the whole task; the executor's summary describes its own round. After a
+// review sends it back, that summary is about closing findings. Measured on one install: three
+// commits of four, +377 to +1565 lines each, whose bodies described the last round's test
+// hardening and said nothing about the work.
+test('a multi-round commit body describes the task, not the round that closed it', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_accept.md'), [
+    '---', 'title: Accept what the node sent', '---', '',
+    '## Change',
+    '- Look the batch up in three places, the exact fingerprint first.',
+    '- Record a refusal under a key other than the one that caused it.', '',
+    '## Must cover',
+    '- A replayed refused batch stays refused.', '',
+  ].join('\n'))
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/accept.go': 'package accept\n', 'src/accept_test.go': 'package accept\n' },
+      envelope: envelope(delivery('implemented batch acceptance over three lookup places')) },
+    { envelope: envelope(verdict({
+      criteria: [
+        { id: 'must-cover-1', state: 'broken', evidence: 'the replay test reads the seam' },
+        { id: 'change-1', state: 'met', evidence: 'three lookups, fingerprint first' },
+        { id: 'change-2', state: 'met', evidence: 'refusal keyed apart from its cause' },
+      ],
+      broken: [{ where: 'src/accept_test.go:1', fix: 'assert on the answer', evidence: 'seam read' }],
+    })) },
+    { writeFiles: { 'src/accept_test.go': 'package accept\n// asserts the answer\n' },
+      envelope: envelope(delivery('tightened the replay subtest to read the function answer')) },
+    { envelope: envelope(verdict({
+      criteria: [
+        { id: 'must-cover-1', state: 'met', evidence: 'dropping the fingerprint fails it' },
+        { id: 'change-1', state: 'met', evidence: 'three lookups, fingerprint first' },
+        { id: 'change-2', state: 'met', evidence: 'refusal keyed apart from its cause' },
+      ],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the subtest reads the answer now' }],
+    })) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+
+  // The contract the task was judged against, not the last round's report.
+  assert.match(message, /^Accept what the node sent\n/)
+  assert.match(message, /Change:\n- Look the batch up in three places, the exact fingerprint first\./)
+  assert.match(message, /- Record a refusal under a key other than the one that caused it\./)
+  assert.doesNotMatch(message, /tightened the replay subtest/)
+  // And the shape of the whole delivery, both files, not only the one the last round touched.
+  assert.match(message, /2 files, \+\d+ -\d+:/)
+  assert.match(message, /src\/accept\.go \(\+1 -0\)/)
+  assert.match(message, /src\/accept_test\.go \(\+2 -0\)/)
+  // The last round's report is still kept, where the full record lives.
+  assert.equal(latestTaskAudit(f).delivery.summary,
+    'tightened the replay subtest to read the function answer')
+})
+
+test('a single-round commit body keeps the executor summary, which is the whole task', () => {
+  const f = fixture({ git: true })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /\n\ndid it\n\n1 file, \+1 -0:\n {2}src\/output\.txt \(\+1 -0\)/)
+})
+
+test('the reviewer is asked for surviving mutations in round 1 and shown earlier notes after', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- Isolation between nodes holds.\n')
+  const staleNote = 'the header comment still says four data tables'
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'first\n' }, envelope: envelope(delivery('first')) },
+    {
+      echoPromptMatch: 'name one concrete\\s+mutation|Already recorded as `noted`|four data tables',
+      envelope: envelope(verdict({
+        criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'isolation leaks' }],
+        broken: [{ where: 'src/output.txt:1', fix: 'isolate', evidence: 'isolation leaks' }],
+        noted: [staleNote],
+      })),
+    },
+    { writeFiles: { 'src/output.txt': 'fixed\n' }, envelope: envelope(delivery('fixed')) },
+    {
+      echoPromptMatch: 'name one concrete\\s+mutation|Already recorded as `noted`|four data tables',
+      envelope: envelope(verdict({
+        criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'dropping the node key fails the test' }],
+        carried: [{ id: 'r1.1', state: 'closed', evidence: 'isolation holds now' }],
+      })),
+    },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.equal(echoes.length, 2, 'one echo per round')
+  const [round1, round2] = echoes
+  // Round 1 is told to try to break every Must cover it would record met.
+  assert.ok(round1.some((hit) => /name one concrete\s+mutation/.test(hit)))
+  assert.ok(!round1.includes('Already recorded as `noted`'), 'nothing is noted before round 1')
+  // Round 2 is shown what round 1 already noted, instead of re-deriving it.
+  assert.ok(round2.includes('Already recorded as `noted`'))
+  assert.ok(round2.includes('four data tables'))
+})
+
+test('build wakes an executor only after the same delivery makes the gate red twice', () => {
+  const gateFast = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');const ok=f.readFileSync('src/output.txt','utf8').includes('fixed');process.exit(ok?0:1)"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'broken\n' }, envelope: envelope(delivery('first try')) },
+    { writeFiles: { 'src/output.txt': 'fixed\n' }, envelope: envelope(delivery('fixed it')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  // The reviewer is intentionally unable to append to the harness log outside its isolated
+  // surface. The two writable calls therefore prove exactly the executor boundary in question.
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 3)
+  assert.match(result.stdout, /gate red — confirming once without an executor/)
+  assert.match(result.stdout, /gate reproducibly red \(executor retry 1\/2\)/)
+  assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
+})
+
+// The gate reads the delivery the way a test suite would: `value=42` is always checked, the label
+// only once the executor has added the check for it. So of the two mutations the executor names,
+// one is caught from the start and the other survives until the executor strengthens its test.
+const mutationGate = `node -e "const f=require('fs');const t=f.readFileSync('src/output.txt','utf8');` +
+  `f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');` +
+  `process.exit(t.includes('value=42')&&(!f.existsSync('src/check-label')||t.includes('label=x'))?0:1)"`
+const executorMutations = [
+  { id: 'm-value', criterion_ids: ['must-cover-1'], path: 'src/output.txt',
+    find: 'value=42', replace: 'value=41', breaks: 'the stored value' },
+  { id: 'm-label', criterion_ids: ['must-cover-1'], path: 'src/output.txt',
+    find: 'label=x', replace: 'label=y', breaks: 'the label' },
+]
+
+test('a surviving executor mutation goes back to the executor before any reviewer is paid',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value and the label are kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\nlabel=x\n' },
+      envelope: envelope(delivery('first', [], executorMutations)) },
+    { writeFiles: { 'src/check-label': 'checked\n' },
+      envelope: envelope(delivery('label checked', [], executorMutations)) },
+    {
+      echoPromptMatch: 'm-value \\(src/output.txt\\) — caught|m-label \\(src/output.txt\\) — caught',
+      envelope: envelope(verdict({ criteria: [{
+        id: 'must-cover-1', state: 'met', evidence: 'changing the value or the label turns the gate red',
+        evidence_refs: ['executor-mutation:m-value', 'executor-mutation:m-label'],
+      }] })),
+    },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.match(result.stdout, /m-label \(src\/output.txt\) — survived/)
+  assert.match(result.stdout, /1 mutation\(s\) survived the gate — back to the executor/)
+  assert.match(result.stdout, /round 1 .*new 0,  open now 0/)
+  // The second executor is told which of its own mutations the gate did not catch.
+  const retry = calls(f)[1].input
+  assert.match(retry, /m-label \(src\/output.txt\) — survived: the gate stayed green/)
+  assert.match(retry, /m-value \(src\/output.txt\) — caught: the gate went red/)
+  // The reviewer sees the engine's measurement of the delivery it judges, and may cite it.
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.equal(echoes.length, 1)
+  assert.equal(echoes[0].length, 2)
+  // Two deliveries, each: its own gate, one unmutated copy, two mutated copies.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 8)
+  // Every mutation ran on a copy; the committed delivery is what the executor wrote.
+  assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'value=42\nlabel=x\n')
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.diagnostics.filter((row) => row.kind === 'mutation-measurement').length, 2)
+})
+
+// Measured on one iOS install, twice: the executor after a rejecting review was shown the pre-review
+// "m1 caught, m2 caught, m3 caught" beside "Close every open finding", read the first as the
+// answer to the second, and returned the tree the reviewer had just rejected.
+test('an executor after a rejecting review is not shown the measurement that review already judged',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' },
+      envelope: envelope(delivery('first', [], [executorMutations[0]])) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'the value is not kept on reload' }],
+      broken: [{ where: 'src/output.txt:1', fix: 'keep the value on reload',
+        evidence: 'reloaded and the value was gone' }],
+    })) },
+    { writeFiles: { 'src/output.txt': 'value=42\nreload=kept\n' },
+      envelope: envelope(delivery('kept on reload')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor'])
+  assert.match(result.stdout, /m-value \(src\/output.txt\) — caught/)
+  const second = calls(f)[1].input
+  assert.match(second, /Close every open finding in the dossier/)
+  assert.doesNotMatch(second, /m-value \(src\/output.txt\) — caught/)
+  assert.doesNotMatch(second, /on each mutation you returned last time/)
+})
+
+// The gate watches the heading only once `src/heading-check` exists, so the reviewer's heading
+// mutation survives until the executor adds that check — and survives an unrelated edit.
+const headingGate = `node -e "const f=require('fs');f.appendFileSync(process.env.CAW_GATE_LOG,'gate\\n');` +
+  `process.exit(f.existsSync('src/heading-check')&&!f.readFileSync('README.md','utf8').startsWith('# fixture\\n')?1:0)"`
+
+// Measured on one iOS install, on two tasks: the executor answered a weak finding without running
+// the reviewer's mutation, and a whole review round went on learning that it still survived.
+test('an open weak finding is replayed on the next delivery and goes back before any reviewer while it survives',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Done when\n- The heading is checked.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'delivery\n' }, envelope: envelope(delivery('first')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'weak', evidence: 'the heading can change unseen' }],
+      weak: [{
+        where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+        evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+        mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+      }],
+    })) },
+    { writeFiles: { 'src/unrelated.txt': 'beside the point\n' },
+      envelope: envelope(delivery('strengthened a helper')) },
+    { writeFiles: { 'src/heading-check': 'on\n' }, envelope: envelope(delivery('heading checked')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'met', evidence: 'the heading mutation turns the gate red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the engine replay went red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — survived: the gate stayed green with it applied/)
+  assert.match(result.stdout, /1 mutation\(s\) survived the gate — back to the executor/)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — caught: the gate went red/)
+  assert.match(calls(f)[2].input,
+    /replayed the reviewer's own mutation for each open weak finding[\s\S]*r1\.1 \(README\.md:1\) — survived/)
+  assert.doesNotMatch(calls(f)[1].input, /replayed the reviewer's own mutation/)
+  // Round 1: gate, weak baseline, weak mutation. Then per delivery: gate, unmutated copy, r1.1.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 9)
+})
+
+// A finding recorded before `patch_run` existed names only its patch file. The installs already
+// hold such findings open, and the first resumed round on them is where the replay pays.
+test('an open weak finding recorded without its run is still replayed on a resumed round',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: headingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Done when\n- The heading is checked.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
+  const first = run(f, ['review', '001_task.md'], [{ envelope: envelope(verdict({
+    criteria: [{ id: 'done-when-1', state: 'weak', evidence: 'the heading can change unseen' }],
+    weak: [{
+      where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+      evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+      mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+    }],
+  })) }], { CAW_GATE_LOG: gateLog })
+  assert.equal(first.status, 1, `${first.stdout}\n${first.stderr}`)
+  const statePath = join(f.root, '.caw-tasks', '.round-001_task.md.json')
+  const state = JSON.parse(readFileSync(statePath, 'utf8'))
+  assert.match(state.history[0].mutation_event.patch_run, /^run-/)
+  delete state.history[0].mutation_event.patch_run
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`)
+
+  const result = run(f, ['round', '001_task.md'], [
+    { writeFiles: { 'src/unrelated.txt': 'beside the point\n' },
+      envelope: envelope(delivery('strengthened a helper')) },
+    { writeFiles: { 'src/heading-check': 'on\n' }, envelope: envelope(delivery('heading checked')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'met', evidence: 'the heading mutation turns the gate red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'the engine replay went red',
+        evidence_refs: ['review-mutation:r1.1'] }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — survived/)
+  assert.match(result.stdout, /r1\.1 \(README\.md:1\) — caught/)
+})
+
+const loggingGate = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,'gate\\n')"`
+const rejectingReview = { envelope: envelope(verdict({
+  criteria: [{ id: 'must-cover-1', state: 'broken', evidence: 'the value is not kept on reload' }],
+  broken: [{ where: 'src/output.txt:1', fix: 'keep the value on reload',
+    evidence: 'reloaded and the value was gone' }],
+})) }
+
+// Measured on one iOS install, on two tasks: an executor returned the tree the reviewer had just
+// rejected, and the engine paid the gate, the replays and the reviewers to learn `closed 0, new 0`.
+test('an executor that returns the rejected tree unchanged goes back without a gate or reviewer',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: loggingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('first')) },
+    rejectingReview,
+    { envelope: envelope(delivery('the tree already matches the dossier')) },
+    { writeFiles: { 'src/output.txt': 'value=42\nreload=kept\n' },
+      envelope: envelope(delivery('kept on reload')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.match(result.stdout, /executor returned the tree the reviewer rejected, unchanged — back to the executor/)
+  assert.doesNotMatch(calls(f)[1].input, /byte for byte/)
+  assert.match(calls(f)[2].input, /You returned the tree the reviewer rejected, byte for byte\. That tree cannot close r1\.1/)
+  // One gate per judged delivery; the unchanged return bought none.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 2)
+})
+
+test('an executor that returns the rejected tree unchanged twice stops for a human',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: loggingGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('first')) },
+    rejectingReview,
+    { envelope: envelope(delivery('no edits were needed')) },
+    { envelope: envelope(delivery('still no edits')) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1)
+  assert.match(`${result.stdout}\n${result.stderr}`,
+    /the executor returned the tree the reviewer rejected, unchanged, twice\. Nothing it can deliver unchanged closes r1\.1/)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor', 'executor', 'executor'])
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 1)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '.round-001_task.md.json')), true)
+})
+
+test('an executor mutation that cannot be applied is unavailable and never stops the delivery',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' }, envelope: envelope(delivery('done', [], [
+      { id: 'm-absent', criterion_ids: [], path: 'src/output.txt', find: 'nowhere',
+        replace: 'x', breaks: 'nothing' },
+      { id: 'm-outside', criterion_ids: [], path: '../escape.txt', find: 'a', replace: 'b',
+        breaks: 'nothing' },
+      { id: 'm-value', criterion_ids: [], path: 'src/output.txt', find: 'value=42',
+        replace: 'value=41', breaks: 'the stored value' },
+    ])) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /m-absent \(src\/output.txt\) — unavailable: `find` occurs 0 times/)
+  assert.match(result.stdout, /m-outside \(\.\.\/escape.txt\) — unavailable: \.\.\/escape.txt is not a regular file/)
+  assert.match(result.stdout, /m-value \(src\/output.txt\) — caught/)
+  assert.doesNotMatch(result.stdout, /back to the executor/)
+  assert.deepEqual(calls(f).map((call) => call.role), ['executor'])
+  assert.equal(existsSync(join(f.parent, 'escape.txt')), false)
+})
+
+test('an executor asks the engine to run the gate, and to run it on a mutation, mid-turn', () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' },
+      gateProbes: [
+        {},
+        { mutation: { path: 'src/output.txt', find: 'value=42', replace: 'value=41' } },
+        { mutation: { path: 'src/output.txt', find: 'absent', replace: 'x' } },
+      ],
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: join(f.parent, 'gate-calls.log') })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const executor = calls(f)[0]
+  assert.match(executor.input, /Gate probe\. Your write boundary may keep the gate from running/)
+  const probes = latestTaskAudit(f).delivery.executor_notes
+    .filter((note) => note.startsWith('fake-gate-probe:'))
+    .map((note) => JSON.parse(note.slice('fake-gate-probe:'.length)))
+  assert.deepEqual(probes.map(({ status }) => status), [0, 1, 2])
+  assert.equal(probes[0].last, 'caw-gate: green (status 0)')
+  assert.equal(probes[1].last, 'caw-gate: red (status 1)')
+  assert.match(probes[2].last, /caw-gate: unavailable: `find` occurs 0 times in src\/output.txt/)
+  // Probes ran on copies: the delivery the executor left is what was committed.
+  assert.equal(readFileSync(join(f.root, 'src', 'output.txt'), 'utf8'), 'value=42\n')
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  const probeRecord = manifest.diagnostics.find((row) => row.kind === 'gate-probe')
+  assert.ok(probeRecord, 'the probes are recorded in the run')
+  const body = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, probeRecord.file), 'utf8'))
+  assert.equal(body.requests, 3)
+})
+
+test('the gate broker answers at most its per-call limit and refuses the rest', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, gateProbes: Array.from({ length: 7 }, () => ({})),
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const probes = latestTaskAudit(f).delivery.executor_notes
+    .filter((note) => note.startsWith('fake-gate-probe:'))
+    .map((note) => JSON.parse(note.slice('fake-gate-probe:'.length)))
+  assert.deepEqual(probes.map(({ status }) => status), [0, 0, 0, 0, 0, 0, 2])
+  assert.match(probes[6].last, /caw-gate: refused: this call's 6 gate probes are spent/)
+})
+
+test('a gate probe still running when the executor returns is stopped with its broker', () => {
+  // The probe copy lives under the review-surface parent; the deciding gate runs in the delivery.
+  // Only the probe's gate lingers, and it leaves a mark if it outlives the executor call.
+  const gateFast = `node -e "const f=require('fs');if(process.cwd().includes('caw-review-surfaces'))` +
+    `{setTimeout(()=>f.appendFileSync(process.env.CAW_GATE_LOG,'orphan\\n'),3000)}"`
+  const f = fixture({ git: true, gateFast })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, gateProbes: [{ abandon: 1500 }],
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_LOG: gateLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  Atomics.wait(pause, 0, 0, 4000)
+  assert.equal(existsSync(gateLog), false, 'the abandoned probe gate kept running after the call')
+})
+
+test('confirmed red receipt is persisted before an executor retry starts', () => {
+  const f = fixture({
+    git: true,
+    gateFast: `node -e "process.exit(require('fs').readFileSync('src/output.txt','utf8').includes('fixed')?0:1)"`,
+  })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  const spec = '001_task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), '---\ntitle: Task\n---\n\nDo it.\n')
+
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'broken\n' }, envelope: envelope(delivery('first try')) },
+    { status: 1, error: 'retry interrupted after editing' },
+  ])
+
+  assert.equal(result.status, 1)
+  const state = JSON.parse(readFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), 'utf8'))
+  assert.equal(state.state_version, 6)
+  assert.equal(state.gate_fact.state, 'red')
+  assert.match(state.gate_fact.receipt_id, /^[0-9a-f]{64}$/)
+})
+
+test('unavailable gate may receive one advisory review but cannot commit', () => {
+  const f = fixture({ git: true, gateFast: 'exit 75', gateUnavailableReview: 'true' })
+  const result = buildOneTask(f)
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls.map((call) => call.role), ['executor', 'reviewer'], text)
+  assert.match(text, /running one advisory reviewer pass without certification/)
+  assert.match(text, /delivery is not certified or committed/i)
+  assert.equal(readFileSync(join(f.root, 'src/output.txt'), 'utf8'), 'done\n')
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_task.md')), true)
+})
+
+test('Codex runner enforces its live tool-event budget', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'caw-runner-budget-'))
+  TEMP_ROOTS.add(parent)
+  const fake = join(parent, 'events.mjs')
+  writeFileSync(fake, [
+    "process.on('SIGINT', () => process.exit(130))",
+    "for (let i = 0; i < 20; i++) console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution'}}))",
+    'setTimeout(() => process.exit(0), 5000)',
+  ].join('\n'))
+  const runner = join(ROOT, '.caw', 'adapters', 'codex', 'runner.mjs')
+  const result = spawnSync(process.execPath, [runner, '-', process.execPath, fake], {
+    input: '', encoding: 'utf8', timeout: 3000,
+    env: { ...process.env, CAW_EXECUTOR_MAX_TOOL_EVENTS: '3' },
+  })
+
+  assert.equal(result.status, 86, result.stderr)
+  assert.match(result.stderr, /CAW_EXECUTOR_BUDGET_EXHAUSTED tool-events 3\/3/)
+})
+
+test('adaptive executor budget is selected before delivery and retained in the run record', () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, {
+    executor_budget_small_tool_events: 80,
+    executor_budget_small_event_bytes: 1048576,
+    executor_budget_normal_tool_events: 160,
+    executor_budget_normal_event_bytes: 2097152,
+    executor_budget_large_tool_events: 240,
+    executor_budget_large_event_bytes: 4194304,
+  })
+  execFileSync('git', ['add', '.caw/CAW.md'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'configure adaptive executor budgets'], { cwd: f.root })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /executor budget: normal \(requested normal, floor small\); 160 tool events/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.calls[0].prompt.executor_budget, {
+    mode: 'adaptive', class: 'normal', requested: 'normal', floor: 'small',
+    planning_requested: null,
+    reason: 'one non-sensitive surface with fewer than four transitions',
+    tool_events: 160, event_bytes: 2097152,
+  })
+})
+
+test('task gate receives stable task key and must pass every required check id', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { writeFileSync } from 'node:fs'
+writeFileSync(process.env.CAW_TASK_KEY_LOG, process.env.CAW_TASK_KEY)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add focused gate'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '018_renumbered.md'), `---
+title: Task
+task_key: stable-output-authority
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`)
+  const keyLog = join(f.parent, 'task-key.log')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ], { CAW_TASK_KEY_LOG: keyLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.equal(readFileSync(keyLog, 'utf8'), 'stable-output-authority')
+})
+
+// The gate used to be handed the output path and nothing else, so the only way to emit a
+// conforming manifest was to re-derive the contract — one install parsed `## Required gate
+// checks` out of CAW_SPEC, which is correct and invisible. A gate emitting MORE than was asked
+// for is refused exactly like one emitting nothing, so the contract has to arrive with the path.
+test('the gate is told which check ids are required and against what they are judged', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { readFileSync, writeFileSync } from 'node:fs'
+writeFileSync(process.env.CAW_CONTRACT_LOG, JSON.stringify({
+  required: process.env.CAW_GATE_REQUIRED_CHECKS,
+  contract: JSON.parse(readFileSync(process.env.CAW_GATE_CONTRACT, 'utf8')),
+}))
+// Emit exactly what the engine asked for, derived from the engine's own list rather than
+// from the spec. This is the shape the export exists to make writable.
+const ids = process.env.CAW_GATE_REQUIRED_CHECKS.split('\\n').filter(Boolean)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks: ids.map((id) => ({
+  id, criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'required check passed', artifacts:[]
+}))}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add contract-reading gate'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '019_contract.md'), `---
+title: Task
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+- \`tier-output\` — second required proof
+
+## Done when
+- The fixture output exists.
+`)
+  const contractLog = join(f.parent, 'gate-contract.json')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ], { CAW_CONTRACT_LOG: contractLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+
+  const seen = JSON.parse(readFileSync(contractLog, 'utf8'))
+  // The plain list is what a shell gate loops over with no dependency at all.
+  assert.equal(seen.required, 'focused-output\ntier-output')
+  assert.equal(seen.contract.version, 1)
+  assert.equal(seen.contract.task, '019_contract.md')
+  assert.equal(seen.contract.kind, 'fast')
+  assert.deepEqual(seen.contract.required_check_ids, ['focused-output', 'tier-output'])
+  // A check MAY link a criterion instead of being required, and cannot guess the engine's
+  // stable ids — so the census travels with the list.
+  assert.deepEqual(seen.contract.criteria, [
+    { id: 'done-when-1', section: 'Done when', criterion: 'The fixture output exists.' },
+  ])
+  assert.deepEqual(seen.contract.acceptance_cases, [])
+})
+
+// The install this is written for updated from 0.1.0: its gate predates evidence manifests, its
+// new architect declares required checks, and the two met after an executor round had been paid
+// for. The refusal has to arrive before the provider does.
+test('a gate that writes no evidence manifest is refused before any executor runs', () => {
+  const f = fixture({ git: true, gateFast: 'node -e "process.exit(0)"' })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '020_unmigrated.md'), `---
+title: Task
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`)
+  // No provider responses are queued: reaching one would itself be the failure.
+  const result = run(f, ['build'], [])
+
+  assert.notEqual(result.status, 0)
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.match(output, /declare '## Required gate checks'/)
+  assert.match(output, /no evidence manifest to CAW_GATE_EVIDENCE_OUT/)
+  assert.match(output, /020_unmigrated\.md/)
+  // The point of the check is where it happens, not that it happens.
+  assert.doesNotMatch(output, /green gate produced no evidence manifest/)
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal((manifest.calls || []).length, 0, 'no provider call may precede this refusal')
+})
+
+// A reviewer is required to name transition_ids on every blocking finding, and the ids are
+// content hashes that appear in no form it reads: the spec renders arrows, not ids. Measured on
+// one install, the role answered with `<surface>:<from>-><to>` over a transition that really
+// exists. Only a REJECTION is asked for them — reviewContractIssue walks the blocking slots —
+// so the role could approve and could not reject, and a real defect ended the run as an engine
+// diagnostic instead of a finding.
+test('the reviewer is shown the engine-owned surface and transition ids it must name', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  // Two surfaces, and the second carries TWO transitions that share a state name. A
+  // one-transition surface cannot measure this fix: `<surface>:<from>-><to>` is unambiguous
+  // there, so a composed id still reads as the right one. The shape below is taken from the
+  // install that reported it, where one surface hops A->B and then B->C.
+  const specText = [
+    '---', 'title: Topology', '---', '',
+    '## Surfaces',
+    '- `check-d-header-doc` — the dated measurement header',
+    '- `onboarding-step-extraction` — the step enum and its registration', '',
+    '## State machines',
+    '- `check-d-header-doc`: states `undated-restatement`, `dated-with-listing`',
+    '  - `undated-restatement` -- attach the ticket listing --> `dated-with-listing`',
+    '- `onboarding-step-extraction`: states `inline`, `registered`, `partition-confirmed`',
+    '  - `inline` -- cut the enum into its own file --> `registered`',
+    '  - `registered` -- re-check the counterfactual patches --> `partition-confirmed`', '',
+    '## Done when',
+    '- The header carries its original date.', '',
+  ].join('\n')
+  writeFileSync(join(f.root, '.caw-tasks', '023_topology.md'), specText)
+  writeFileSync(join(f.root, 'delivery.txt'), 'implemented\n')
+
+  const result = run(f, ['review', '023_topology.md'], [
+    {
+      // The reviewer cannot write outside its surface, so what CAW sent it comes back in `noted`.
+      echoPromptMatch: 'transition-[0-9a-f]{12}|Transitions:|check-d-header-doc'
+        + '|onboarding-step-extraction',
+      envelope: envelope(verdict({ criteria: [{
+        id: 'done-when-1', state: 'met', evidence: 'read the header',
+        evidence_refs: ['repository:delivery.txt'],
+      }] })),
+    },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+
+  const topology = extractTaskTopology(specText)
+  assert.equal(topology.transitions.length, 3)
+  // The ids are derived, so the test takes them from the engine rather than restating hashes.
+  for (const row of topology.transitions) assert.match(row.id, /^transition-[0-9a-f]{12}$/)
+  const sharedSurface = topology.transitions
+    .filter((row) => row.surface === 'onboarding-step-extraction')
+  assert.equal(sharedSurface.length, 2, 'the ambiguous case needs two hops on one surface')
+  assert.notEqual(sharedSurface[0].id, sharedSurface[1].id)
+
+  const echo = latestTaskAudit(f).delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-prompt-echo:'))
+  assert.ok(echo, 'the reviewer pass recorded no prompt echo')
+  const seen = JSON.parse(echo.slice('fake-prompt-echo:'.length))
+  // Every one of them, not just the first: a reviewer picking between two hops on one surface
+  // is exactly where a composed `<surface>:<from>-><to>` stays plausible and means nothing.
+  for (const row of topology.transitions) {
+    assert.ok(seen.includes(row.id),
+      `the reviewer prompt must carry ${row.id} (${row.surface}); saw ${echo}`)
+  }
+  assert.ok(seen.includes('check-d-header-doc'), 'and the surface ids beside them')
+  assert.ok(seen.includes('onboarding-step-extraction'))
+  // The arrow form alone is what produced the composed id; it must not be the only rendering.
+  assert.ok(seen.includes('Transitions:'))
+})
+
+test('a non-met criterion names the exact text its blocking item has to quote', () => {
+  const spec = [
+    '## Done when',
+    '- The header carries its original date.',
+  ].join('\n')
+  const verdictValue = {
+    criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'the header was rewritten' }],
+    broken: [{ evidence: 'the header lost its date' }],
+    uncovered: [], weak: [], carried: [],
+  }
+
+  const issue = reviewCriteriaIssue(spec, verdictValue.criteria, verdictValue)
+
+  // The id comes first because naming it is what satisfies the check; the text stays for a role
+  // that chose to quote.
+  assert.match(issue, /list "done-when-1" in the criterion_ids of the broken item/)
+  assert.ok(issue.includes('The header carries its original date.'))
+})
+
+// End to end, the shape that could not serialize on a third install: a real rejection whose
+// finding names its criterion by id and describes what was observed without restating it.
+// The record of a rejected round must say what its findings were ABOUT. `open_item_ids` alone
+// names them and nothing else, so an install checking afterwards which transition a finding meant
+// had to re-derive the whole topology from the audit's spec string.
+// A credential outliving a task and not a queue is measured on three installs: twice to a
+// reviewer mid-build, once to a plan-reviewer that took a finished enumerator and architect down
+// with it. `exited 1` is not something an operator can act on, and the tree is not at fault.
+test('an expired credential is told apart from an ordinary provider failure', () => {
+  for (const text of [
+    'API Error: 401 {"type":"error","error":{"type":"authentication_error",' +
+      '"message":"OAuth access token has expired"}}',
+    'Error: 401 Unauthorized — token expired',
+    'invalid_api_key: the provided key was rejected',
+    'credentials rejected',
+  ]) assert.equal(expiredCredentials(text), true, text)
+
+  for (const text of [
+    'exited 1',
+    'API Error: 500 Server error mid-response',
+    'the spec mentions a 401 response code in its done_when',
+    'ENOENT: no such file or directory',
+    '',
+  ]) assert.equal(expiredCredentials(text), false, text)
+})
+
+test('a malformed executor answer is repaired once instead of ending the run', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    // A claim missing the fields the delivery schema requires: valid JSON, invalid canonical value.
+    { envelope: envelope({ summary: 'first try', notes: [], mutations: [], blocked: '',
+      claims: [{ id: 'check-one', summary: 'ran it' }] }) },
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict()) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /executor canonical inconsistency; retrying once: \$\.claims/)
+  // Two executor calls, not one and a dead run. The reviewer's own call is absent from this log
+  // because it runs inside its isolated surface, which cannot write here.
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor', 'executor'])
+  assert.match(result.stdout, /committed {2}[0-9a-f]{7}/)
+  const repair = calls(f)[1].input
+  assert.match(repair, /Canonical repair 1 for executor/)
+  assert.match(repair, /Rejected canonical value/)
+  assert.match(repair, /check-one/)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const manifest = JSON.parse(readFileSync(join(f.root, '.caw-logs', runName, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.diagnostics.filter((row) =>
+    row.role === 'executor' && row.kind === 'canonical-validation').length, 1)
+  assert.equal(existsSync(join(f.root, '.git', 'caw', 'contract-failures')), false)
+})
+
+test('a second malformed executor answer still stops, with the failure retained', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const malformed = { envelope: envelope({ summary: 'try', notes: [], mutations: [], blocked: '',
+    claims: [{ id: 'check-one', summary: 'ran it' }] }) }
+  const result = run(f, ['build'], [malformed, malformed])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /executor returned invalid canonical output at \$\.claims/)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['executor', 'executor'])
+  const root = join(f.root, '.git', 'caw', 'contract-failures')
+  const record = JSON.parse(readFileSync(join(root, readdirSync(root)[0]), 'utf8'))
+  assert.equal(record.role, 'executor')
+  assert.equal(record.diagnostics.length, 2)
+})
+
+test('a rejected round records its findings\' links and the topology they belong to',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_links.md'), [
+    '---', 'title: Links', '---', '',
+    '## Surfaces',
+    '- `retention-window` — the configured retention period', '',
+    '## State machines',
+    '- `retention-window`: states `days`, `duration`',
+    '  - `days` -- convert to a duration --> `duration`', '',
+    '## Done when',
+    '- Retention converts days to a positive duration.', '',
+  ].join('\n'))
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+
+  const expected = extractTaskTopology(
+    readFileSync(join(f.root, '.caw-tasks', '001_links.md'), 'utf8'))
+  const transitionId = expected.transitions[0].id
+  const result = run(f, ['review', '001_links.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'observed a negative period' }],
+      broken: [{ where: 'README.md:1', fix: 'bound the multiplication',
+        surface_ids: ['retention-window'], transition_ids: [transitionId],
+        evidence: 'ran the conversion with 3650 and saw a negative period' }],
+    })) },
+  ])
+  assert.equal(result.status, 1)
+
+  const runName = readdirSync(join(f.root, '.caw-logs')).find((name) => name.startsWith('run-'))
+  const certName = readdirSync(join(f.root, '.caw-logs', runName))
+    .find((name) => name.startsWith('certification-'))
+  const certification = JSON.parse(
+    readFileSync(join(f.root, '.caw-logs', runName, certName), 'utf8'))
+
+  assert.equal(certification.state, 'rejected')
+  assert.equal(certification.open_items.length, 1)
+  const [item] = certification.open_items
+  assert.equal(item.id, certification.open_item_ids[0])
+  assert.equal(item.slot, 'broken')
+  assert.deepEqual(item.criterion_ids, ['done-when-1'])
+  assert.deepEqual(item.surface_ids, ['retention-window'])
+  assert.deepEqual(item.transition_ids, [transitionId])
+  assert.ok(item.property_key)
+  // And the topology those ids resolve against, so nothing has to be re-derived to read them.
+  assert.deepEqual(certification.topology.transitions.map((row) => row.id), [transitionId])
+  assert.equal(certification.topology.transitions[0].from, 'days')
+  assert.equal(certification.topology.transitions[0].to, 'duration')
+})
+
+// The shape one install hit four times running: a finding keyed in snake_case, refused each time.
+test('a reviewer finding keyed in snake_case is recorded, with the key normalised',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_keys.md'),
+    'title: Keys\n\n## Done when\n- The handler propagates the failing step error.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_keys.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken', evidence: 'a later consequence is reported' }],
+      broken: [{ where: 'README.md:1', fix: 'propagate the first error',
+        property_key: 'handler_propagates_failing_step_error_rather_than_later_consequence',
+        evidence: 'forced the first step to fail and saw the second step error instead' }],
+    })) },
+  ])
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.doesNotMatch(output, /invalid property_key/)
+  assert.doesNotMatch(output, /invalid canonical output/)
+  assert.match(output, /one round this command runs is done/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks', '.round-001_keys.md.json'), 'utf8'))
+  assert.equal(saved.history[0].property_key,
+    'handler-propagates-failing-step-error-rather-than-later-consequence')
+})
+
+test('a reviewer rejection that names its criterion by id is recorded as a finding',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  writeFileSync(join(f.root, '.caw-tasks', '001_retention.md'),
+    'title: Retention\n\n## Done when\n- Retention converts days to a positive duration.\n')
+  writeFileSync(join(f.root, 'README.md'), '# changed delivery\n')
+  const result = run(f, ['review', '001_retention.md'], [
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'done-when-1', state: 'broken',
+        evidence: '3650 days overflowed to a negative value' }],
+      broken: [{ where: 'README.md:1', fix: 'bound the multiplication',
+        evidence: 'ran the conversion with 3650 and observed a negative period, no error' }],
+    })) },
+  ])
+  const output = `${result.stdout}\n${result.stderr}`
+  assert.doesNotMatch(output, /invalid canonical output/)
+  assert.doesNotMatch(output, /semantic inconsistency/)
+  assert.match(output, /one round this command runs is done/)
+  const saved = JSON.parse(readFileSync(join(f.root, '.caw-tasks',
+    '.round-001_retention.md.json'), 'utf8'))
+  assert.equal(saved.history.length, 1)
+  assert.deepEqual(saved.history[0].criterion_ids, ['done-when-1'])
+  assert.equal(existsSync(join(f.root, '.git', 'caw', 'contract-failures')), false)
+})
+
+// Measured on one iOS install: a task-bound project rule ("a task closes its own backlog block") made the
+// preflight red when it was asked as the queue's first task on the committed tree, and `build`
+// refused an approved queue before any executor ran. The manifest is written only on green.
+// Two shapes of such a gate: one that drops its delivery checks when CAW_SPEC is unset, and one
+// that then judges the whole queue, as docs/gate.md prescribes (`queue`) — the install that measured it has the second.
+const deliveryBoundGate = `
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
+appendFileSync(process.env.CAW_GATE_RUN_LOG, (process.env.CAW_SPEC || '-') + '\\n')
+const delivered = existsSync('src/output-1.txt')
+if (process.env.CAW_GATE_RED_WITHOUT_DELIVERY === 'queue' && !delivered) process.exit(1)
+if (process.env.CAW_SPEC && !delivered) process.exit(1)
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`
+const requiredCheckSpec = `---
+title: Task 1
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`
+const requiredCheckResponses = [
+  { writeFiles: { 'src/output-1.txt': 'done\n' }, envelope: envelope(delivery('did it')) },
+  { envelope: envelope(verdict({ criteria: [{
+    id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+    evidence_refs: ['gate-check:focused-output'],
+  }] })) },
+]
+
+test('the contract preflight asks the gate about no task, so a delivery-bound rule cannot refuse the queue', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), deliveryBoundGate)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add delivery-bound gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '012_first.md'), requiredCheckSpec)
+
+  const result = run(f, ['build'], requiredCheckResponses, { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /it writes an evidence manifest/)
+  // The preflight ran with no CAW_SPEC; the task's own gate ran with its spec.
+  assert.deepEqual(readFileSync(runLog, 'utf8').trim().split('\n'), ['-', '012_first.md'])
+})
+
+test('a gate red on the undelivered queue leaves the contract unsettled and the build going', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), deliveryBoundGate)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add queue-bound gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '012_first.md'), requiredCheckSpec)
+
+  const env = { CAW_GATE_RUN_LOG: runLog, CAW_GATE_RED_WITHOUT_DELIVERY: 'queue' }
+  const result = run(f, ['build'], requiredCheckResponses, env)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /it was red on the committed tree \(status 1\) and wrote no manifest/)
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /wrote\n\s+no evidence manifest/)
+  // Unsettled is not cached: the next build asks again.
+  writeFileSync(join(f.root, '.caw-tasks', '013_second.md'), requiredCheckSpec.replace('Task 1', 'Task 2'))
+  const again = run(f, ['build'], [], env)
+  assert.match(again.stdout, /gate evidence contract/)
+})
+
+test('the contract preflight is paid once per gate, not once per build', () => {
+  const f = fixture({ git: true, gateFast: 'node gate.mjs' })
+  writeFileSync(join(f.root, 'gate.mjs'), `
+import { appendFileSync, writeFileSync } from 'node:fs'
+appendFileSync(process.env.CAW_GATE_RUN_LOG, process.env.CAW_GATE_EVIDENCE_OUT + '\\n')
+writeFileSync(process.env.CAW_GATE_EVIDENCE_OUT, JSON.stringify({version:1, checks:[{
+  id:'focused-output', criterion_ids:[], acceptance_case_ids:[], selector:'',
+  evidence_kind:'command', state:'passed', summary:'focused output passed', artifacts:[]
+}]}))
+`)
+  execFileSync('git', ['add', 'gate.mjs'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add manifest-writing gate'], { cwd: f.root })
+  const runLog = join(f.parent, 'gate-runs.log')
+  writeFileSync(runLog, '')
+
+  const spec = (n) => `---
+title: Task ${n}
+---
+
+## Required gate checks
+- \`focused-output\` — focused delivery proof
+
+## Done when
+- The fixture output exists.
+`
+  const responses = (n) => [
+    { writeFiles: { [`src/output-${n}.txt`]: 'done\n' }, envelope: envelope(delivery('did it')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'done-when-1', state: 'met', evidence: 'read the focused output',
+      evidence_refs: ['gate-check:focused-output'],
+    }] })) },
+  ]
+
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '021_first.md'), spec(1))
+  const first = run(f, ['build'], responses(1), { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`)
+  const afterFirst = readFileSync(runLog, 'utf8').split('\n').filter(Boolean).length
+
+  writeFileSync(join(f.root, '.caw-tasks', '022_second.md'), spec(2))
+  const second = run(f, ['build'], responses(2), { CAW_GATE_RUN_LOG: runLog })
+  assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`)
+  const afterSecond = readFileSync(runLog, 'utf8').split('\n').filter(Boolean).length
+
+  assert.match(first.stdout, /gate evidence contract/)
+  // The second build asks nothing: same gate, same engine, same profile.
+  assert.doesNotMatch(second.stdout, /gate evidence contract/)
+  assert.equal(afterFirst, 2, 'the first build pays one preflight plus the task gate')
+  assert.equal(afterSecond - afterFirst, 1, 'the second build pays only the task gate')
+})
 
 test('a configured gate_full runs once at the end of a build and reports green', () => {
   const f = fixture({ git: true, gateFull: 'node -e "process.exit(0)"' })
@@ -3075,6 +6994,54 @@ test('a configured gate_full runs once at the end of a build and reports green',
   assert.match(result.stdout, /· full gate: node -e "process\.exit\(0\)"/)
   assert.match(result.stdout, /\n {2}green/)
   assert.doesNotMatch(result.stdout, /no gate_full configured/)
+})
+
+test('a batch gate runs once after task commits and before the full gate', () => {
+  const f = fixture({
+    git: true,
+    gateBatch: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'batch\\n\')"',
+    gateFull: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'full\\n\')"',
+  })
+  const log = join(f.parent, 'batch.log')
+  const result = buildOneTask(f, [], ['build'], { CAW_BATCH_LOG: log })
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(readFileSync(log, 'utf8'), 'batch\nfull\n')
+})
+
+test('a batch gate runs when round commits the last resumed task', () => {
+  const f = fixture({
+    git: true,
+    gateBatch: 'node -e "require(\'fs\').appendFileSync(process.env.CAW_BATCH_LOG, \'batch\\n\')"',
+  })
+  const log = join(f.parent, 'resume-batch.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  const spec = '001_task.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'src', 'output.txt'), 'done\n')
+  writeFileSync(join(f.root, '.caw-tasks', `.round-${spec}.json`), `${JSON.stringify({
+    state_version: 6, spec_digest: 'saved', round: 1, history: [], how: null, noted: [],
+    accounting: { currencies: {}, unknown_cost_calls: 0 }, runtime_history: [],
+    project_policies: null, weak_verification: null, gate_fact: null, ex: null,
+  })}\n`)
+
+  const result = run(f, ['round', spec], [
+    { envelope: envelope(delivery('finished')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_BATCH_LOG: log })
+
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.equal(readFileSync(log, 'utf8'), 'batch\n')
+})
+
+test('fast mode ends after focused task review and skips queue-level gates', () => {
+  const f = fixture({
+    git: true, pipelineMode: 'fast',
+    gateBatch: 'node -e "process.exit(1)"', gateFull: 'node -e "process.exit(1)"',
+  })
+  const result = buildOneTask(f)
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /fast mode ends after focused task gates and reviews/)
 })
 
 test('--no-full skips a configured gate_full', () => {
@@ -3104,4 +7071,249 @@ test('a gate_full that refuses to start says nothing was tested, and offers no b
   assert.match(text, /full gate DID NOT RUN — it refused to start, and nothing was tested/)
   assert.match(text, /Every task is committed on its own green fast gate; none of that is in doubt/)
   assert.doesNotMatch(text, /git bisect/)
+})
+
+test('a fast gate timeout is neither red nor refused and preserves task recovery', () => {
+  const f = fixture({
+    git: true,
+    gateFast: 'exec node -e "setTimeout(()=>{},2000)"',
+    gateFastTimeout: '30',
+  })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const spec = '001_timeout.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Timeout\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [])
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  assert.match(text, /fast gate TIMED OUT after 30 ms and was killed/)
+  assert.doesNotMatch(text, /gate red — confirming|refused to start/)
+  assert.equal(calls(f).length, 0)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', `.round-${spec}.json`)), true)
+})
+
+test('a full gate timeout has no red verdict and offers no bisect', () => {
+  const f = fixture({
+    git: true,
+    gateFull: 'exec node -e "setTimeout(()=>{},2000)"',
+    gateFullTimeout: '30',
+  })
+  const result = buildOneTask(f)
+  const text = result.stdout + result.stderr
+
+  assert.equal(result.status, 1)
+  assert.match(text, /full gate TIMED OUT after 30 ms and was killed/)
+  assert.doesNotMatch(text, /full gate is RED|git bisect/)
+})
+
+// Measured on one iOS install: a timed-out gate lost only its `bash`, while the xcodebuild under it ran
+// on for forty more minutes, and the next gate on the same simulator went red against that
+// survivor. A red it causes is scored as a caught mutation, so the orphan refutes findings.
+test('a gate timeout kills every process the gate started, not only its shell', () => {
+  const f = fixture({
+    git: true,
+    gateFast: 'node -e "require(\'fs\').writeFileSync(process.env.CAW_TEST_ORPHAN_PID, String(process.pid)); setTimeout(()=>{},20000)" | cat',
+    gateFastTimeout: '1500',
+  })
+  const pidFile = join(f.root, '..', `orphan-${process.pid}.pid`)
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  const spec = '001_orphan.md'
+  writeFileSync(join(f.root, '.caw-tasks', spec), 'title: Orphan\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'hand delivery\n')
+
+  const result = run(f, ['review', spec], [], { CAW_TEST_ORPHAN_PID: pidFile })
+  const pid = Number(readFileSync(pidFile, 'utf8'))
+  const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+  try {
+    assert.match(result.stdout + result.stderr, /fast gate TIMED OUT after 1500 ms and was killed/)
+    // A killed orphan is reaped by init, not by the engine, so it may linger for a moment.
+    const until = Date.now() + 1000
+    while (alive() && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+    assert.equal(alive(), false, `gate grandchild ${pid} outlived the gate's timeout`)
+  } finally {
+    if (alive()) process.kill(pid, 'SIGKILL')
+  }
+})
+
+test('invalid project gate timeouts fail before provider calls', () => {
+  const f = fixture({ git: true, gateFastTimeout: '1.5' })
+  const result = run(f, ['plan', 'x'], [])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /gate_fast_timeout_ms must be a positive whole number/)
+  assert.equal(calls(f).length, 0)
+})
+
+test('invalid executor and unavailable-gate budgets fail before provider calls', () => {
+  for (const fields of [
+    { executor_max_tool_events: '0' },
+    { executor_max_event_bytes: '1.5' },
+    { gate_unavailable_review: 'sometimes' },
+  ]) {
+    const f = fixture({ git: true })
+    configureProfileFields(f, fields)
+    const result = run(f, ['plan', 'x'], [])
+    assert.equal(result.status, 1)
+    assert.equal(calls(f).length, 0)
+  }
+})
+
+test('adaptive executor profiles reject partial, mixed, and non-monotonic limits', () => {
+  const invalid = [
+    { executor_budget_small_tool_events: 80 },
+    {
+      executor_max_tool_events: 100,
+      executor_budget_small_tool_events: 80,
+      executor_budget_small_event_bytes: 1048576,
+      executor_budget_normal_tool_events: 160,
+      executor_budget_normal_event_bytes: 2097152,
+      executor_budget_large_tool_events: 240,
+      executor_budget_large_event_bytes: 4194304,
+    },
+    {
+      executor_budget_small_tool_events: 80,
+      executor_budget_small_event_bytes: 1048576,
+      executor_budget_normal_tool_events: 70,
+      executor_budget_normal_event_bytes: 2097152,
+      executor_budget_large_tool_events: 240,
+      executor_budget_large_event_bytes: 4194304,
+    },
+  ]
+  for (const fields of invalid) {
+    const f = fixture({ git: true })
+    configureProfileFields(f, fields)
+    const result = run(f, ['plan', 'x'], [])
+    assert.equal(result.status, 1)
+    assert.equal(calls(f).length, 0)
+  }
+})
+
+// ---------------------------------------------------------------- autopilot
+
+const autopilotJournal = (f) => {
+  const name = readdirSync(join(f.root, '.caw-logs')).find((entry) => entry.startsWith('autopilot-'))
+  return readFileSync(join(f.root, '.caw-logs', name), 'utf8').trim().split('\n').map(JSON.parse)
+}
+
+test('autopilot answers a refused gate by re-running it through review, and finishes the queue',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const refusesOnce = `node -e "const f=require('fs'),p=process.env.CAW_GATE_COUNT;` +
+    `const n=f.existsSync(p)?Number(f.readFileSync(p,'utf8')):0;f.writeFileSync(p,String(n+1));process.exit(n===0?75:0)"`
+  const f = fixture({ git: true, gateFast: refusesOnce })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['autopilot', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_COUNT: join(f.parent, 'gate-count') })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /the fast gate DID NOT RUN/)
+  assert.match(result.stdout, /autopilot: gate-refused: the gate is re-run on the same tree \(1\/1\)/)
+  assert.match(result.stdout, /autopilot finished: 001_task\.md was the last task/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_task.md')), false)
+  const journal = autopilotJournal(f)
+  const stop = journal.find((entry) => entry.event === 'stop')
+  assert.equal(stop.record.kind, 'gate-refused')
+  assert.equal(stop.record.task, '001_task.md')
+  assert.deepEqual(stop.decision.argv, ['review', '001_task.md'])
+  assert.deepEqual(journal.filter((entry) => entry.event === 'run').map((entry) => entry.argv),
+    [['build', '--no-full'], ['review', '001_task.md']])
+  assert.equal(journal.at(-1).event, 'finished')
+})
+
+test('autopilot hands a judgement stop to the human and says so through the notify hook',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const notified = join(f.parent, 'notified.txt')
+  configureProfileFields(f, {
+    autopilot_notify_cmd: `node -e "require('fs').writeFileSync(process.env.CAW_TEST_NOTIFY,` +
+      `[process.env.CAW_AUTOPILOT_OUTCOME,process.env.CAW_AUTOPILOT_KIND,process.env.CAW_AUTOPILOT_TASK].join(' '))"`,
+  })
+  execFileSync('git', ['commit', '-qam', 'notify hook'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['autopilot', '--no-full'], [
+    { envelope: envelope({ ...delivery('cannot'), blocked: 'the spec contradicts the canonical document' }) },
+  ], { CAW_TEST_NOTIFY: notified })
+
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /autopilot stopped: executor-blocked is a decision/)
+  assert.equal(readFileSync(notified, 'utf8'), 'stopped executor-blocked 001_task.md')
+  assert.deepEqual(autopilotJournal(f).filter((entry) => entry.event === 'run').length, 1)
+})
+
+test('a stop writes its kind for autopilot, and a round autopilot authorised says so in the commit',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'first\n')
+  const record = join(f.parent, 'stop.json')
+  const first = run(f, ['review', '001_task.md'], [rejectingReview], { CAW_STOP_RECORD: record })
+  assert.equal(first.status, 1)
+  assert.deepEqual(JSON.parse(readFileSync(record, 'utf8')), {
+    version: 1, kind: 'round-cap', command: 'review', task: '001_task.md', round: 1, open: ['r1.1'],
+  })
+
+  const second = run(f, ['round', '001_task.md'], [
+    { writeFiles: { 'delivery.txt': 'kept on reload\n' }, envelope: envelope(delivery('kept')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded and the value stayed' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded and the value stayed' }],
+    })) },
+  ], { CAW_AUTOPILOT: '1' })
+  assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`)
+  const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
+  assert.match(message, /^Review: .*, round 2 — rounds beyond the cap were authorised by `autopilot`, not by a person\.$/m)
+})
+
+// Measured on two installs, on every review pass of several tasks: with no replay rows the prompt still
+// listed `review-mutation:<id>`, the reviewer cited its own capture as `review-mutation:caw-weak-1`,
+// and each pass paid a semantic repair ($1.12, $1.21) to be told the id was unknown.
+test('a reviewer is offered review-mutation evidence only when the engine replayed something',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'done\n')
+  const result = run(f, ['review', '001_task.md'], [{
+    echoPromptMatch: 'review-mutation:<id>|review-experiment:caw-weak-N',
+    envelope: envelope(verdict()),
+  }])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.deepEqual(echoes, [['review-experiment:caw-weak-N']])
+})
+
+// Measured on one iOS install (one gate_fast ≈ 13 min): a blind challenger captured the same mutations as
+// the primary pass, and each pass replayed them against the same digest after its own baseline.
+test('a weak gate already answered on this delivery is reused, and a mutation run is told its paths',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const pathsGate = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,` +
+    `(process.env.CAW_GATE_MUTATION_PATHS||'-')+'\\n')"`
+  const f = fixture({ git: true, gateFast: pathsGate })
+  configureProfileFields(f, { review_challenger_passes: 1, review_challenger_policy: 'fixed' })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'done\n')
+  const weak = () => ({ envelope: envelope(verdict({ weak: [{
+    where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+    evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+    mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+  }] })) })
+  const result = run(f, ['review', '001_task.md'], [weak(), weak()], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /review: 2 passes — the primary and 1 blind challenger \(review_challenger_policy: fixed\)/)
+  assert.match(result.stdout, /unmutated gate on this delivery was already green in this run; reused/)
+  assert.match(result.stdout, /README\.md: same patch on the same delivery already confirmed-weak; reused/)
+  // The task gate, one baseline and one mutation — the challenger's pair was answered already.
+  assert.deepEqual(readFileSync(gateLog, 'utf8').trim().split('\n'), ['-', '-', 'README.md'])
 })
