@@ -59,6 +59,21 @@ and run `grep -rn 'LOCAL CHANGE' caw.mjs .caw/` **before** copying, not after: t
 make re-application a list rather than a memory. A local change that survives two updates is
 one that belongs upstream instead.
 
+### What else a gate and a profile meet — coming to 0.2.0
+
+- **A gate's leftovers are stopped.** The fast gate runs in a process group of its own, and the
+  whole group is stopped when the command exits, on its timeout, and on a signal. A gate that
+  starts a background process and expects it to outlive the gate must start it outside that group
+  — a daemon or a service manager — or it is stopped with the gate.
+- **The evidence-contract preflight runs as no task.** `CAW_SPEC` is unset for it and its
+  `CAW_GATE_CONTRACT` says `"kind": "contract-preflight"`. Only a green run without a manifest
+  refuses the queue; a red one is asked again on the next build. A gate that judges the whole queue
+  without `CAW_SPEC` is cached only if it skips its delivery checks for that kind.
+- **Weak replays can be made cheaper.** A `weak-mutation` run carries its kind in the contract and
+  the changed files in `CAW_GATE_MUTATION_PATHS`; [gate.md](gate.md) states what narrowing costs.
+- **`autopilot` is opt-in.** Nothing changes for an install that keeps running `build`. Its limits
+  and hooks are the optional `autopilot_*` profile fields in the README.
+
 ### When, and who decides
 
 **The install decides.** Not the owner, and not a session on another machine: neither can see

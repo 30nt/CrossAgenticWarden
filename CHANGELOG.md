@@ -63,6 +63,15 @@ Target release: **0.2.0**.
 
 ### Fixed
 
+- A gate that times out, or finishes, no longer leaves processes behind: the fast gate and the weak
+  control commands run in a process group of their own, and the whole group is stopped on timeout,
+  on a signal, when the command exits and when the engine dies. A timed-out gate used to lose only
+  its shell, and the build under it raced the next gate on the same simulator.
+- An executor after a rejecting review is no longer shown the pre-review measurement of its own
+  mutations, and one that returns the tree the reviewer rejected, unchanged, goes back to the
+  executor without a gate, replay or reviewer; a second unchanged return stops the task.
+- The reviewer reads each of its `noted` items against `## Must cover`, `## Change` and
+  `## Done when` before returning, and moves one that names an unmet line to `uncovered`.
 - A reviewer is offered `executor-mutation:<id>` and `review-mutation:<id>` only when the engine
   listed rows of that kind, and told that its own capture is `review-experiment:caw-weak-N`; citing
   its own weak branch as `review-mutation:` cost a semantic repair on every pass.
