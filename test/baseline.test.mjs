@@ -5558,7 +5558,7 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
   writeFileSync(join(f.root, '.caw-tasks', '001_baseline-task.md'), 'title: Baseline task\n')
   writeFileSync(join(f.root, 'delivery.txt'), 'delivery\n')
   writeFileSync(f.queue, `${JSON.stringify([
-    { delayMs: 5000, envelope: envelope(verdict()) },
+    { delayMs: 5000, startedMark: '.fake-reviewer-started', envelope: envelope(verdict()) },
   ], null, 2)}\n`)
   const before = new Set(activeSurfaceNames())
   const child = spawn(process.execPath, ['caw.mjs', 'review', '001_baseline-task.md'], {
@@ -5588,6 +5588,24 @@ test('SIGINT retains an interrupted isolated review surface', { skip: !CLAUDE_OU
     await new Promise((done) => setTimeout(done, 20))
   }
   assert.ok(runName, 'reviewer provider attempt did not start before SIGINT')
+  // The attempt is recorded before the provider process exists. A signal sent in that gap was
+  // measured to miss the provider in CI: once it ran its whole delay and answered (5.6 s, a
+  // non-interrupted exit), once a sandbox wrapper still starting turned it into an ordinary
+  // failure. So the signal waits until the fake provider says it is running.
+  const surfaceName = activeSurfaceNames().find((name) => !before.has(name))
+  const findMark = (dir, depth) => {
+    let entries = []
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return false }
+    return entries.some((entry) => entry.name === '.fake-reviewer-started' ||
+      (depth > 0 && entry.isDirectory() && !entry.isSymbolicLink() &&
+        entry.name !== '.git' && findMark(join(dir, entry.name), depth - 1)))
+  }
+  let running = false
+  for (let attempt = 0; attempt < 250; attempt++) {
+    if (findMark(join(REVIEW_SURFACE_PARENT, surfaceName), 3)) { running = true; break }
+    await new Promise((done) => setTimeout(done, 20))
+  }
+  assert.ok(running, 'the fake reviewer never reported that it was running')
   process.kill(-child.pid, 'SIGINT')
   const exit = await new Promise((done) => child.once('exit', (code, signal) => done({ code, signal })))
   assert.equal([1, 130].includes(exit.code), true)
