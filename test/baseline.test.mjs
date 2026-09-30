@@ -7269,3 +7269,50 @@ test('a stop writes its kind for autopilot, and a round autopilot authorised say
   const message = execFileSync('git', ['log', '-1', '--pretty=%B'], { cwd: f.root, encoding: 'utf8' })
   assert.match(message, /^Review: .*, round 2 — rounds beyond the cap were authorised by `autopilot`, not by a person\.$/m)
 })
+
+// Measured on two installs, on every review pass of several tasks: with no replay rows the prompt still
+// listed `review-mutation:<id>`, the reviewer cited its own capture as `review-mutation:caw-weak-1`,
+// and each pass paid a semantic repair ($1.12, $1.21) to be told the id was unknown.
+test('a reviewer is offered review-mutation evidence only when the engine replayed something',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'done\n')
+  const result = run(f, ['review', '001_task.md'], [{
+    echoPromptMatch: 'review-mutation:<id>|review-experiment:caw-weak-N',
+    envelope: envelope(verdict()),
+  }])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const echoes = latestTaskAudit(f).delivery.reviewer_notes
+    .filter((note) => note.startsWith('fake-prompt-echo:'))
+    .map((note) => JSON.parse(note.slice('fake-prompt-echo:'.length)))
+  assert.deepEqual(echoes, [['review-experiment:caw-weak-N']])
+})
+
+// Measured on one iOS install (one gate_fast ≈ 13 min): a blind challenger captured the same mutations as
+// the primary pass, and each pass replayed them against the same digest after its own baseline.
+test('a weak gate already answered on this delivery is reused, and a mutation run is told its paths',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const pathsGate = `node -e "require('fs').appendFileSync(process.env.CAW_GATE_LOG,` +
+    `(process.env.CAW_GATE_MUTATION_PATHS||'-')+'\\n')"`
+  const f = fixture({ git: true, gateFast: pathsGate })
+  configureProfileFields(f, { review_challenger_passes: 1, review_challenger_policy: 'fixed' })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'done\n')
+  const weak = () => ({ envelope: envelope(verdict({ weak: [{
+    where: 'README.md:1', fix: 'make the gate observe the fixture heading',
+    evidence: 'I changed README.md in the isolated review surface and the gate stayed green',
+    mutation: { patch: readmeMutation('broken'), breaks: 'the fixture heading' },
+  }] })) })
+  const result = run(f, ['review', '001_task.md'], [weak(), weak()], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /review: 2 passes — the primary and 1 blind challenger \(review_challenger_policy: fixed\)/)
+  assert.match(result.stdout, /unmutated gate on this delivery was already green in this run; reused/)
+  assert.match(result.stdout, /README\.md: same patch on the same delivery already confirmed-weak; reused/)
+  // The task gate, one baseline and one mutation — the challenger's pair was answered already.
+  assert.deepEqual(readFileSync(gateLog, 'utf8').trim().split('\n'), ['-', '-', 'README.md'])
+})

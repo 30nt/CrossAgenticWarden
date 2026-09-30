@@ -110,12 +110,22 @@ that offers the contract from one that does not:
 |---|---|
 | `CAW_GATE_REQUIRED_CHECKS` | the required check ids, one per line, for a shell to loop over |
 | `CAW_GATE_CONTRACT` | a path to version-1 JSON: `required_check_ids`, `criteria`, `acceptance_cases` |
+| `CAW_GATE_MUTATION_PATHS` | on a `weak-mutation` run, the files the mutation changed, one per line; empty on every other run |
 
 The JSON is what a gate needs to link rather than declare. A check naming a criterion must use
 the engine's own stable census id, and one naming an acceptance case must match that row's exact
 `evidence_kind` and `selector` — none of which a project can guess. Emit the required ids from
 `CAW_GATE_REQUIRED_CHECKS` directly; do not parse `## Required gate checks` out of `CAW_SPEC`,
 which duplicates engine-owned identity in project code and drifts silently when it changes.
+
+The JSON also names the run's `kind`: `fast`, `batch`, `full`, `contract-preflight`, and on a
+disposable review copy `weak-baseline` or `weak-mutation`. A replay run exists only to learn whether
+one mutation turns the gate red, so a gate may make it cheaper: stop at the first failure, and run
+only the tests that reach `CAW_GATE_MUTATION_PATHS`. Narrowing is the project's call and its risk.
+A suite cut too far lets a mutation survive that the full suite would catch, and the reviewer's
+weak finding then blocks the task on a test gap that does not exist. Within one invocation the
+engine asks a weak gate once per exact delivery digest and patch: a green baseline and a caught
+or surviving mutation are reused, a red, timed-out or refused run is asked again.
 
 ```bash
 while IFS= read -r id; do [ -n "$id" ] && printf '%s\n' "$id"; done \

@@ -63,6 +63,13 @@ Target release: **0.2.0**.
 
 ### Fixed
 
+- A reviewer is offered `executor-mutation:<id>` and `review-mutation:<id>` only when the engine
+  listed rows of that kind, and told that its own capture is `review-experiment:caw-weak-N`; citing
+  its own weak branch as `review-mutation:` cost a semantic repair on every pass.
+- Weak gates are asked once per exact delivery digest within an invocation: a green unmutated
+  baseline and a caught or surviving mutation with the same patch bytes are reused, so a blind
+  challenger no longer replays the primary pass's captures. A weak-mutation run receives
+  `CAW_GATE_MUTATION_PATHS`, and a planned challenger pass says why it runs.
 - The gate evidence-contract preflight no longer runs as the queue's first task and no longer
   refuses a queue over a red run: it is asked of no task (`CAW_SPEC` unset, `kind:
   contract-preflight`), and only a green gate without a manifest refuses. A red or refused one

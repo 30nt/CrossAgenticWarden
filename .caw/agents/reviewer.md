@@ -125,7 +125,8 @@ answer-card block while `## Change` required updating it, and the item blocked o
 Every criterion disposition, carried decision and blocking item also carries `evidence_refs`.
 Use the exact references supplied by the dossier: `gate-receipt:<id>`, `gate-check:<id>`,
 `gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `review-mutation:<id>`,
-`repository:<path>` or `review-experiment:<id>`.
+`repository:<path>` or `review-experiment:<id>`. The two `*-mutation:<id>` kinds name only rows the
+engine lists in your prompt; a mutation you capture yourself is `review-experiment:caw-weak-N`.
 
 For each open `weak` finding the engine replays the mutation captured for it against the new
 delivery before you are called, and tells you the result. A caught replay is `review-mutation:<id>`

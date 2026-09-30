@@ -6230,6 +6230,8 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
   // guessed. Both are always set, including empty, so a gate can tell an engine that offers
   // the contract from one that does not.
   env.CAW_GATE_REQUIRED_CHECKS = requiredCheckIds.join('\n')
+  // The files a weak-mutation run changed, one per line; empty on every other run.
+  env.CAW_GATE_MUTATION_PATHS = (context.mutationPaths || []).join('\n')
   const contractPath = join(evidenceScratch, 'contract.json')
   writeFileSync(contractPath, `${JSON.stringify({
     version: 1,
@@ -8368,6 +8370,22 @@ function requireTaskBranch(f) {
 
 const CHALLENGER_RISK_PATH = /(^|\/)(auth|security|billing|payment|migrations?|polic(?:y|ies)|rls)(\/|[._-]|$)/i
 
+// Why a challenger was planned before the primary pass, in the words of the profile. Measured on
+// one iOS install: pass 2 ran with nothing in the log saying why, and the operator reconstructed a wrong
+// cause — a refuted weak claim — from the gate receipts. Null when no challenger is planned up front.
+function challengerReason(f, files, open = []) {
+  if (f.review_challenger_policy === 'fixed') {
+    return f.review_challenger_passes > 0 ? 'review_challenger_policy: fixed' : null
+  }
+  if (open.length) return `review_challenger_policy: risk, ${open.length} open item(s) carried in`
+  if (files.length >= f.review_challenger_file_threshold) {
+    return `review_challenger_policy: risk, ${files.length} changed files` +
+      ` (threshold ${f.review_challenger_file_threshold})`
+  }
+  const risky = files.find((path) => CHALLENGER_RISK_PATH.test(path))
+  return risky ? `review_challenger_policy: risk, ${risky} is a risk path` : null
+}
+
 function reviewNeedsChallenger(f, files, open = [], verdict = null) {
   if (f.review_challenger_policy === 'fixed') return f.review_challenger_passes > 0
   if (open.length || files.length >= f.review_challenger_file_threshold ||
@@ -9007,6 +9025,20 @@ function restoreWeakReplaySurface(surface, baseline) {
   }
 }
 
+// What a weak gate already answered in this invocation, keyed by everything its answer depends on:
+// the gate command and limit, the task it runs as, the exact delivery digest and, for a mutation,
+// the patch bytes. Measured on one iOS install (one gate_fast ≈ 13 min there): a primary review pass and
+// its blind challenger replayed the same five captures against the same digest, each after its own
+// unmutated gate, and a round spent 3 baselines where one answered — about 65 min of gate time
+// that told nobody anything new. Only a green baseline and a mutation verdict (caught or
+// survived) are kept; a red, timed-out or refused run is asked again, because that is exactly
+// the run a retry might settle.
+const weakGateAnswers = new Map()
+const weakGateKey = (f, spec, digest, patchSha256 = null) => stableJson({
+  gate: f.gate_fast, timeout_ms: f.gate_fast_timeout_ms ?? null, spec: spec || null,
+  delivery_digest: digest, patch_sha256: patchSha256,
+})
+
 function replayWeakMutation(item, f, spec, expectedDigest, surface) {
   const patch = item?.mutation?.patch
   if (typeof patch !== 'string' || !patch.length) throw new Error('weak mutation patch is missing')
@@ -9034,6 +9066,17 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     error.weakPatch = patchEvidence
     throw error
   }
+  const key = weakGateKey(f, spec, expectedDigest, patchEvidence.patch_sha256)
+  const known = weakGateAnswers.get(key)
+  if (known) {
+    say(`    ${paths.join(', ')}: same patch on the same delivery already ${known.state}; reused`)
+    const event = { ...known, ...patchEvidence, gate_reused: true }
+    surface.weakGate = {
+      phase: 'mutation', state: event.state, gate: event.gate,
+      status: event.gate_status, output: event.gate_output,
+    }
+    return event
+  }
   execFileSync('git', ['apply', '--check', '--binary', '-'], {
     cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
   })
@@ -9041,8 +9084,12 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     cwd: surface.workingRoot, input: patch, maxBuffer: REVIEW_PATCH_MAX,
   })
   const startedAt = Date.now()
+  // The files the mutation changes, so a gate may narrow what it runs to the tests that reach
+  // them. That narrowing is the project's call and its risk: a suite cut too far lets a mutation
+  // survive that the full suite would catch, and the reviewer's weak finding then blocks.
   const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
     task: spec, kind: 'weak-mutation', deliveryDigest: expectedDigest, collectEvidence: false,
+    mutationPaths: paths,
   })
   const event = {
     state: result.state === 'timeout' ? 'unverified-timeout'
@@ -9059,6 +9106,10 @@ function replayWeakMutation(item, f, spec, expectedDigest, surface) {
     phase: 'mutation', state: event.state, gate: event.gate,
     status: event.gate_status, output: event.gate_output,
   }
+  if (['confirmed-weak', 'mutation-caught'].includes(event.state)) {
+    const { patch: _patch, ...answer } = event
+    weakGateAnswers.set(key, answer)
+  }
   return event
 }
 
@@ -9066,6 +9117,16 @@ function weakBaselineGate(f, spec, expectedDigest, surface) {
   if (deliveryDigest() !== expectedDigest) {
     throw new WeakMutationInvariantError(
       'delivery tree changed after its green gate; refusing weak baseline')
+  }
+  const key = weakGateKey(f, spec, expectedDigest)
+  const known = weakGateAnswers.get(key)
+  if (known) {
+    say('    unmutated gate on this delivery was already green in this run; reused')
+    surface.weakGate = {
+      phase: 'baseline', state: known.state,
+      gate: known.gate, status: known.gate_status, output: known.gate_output,
+    }
+    return { ...known, gate_reused: true }
   }
   const startedAt = Date.now()
   const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
@@ -9083,6 +9144,7 @@ function weakBaselineGate(f, spec, expectedDigest, surface) {
     state: result.state,
     gate: observation.gate, status: observation.gate_status, output: observation.gate_output,
   }
+  if (result.state === 'green') weakGateAnswers.set(key, { ...observation, state: 'green' })
   return { ...observation, state: surface.weakGate.state }
 }
 
@@ -10277,6 +10339,10 @@ function runTask(file, f, profileText, opts = {}) {
     let weakBaseline = null
     let passCount = gateUnavailable ? 1 : 1 + (reviewNeedsChallenger(f, files, open)
       ? f.review_challenger_passes : 0)
+    if (passCount > 1) {
+      say(`  review: ${passCount} passes — the primary and ${passCount - 1} blind challenger` +
+        `${passCount > 2 ? 's' : ''} (${challengerReason(f, files, open)})`)
+    }
     for (let passIndex = 0; passIndex < passCount; passIndex++) {
       const reviewSurface = createReviewSurface(f, g.receipt)
       reviewSurfaceIds.push(reviewSurface.parent.split(/[\\/]/).pop())
@@ -10340,11 +10406,18 @@ function runTask(file, f, profileText, opts = {}) {
         ' mutation the current verification would NOT catch, the row is `weak` now, in this',
         ' round, with that mutation as its evidence — not a finding held for a later round:\n\n' +
           renderReviewCriteria(spec, projectCriteria),
+        // Only the kinds this delivery has rows for. Measured on two installs, every pass of several tasks:
+        // offered `review-mutation:<id>` with nothing replayed, the reviewer cited its own capture
+        // as `review-mutation:caw-weak-1` and paid a semantic repair to learn the id was unknown.
         '\n\nEvery criterion disposition, carried adjudication, and new finding must include',
         ' `evidence_refs`. Use `gate-receipt:<id>`, `gate-check:<id>`,',
-        ' `gate-artifact:<id>`, `executor-claim:<id>`, `executor-mutation:<id>`, `review-mutation:<id>`,',
+        ' `gate-artifact:<id>`, `executor-claim:<id>`,',
+        executorMutationRows(measuredMutations).length ? ' `executor-mutation:<id>`,' : '',
+        reviewMutationRows(measuredMutations).length ? ' `review-mutation:<id>`,' : '',
         ' `repository:<path>` or',
         ' `review-experiment:<id>`. A met criterion cannot rely only on executor claims.',
+        ' A mutation you capture yourself in this pass is `review-experiment:caw-weak-N`;',
+        ' a `*-mutation:<id>` names only a row the engine listed above.',
         ' Every new finding must also name criterion_ids, surface_ids, transition_ids and one',
         ` stable property_key: ${PROPERTY_KEY_RULE}.`,
         ' Use empty surface/transition arrays only when the contract has no',
