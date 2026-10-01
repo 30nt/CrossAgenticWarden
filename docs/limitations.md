@@ -185,6 +185,11 @@ and then restore its own tree.
   break that check invisibly — one install carried `755` on two files tracked as `644` and every
   content check passed. `.gitattributes` closes the line-ending half.
 - **A rejected round's notes never reach a commit, and the run prints that they did.**
+- **An interrupt can wait for a provider.** The engine acts on SIGINT or SIGTERM only between
+  its own synchronous steps. A signal that lands while a provider or a gate is running reaches
+  that child and ends the call; one that lands in the moment after an attempt is recorded and
+  before its provider process exists is acted on only when that provider returns. Measured in
+  CI as a test that signalled in exactly that gap: the provider ran its whole delay and answered.
 - **No bootstrap.** The loop is "change the code, keep the gate green", and an empty repository
   has no gate to keep green. A human makes the first commit — skeleton, manifest, one passing
   test, `gate_fast` — by hand.
@@ -229,6 +234,7 @@ artifacts themselves are not published.
 | native macOS Xcode/Swift review gate | direct experiment failed four of five checks inside the current profile; controls passed outside it | the review-boundary limitation above; Node-gate acceptance does not generalize to toolchains needing external writable temp/cache state |
 | Linux, planning half | reported by one install (Python, bubblewrap 0.11.0, uid 1000), 2026-09-03: `plan` of 7 calls, 3 review rounds, no refusal or retry, $19.41 | **not verified here**, same reason. All three planning roles share `engine-private-only`, so this is one write scope, not three |
 | Linux, `build` | reported in progress by the same install: executor under bwrap, `createReviewSurface()` built by the engine, `gate_fast` green and red inside it | **not verified here**. Not reported even there: a task commit, five remaining tasks, a completed `build` |
+| `autopilot` | reported by one install, 2026-09-30: one task committed in two rounds inside `build`, then a red full gate stopped it for the human | deterministic only for every stop it answers — none of them has fired live |
 | Windows | none | portable contract tests do not substitute for an OS boundary run |
 
 Across the four bindings in the published acceptance summary, four tasks were planned,
