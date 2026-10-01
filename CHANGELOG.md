@@ -5,6 +5,13 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- A full or batch gate that does not pass writes a stop record (`full-gate-red`,
+  `full-gate-timeout`, `full-gate-refused`, `full-gate-policy`, and the `batch-gate-*` three), so
+  `autopilot` names it in its journal and to `autopilot_notify_cmd` instead of reporting
+  `unknown`. The decision stays with the human.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added
