@@ -5,6 +5,8 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-01
+
 ### Fixed
 
 - A full or batch gate that does not pass writes a stop record (`full-gate-red`,
@@ -195,6 +197,7 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/30nt/CrossAgenticWarden/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/30nt/CrossAgenticWarden/releases/tag/v0.1.0
