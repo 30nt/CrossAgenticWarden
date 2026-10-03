@@ -7335,3 +7335,30 @@ test('a weak gate already answered on this delivery is reused, and a mutation ru
   // The task gate, one baseline and one mutation — the challenger's pair was answered already.
   assert.deepEqual(readFileSync(gateLog, 'utf8').trim().split('\n'), ['-', '-', 'README.md'])
 })
+
+// Measured on one iOS install, the first live autopilot run: the task committed, the full gate
+// went red, and the journal and the notify hook said `unknown names no task`.
+test('autopilot names a red full gate in its journal and to the notify hook',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFull: 'node -e "process.exit(1)"' })
+  const notified = join(f.parent, 'notified.txt')
+  configureProfileFields(f, {
+    autopilot_notify_cmd: `node -e "require('fs').writeFileSync(process.env.CAW_TEST_NOTIFY,` +
+      `[process.env.CAW_AUTOPILOT_OUTCOME,process.env.CAW_AUTOPILOT_KIND].join(' '))"`,
+  })
+  execFileSync('git', ['commit', '-qam', 'notify hook'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['autopilot'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_TEST_NOTIFY: notified })
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_task.md')), false, 'the task committed')
+  assert.match(result.stderr, /full gate is RED/)
+  assert.match(result.stdout, /autopilot stopped: the full gate is red/)
+  assert.equal(readFileSync(notified, 'utf8'), 'stopped full-gate-red')
+  const stop = autopilotJournal(f).find((entry) => entry.event === 'stop')
+  assert.deepEqual(stop.record, { version: 1, kind: 'full-gate-red', command: 'build', gate: 'full', status: 1 })
+})

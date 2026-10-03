@@ -61,3 +61,21 @@ test('a stall, a judgement and an unrecognised stop all go to the human', () => 
   assert.match(decide(null).reason, /names no task/)
   assert.match(decide({ kind: 'unknown', task }).reason, /without a stop record/)
 })
+
+test('a queue gate that did not pass is the human\'s, and is named', () => {
+  const reasons = {
+    'full-gate-red': /the full gate is red/,
+    'full-gate-timeout': /the full gate timed out/,
+    'full-gate-refused': /the full gate refused to run/,
+    'full-gate-policy': /project gate policy stopped the full gate/,
+    'batch-gate-red': /the batch gate is red/,
+    'batch-gate-timeout': /the batch gate timed out/,
+    'batch-gate-refused': /the batch gate refused to run/,
+  }
+  for (const [kind, reason] of Object.entries(reasons)) {
+    // A queue stop names no task; that must not read as an unrecognised stop.
+    const answer = decide({ kind, gate: kind.split('-')[0], status: 1 })
+    assert.equal(answer.action, 'stop', kind)
+    assert.match(answer.reason, reason)
+  }
+})
