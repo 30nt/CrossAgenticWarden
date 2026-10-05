@@ -890,7 +890,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.0'
+const VERSION = '0.2.1'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -8293,11 +8293,19 @@ function runFinalFullGate(f, startHead, fullGateBaseline = null) {
   })
   if (gatePolicy?.output.action === 'stop') {
     if (g.out) say(g.out)
+    writeStopRecord('full-gate-policy', { gate: 'full', status: g.status ?? null })
     die(`project gate policy ${gatePolicy.policy.id} stopped the full gate: ` +
       gatePolicy.output.reason.trim())
   }
   if (!g.ok) {
     say(g.out)
+    // A queue gate's verdict is the human's in every case, but it is still a fact `autopilot` can
+    // name. Measured on one iOS install: a task committed, the full gate went red, and the journal
+    // and the notify hook said only `unknown`, so the morning reader had to open the build log to
+    // learn which of the stops it had been.
+    writeStopRecord(g.state === 'timeout' ? 'full-gate-timeout'
+      : g.state === 'refused' ? 'full-gate-refused' : 'full-gate-red',
+    { gate: 'full', status: g.status ?? null })
     if (g.state === 'timeout') {
       die(`full gate TIMED OUT after ${formatTimeout(g.timeoutMs)} and was killed. No full-gate` +
           ` verdict exists; re-run it or adjust gate_full_timeout_ms in .caw/CAW.md.`)
@@ -8332,6 +8340,9 @@ function runBatchGate(f) {
   }
   if (!g.ok) {
     if (g.out) say(g.out)
+    writeStopRecord(g.state === 'timeout' ? 'batch-gate-timeout'
+      : g.state === 'refused' ? 'batch-gate-refused' : 'batch-gate-red',
+    { gate: 'batch', status: g.status ?? null })
     if (g.state === 'timeout') {
       die(`batch gate timed out after ${formatTimeout(g.timeoutMs)}; no verdict exists`)
     }
@@ -10842,6 +10853,16 @@ const AUTOPILOT_STEPS_MAX = 100
 const AUTOPILOT_HOOK_TIMEOUT_MS = 5 * 60 * 1000
 const AUTOPILOT_ROUND_KINDS = new Set(['round-cap', 'gate-red-retries', 'review-baseline-red'])
 const AUTOPILOT_GATE_KINDS = new Set(['gate-timeout', 'gate-refused'])
+// Stops of the queue rather than of a task. Each is the human's, and each is named.
+const AUTOPILOT_QUEUE_STOPS = {
+  'full-gate-red': 'the full gate is red',
+  'full-gate-timeout': 'the full gate timed out',
+  'full-gate-refused': 'the full gate refused to run',
+  'full-gate-policy': 'the project gate policy stopped the full gate',
+  'batch-gate-red': 'the batch gate is red',
+  'batch-gate-timeout': 'the batch gate timed out',
+  'batch-gate-refused': 'the batch gate refused to run',
+}
 
 // The whole policy, pure so it can be read and tested apart from the processes it drives.
 // `counts` is per task and per run; the caller increments what the answer spends.
@@ -10849,6 +10870,7 @@ function decideAutopilot(record, counts, limits, { treeDirty }) {
   const kind = record?.kind || 'unknown'
   const task = record?.task || null
   const human = (reason) => ({ action: 'stop', reason })
+  if (AUTOPILOT_QUEUE_STOPS[kind]) return human(AUTOPILOT_QUEUE_STOPS[kind])
   if (!task) return human(`${kind} names no task`)
   const spent = counts.tasks[task] || { rounds: 0, gates: 0, resumes: 0 }
   // The role that died decides where the task resumes: an executor's round is re-run, a

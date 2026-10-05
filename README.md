@@ -237,7 +237,7 @@ CAW appends payload-free counters and durations to Git's private `caw/metrics/ru
 
 ## Status and licence
 
-**v0.2.0 is the latest tagged release.** One maintainer, a research
+**v0.2.1 is the latest tagged release.** One maintainer, a research
 tool, exercised on a handful of real projects rather than benchmarked. The adapter contract is
 not stable until v1.
 
