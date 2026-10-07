@@ -7362,3 +7362,87 @@ test('autopilot names a red full gate in its journal and to the notify hook',
   const stop = autopilotJournal(f).find((entry) => entry.event === 'stop')
   assert.deepEqual(stop.record, { version: 1, kind: 'full-gate-red', command: 'build', gate: 'full', status: 1 })
 })
+
+// ---------------------------------------------------------------- partial spec revision
+
+const taskFixture = (slug, doneWhen) => ({
+  slug, title: `Task ${slug}`, read: ['README.md'], change: [`Write ${slug}.`], done_when: [doneWhen],
+  gate_checks: [], surfaces: [{ id: `${slug}-output`, responsibility: `The ${slug} output.` }],
+  state_machines: [{
+    surface: `${slug}-output`, states: ['absent', 'present'],
+    transitions: [{ from: 'absent', event: `write ${slug}`, to: 'present' }],
+  }],
+  indivisible_reason: '', executor_budget: 'small',
+})
+const twoTaskPlan = (doneWhenB = 'The b output exists.') => ({
+  tasks: [taskFixture('task-a', 'The a output exists.'), taskFixture('task-b', doneWhenB)],
+  coverage: [
+    { case: 'a output', task: 'task-a', acceptance_criteria: ['The a output exists.'] },
+    { case: 'b output', task: 'task-b', acceptance_criteria: [doneWhenB] },
+  ],
+  blocked: '', resplit: [],
+})
+const twoTaskDescription = 'Create the a output and the b output'
+const planTwoTasks = (f) => {
+  const result = run(f, ['plan', twoTaskDescription], [
+    { envelope: envelope(population([
+      { case: 'a output', source: requestSource('the a output') },
+      { case: 'b output', source: requestSource('the b output') },
+    ])) },
+    { envelope: envelope(twoTaskPlan()) },
+    { envelope: envelope(planReview(twoTaskPlan())) },
+  ])
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+}
+const holeInB = { envelope: envelope({
+  ...planReview(twoTaskPlan()), unverifiable: ['task-b: its done_when does not say where the b output is'],
+}) }
+
+// Measured on one iOS install: closing holes in 3 of 13 specs, the architect returned all 13, and
+// review-specs died once on the 30-minute role timeout and once on a 64000-token output ceiling.
+test('review-specs revises only the specs its holes touch when the plan object is on record', () => {
+  const f = fixture({ git: true })
+  planTwoTasks(f)
+  const specA = join(f.root, '.caw-tasks', '001_task-a.md')
+  const specB = join(f.root, '.caw-tasks', '002_task-b.md')
+  const beforeA = readFileSync(specA, 'utf8')
+  const revisedB = taskFixture('task-b', 'The b output exists under src/b.')
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', twoTaskDescription], [
+    holeInB,
+    { envelope: envelope({
+      tasks: [revisedB], order: ['task-a', 'task-b'],
+      coverage: [{ case: 'b output', task: 'task-b', acceptance_criteria: ['The b output exists under src/b.'] }],
+      blocked: '', resplit: [],
+    }) },
+    { envelope: envelope({ ...planReview(twoTaskPlan('The b output exists under src/b.')),
+      carried: [{ id: 'h1', state: 'closed', evidence: 'task-b done_when now names src/b' }] }) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /architect revised 1 of 2 task\(s\); the rest are kept as they were/)
+  const architect = calls(f).find(({ role }) => role === 'architect')
+  assert.match(architect.input, /Return only the tasks you change or add/)
+  assert.doesNotMatch(architect.input, /Return the whole plan again/)
+  assert.equal(readFileSync(specA, 'utf8'), beforeA, 'the untouched spec is byte-identical')
+  assert.match(readFileSync(specB, 'utf8'), /The b output exists under src\/b\./)
+})
+
+test('review-specs asks for the whole plan when the specs on disk are not the recorded ones', () => {
+  const f = fixture({ git: true })
+  planTwoTasks(f)
+  const specB = join(f.root, '.caw-tasks', '002_task-b.md')
+  writeFileSync(specB, `${readFileSync(specB, 'utf8')}\n<!-- edited by hand -->\n`)
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', twoTaskDescription], [
+    holeInB,
+    { envelope: envelope(twoTaskPlan('The b output exists under src/b.')) },
+    { envelope: envelope({ ...planReview(twoTaskPlan('The b output exists under src/b.')),
+      carried: [{ id: 'h1', state: 'closed', evidence: 'task-b done_when now names src/b' }] }) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const architect = calls(f).find(({ role }) => role === 'architect')
+  assert.match(architect.input, /Return the whole plan again/)
+  assert.doesNotMatch(result.stdout, /architect revised/)
+})

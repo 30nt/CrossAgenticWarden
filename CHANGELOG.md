@@ -5,6 +5,14 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- `review-specs` asks the architect to return only the specs it changes or adds, with an `order`
+  naming every task that remains, when the specs on disk are the exact ones the last plan wrote;
+  the engine keeps every other task and its rendering as it was. A hand-written or hand-edited
+  queue is still revised whole. The plan object behind the specs is recorded in Git's private
+  `caw/plan-object.json`.
+
 ## [0.2.1] - 2026-10-01
 
 ### Fixed
