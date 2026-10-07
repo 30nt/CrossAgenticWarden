@@ -3707,12 +3707,22 @@ const dumpNotes = () => {
 // picking up after a run died, and until now the only thing that ever mentioned the file was
 // one line printed at the moment of death — so the record survived and the knowledge of it did
 // not. `plan` and `build` therefore announce it on the way in.
-const noticeNotesLog = () => {
-  if (!existsSync(NOTES_LOG)) return
+const notesLogState = () => {
+  if (!existsSync(NOTES_LOG)) return null
   const text = readFileSync(NOTES_LOG, 'utf8')
   const count = (text.match(/^- /gm) || []).length
   const when = (text.match(/^## (.+)$/gm) || []).slice(-1)[0]?.slice(3) || 'an earlier run'
-  say(`· ${NOTES_LOG}: ${count} note(s) from a run that died, last ${when}. Read it before you decide.`)
+  // It travels to autopilot's steps in an environment variable, which cannot hold a NUL.
+  return { count, when, signature: `${count} notes, last ${when}` }
+}
+// `autopilot` runs every step as its own process, so each one used to repeat the same notice:
+// measured on one iOS install, the banner for a batch long finished opened every step of the
+// next. Within one autopilot run a notice is shown once per state of the file; notes added by a
+// step that died during the run change the state and are announced again.
+const noticeNotesLog = () => {
+  const state = notesLogState()
+  if (!state || process.env.CAW_NOTES_NOTICED === state.signature) return
+  say(`· ${NOTES_LOG}: ${state.count} note(s) from a run that died, last ${state.when}. Read it before you decide.`)
 }
 
 // `.caw-tasks/notes.log` is written by `die` and by nothing else, so a run that reaches the end
@@ -11068,6 +11078,7 @@ function runAutopilot(noFull) {
   const scratch = mkdtempSync(join(tmpdir(), 'caw-autopilot-'))
   const recordPath = join(scratch, 'stop.json')
   const counts = { tasks: {}, reauths: 0 }
+  const noticedNotes = new Set()
   const note = (entry) => {
     appendFileSync(journal, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
       { mode: 0o600 })
@@ -11099,9 +11110,15 @@ function runAutopilot(noFull) {
     rmSync(recordPath, { force: true })
     say(`\n· autopilot step ${step}: caw.mjs ${argv.join(' ')}`)
     note({ event: 'run', step, argv })
+    const notesState = notesLogState()
+    const notesNoticed = notesState && noticedNotes.has(notesState.signature) ? notesState.signature : null
+    if (notesState) noticedNotes.add(notesState.signature)
     const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
       stdio: 'inherit',
-      env: { ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1' },
+      env: {
+        ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1',
+        ...(notesNoticed ? { CAW_NOTES_NOTICED: notesNoticed } : {}),
+      },
     })
     if (child.status === 0) {
       if (argv[0] === 'build') finish('finished', { reason: 'the queue is built' }, 0)

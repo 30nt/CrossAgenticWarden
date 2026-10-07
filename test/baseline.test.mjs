@@ -7446,3 +7446,22 @@ test('review-specs asks for the whole plan when the specs on disk are not the re
   assert.match(architect.input, /Return the whole plan again/)
   assert.doesNotMatch(result.stdout, /architect revised/)
 })
+
+test('autopilot shows a notes.log notice once per run, not on every step',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const refusesOnce = `node -e "const f=require('fs'),p=process.env.CAW_GATE_COUNT;` +
+    `const n=f.existsSync(p)?Number(f.readFileSync(p,'utf8')):0;f.writeFileSync(p,String(n+1));process.exit(n===0?75:0)"`
+  const f = fixture({ git: true, gateFast: refusesOnce })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, '.caw-tasks', 'notes.log'), '## 2026-09-30T17:42:21.044Z\n\n- an old note\n')
+  const result = run(f, ['autopilot', '--no-full'], [
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ], { CAW_GATE_COUNT: join(f.parent, 'gate-count') })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(autopilotJournal(f).filter((entry) => entry.event === 'run').map((entry) => entry.argv[0]),
+    ['build', 'review'])
+  assert.equal((result.stdout.match(/note\(s\) from a run that died/g) || []).length, 1)
+})
