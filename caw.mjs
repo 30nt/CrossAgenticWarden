@@ -2121,6 +2121,57 @@ const SCHEMA = closeSchema({
     required: ['tasks', 'coverage', 'blocked', 'resplit'],
   },
 
+  // A revision that names only what it changes. The architect closing review-specs holes used
+  // to return every spec in the queue, so its output grew with the queue rather than with the
+  // holes: measured on one iOS install, a 13-spec queue with holes in 3 specs died once on the
+  // 30-minute role timeout and once on the provider's 64000-token output ceiling. The engine
+  // keeps every task this leaves out exactly as it was; see mergePlanRevision().
+  planRevision: {
+    type: 'object',
+    properties: {
+      tasks: {
+        type: 'array', items: TASK,
+        description: 'only the tasks you change or add, each in full. A task you leave out stays ' +
+          'exactly as it is on disk.',
+      },
+      order: {
+        type: 'array', items: { type: 'string' },
+        description: 'the slug of EVERY task that remains, returned or untouched, in the order ' +
+          'they run. A slug missing here is removed from the queue.',
+      },
+      coverage: {
+        type: 'array',
+        description: 'the coverage rows of the tasks you return, and only those — an untouched ' +
+          'task keeps its own rows',
+        items: {
+          type: 'object',
+          properties: {
+            case: { type: 'string', description: 'a case, state, input or surface the request implies' },
+            task: { type: 'string', description: 'slug of a task you return that handles it' },
+            acceptance_criteria: {
+              type: 'array', minItems: 1,
+              items: { type: 'string' },
+              description: 'one or more exact done_when strings from that task which make this ' +
+                'case checkable on the final tree',
+            },
+          },
+          required: ['case', 'task', 'acceptance_criteria'],
+        },
+      },
+      blocked: {
+        type: 'string',
+        description: 'THE EMPTY STRING when you are returning a revision. Fill it only to name a ' +
+          'question that stops you at all. Do not write "none" or any other placeholder.',
+      },
+      resplit: {
+        type: 'array', items: { type: 'string' },
+        description: 'one line per case that MOVED between tasks or per task whose boundary ' +
+          'changed — what moved, from which task to which, and which hole required it',
+      },
+    },
+    required: ['tasks', 'order', 'coverage', 'blocked', 'resplit'],
+  },
+
   // Typed slots and nothing else, on purpose. A free-text field is where "replace 24 with 25"
   // goes; with no such field, a finding that is not a hole has nowhere to land. There is no
   // verdict property either — the script derives the verdict from the slots, so the reviewer
@@ -3656,12 +3707,22 @@ const dumpNotes = () => {
 // picking up after a run died, and until now the only thing that ever mentioned the file was
 // one line printed at the moment of death — so the record survived and the knowledge of it did
 // not. `plan` and `build` therefore announce it on the way in.
-const noticeNotesLog = () => {
-  if (!existsSync(NOTES_LOG)) return
+const notesLogState = () => {
+  if (!existsSync(NOTES_LOG)) return null
   const text = readFileSync(NOTES_LOG, 'utf8')
   const count = (text.match(/^- /gm) || []).length
   const when = (text.match(/^## (.+)$/gm) || []).slice(-1)[0]?.slice(3) || 'an earlier run'
-  say(`· ${NOTES_LOG}: ${count} note(s) from a run that died, last ${when}. Read it before you decide.`)
+  // It travels to autopilot's steps in an environment variable, which cannot hold a NUL.
+  return { count, when, signature: `${count} notes, last ${when}` }
+}
+// `autopilot` runs every step as its own process, so each one used to repeat the same notice:
+// measured on one iOS install, the banner for a batch long finished opened every step of the
+// next. Within one autopilot run a notice is shown once per state of the file; notes added by a
+// step that died during the run change the state and are announced again.
+const noticeNotesLog = () => {
+  const state = notesLogState()
+  if (!state || process.env.CAW_NOTES_NOTICED === state.signature) return
+  say(`· ${NOTES_LOG}: ${state.count} note(s) from a run that died, last ${state.when}. Read it before you decide.`)
 }
 
 // `.caw-tasks/notes.log` is written by `die` and by nothing else, so a run that reaches the end
@@ -7916,6 +7977,80 @@ function plan(description) {
 // Writes the specs and says where they went, and nothing else. The next-step line belongs to
 // the caller: this used to end with "then: node caw.mjs build", which on the failure path told
 // the human to build a plan nobody approved — and printed it BEFORE the holes.
+// The plan object behind the specs on disk, kept beside them in Git's private directory. The
+// markdown is a rendering of it, and not a reversible one: the acceptance links are derived from
+// the whole plan. A revision that returns only the tasks it changes needs the full objects of
+// the ones it leaves out, and this is where they come from — trusted only while every spec on
+// disk is still the exact bytes this record saw, so a hand-edited queue falls back to a whole
+// revision rather than being silently overwritten from a stale object.
+function planObjectPath() {
+  try { return gitPrivatePath('caw', 'plan-object.json') } catch { return null }
+}
+
+function recordPlanObject(tasks, coverage) {
+  const path = planObjectPath()
+  if (!path) return
+  try {
+    const files = Object.fromEntries(specFiles().map((name) => [name,
+      createHash('sha256').update(readFileSync(join(QUEUE_DIR, name))).digest('hex')]))
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+    writeFileSync(path, `${JSON.stringify({ version: 1, tasks, coverage, files })}\n`, { mode: 0o600 })
+  } catch { /* without it the next revision returns the whole plan, as before */ }
+}
+
+function readPlanObject(specs) {
+  const path = planObjectPath()
+  if (!path || !existsSync(path)) return null
+  try {
+    const record = JSON.parse(readFileSync(path, 'utf8'))
+    if (record?.version !== 1 || !Array.isArray(record.tasks) || !Array.isArray(record.coverage)) return null
+    const recorded = Object.keys(record.files || {}).sort()
+    if (stableJson(recorded) !== stableJson([...specs].sort())) return null
+    for (const name of specs) {
+      const digest = createHash('sha256').update(readFileSync(join(QUEUE_DIR, name))).digest('hex')
+      if (record.files[name] !== digest) return null
+    }
+    return { tasks: record.tasks, coverage: record.coverage }
+  } catch { return null }
+}
+
+// A partial revision laid over the recorded plan. Every task left out keeps its object, and
+// with it its rendering: the acceptance-link ids are content hashes and a task's own coverage
+// rows keep their order, so an untouched spec is rewritten byte for byte unless its position in
+// `order` moved.
+function mergePlanRevision(prior, revision) {
+  const issue = (path, message) => schemaFailure('architect', path, message)
+  const order = revision.order.map((slug) => slug.trim())
+  if (new Set(order).size !== order.length) issue('$.order', 'order must name each task exactly once')
+  const revisedSlugs = revision.tasks.map((task) => task.slug.trim())
+  if (new Set(revisedSlugs).size !== revisedSlugs.length) issue('$.tasks', 'a returned task slug repeats')
+  const revised = new Map(revision.tasks.map((task) => [task.slug.trim(), task]))
+  const priorBySlug = new Map(prior.tasks.map((task) => [task.slug, task]))
+  for (const slug of revised.keys()) {
+    if (!order.includes(slug)) issue('$.order', `returned task ${slug} is missing from order`)
+  }
+  for (const slug of order) {
+    if (!revised.has(slug) && !priorBySlug.has(slug)) {
+      issue('$.order', `order names ${slug}, which is neither returned nor an existing task`)
+    }
+  }
+  for (const [index, row] of revision.coverage.entries()) {
+    if (!revised.has(row.task)) {
+      issue(`$.coverage[${index}]`, `names ${row.task}, which you did not return; an untouched ` +
+        'task keeps its own coverage rows')
+    }
+  }
+  return {
+    tasks: order.map((slug) => revised.get(slug) || priorBySlug.get(slug)),
+    coverage: [
+      ...prior.coverage.filter((row) => order.includes(row.task) && !revised.has(row.task)),
+      ...revision.coverage,
+    ],
+    blocked: revision.blocked,
+    resplit: revision.resplit,
+  }
+}
+
 function writeSpecs(tasks, coverage) {
   mkdirSync(QUEUE_DIR, { recursive: true })
   const ledger = planningLedger({ tasks, coverage })
@@ -7961,6 +8096,7 @@ function writeSpecs(tasks, coverage) {
     say(`  ${path}`)
   })
   say(`\n${tasks.length} task(s) written.`)
+  recordPlanObject(tasks, coverage)
 }
 
 // ---------------------------------------------------------------- build
@@ -10942,6 +11078,7 @@ function runAutopilot(noFull) {
   const scratch = mkdtempSync(join(tmpdir(), 'caw-autopilot-'))
   const recordPath = join(scratch, 'stop.json')
   const counts = { tasks: {}, reauths: 0 }
+  const noticedNotes = new Set()
   const note = (entry) => {
     appendFileSync(journal, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
       { mode: 0o600 })
@@ -10973,9 +11110,15 @@ function runAutopilot(noFull) {
     rmSync(recordPath, { force: true })
     say(`\n· autopilot step ${step}: caw.mjs ${argv.join(' ')}`)
     note({ event: 'run', step, argv })
+    const notesState = notesLogState()
+    const notesNoticed = notesState && noticedNotes.has(notesState.signature) ? notesState.signature : null
+    if (notesState) noticedNotes.add(notesState.signature)
     const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
       stdio: 'inherit',
-      env: { ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1' },
+      env: {
+        ...process.env, CAW_STOP_RECORD: recordPath, CAW_AUTOPILOT: '1',
+        ...(notesNoticed ? { CAW_NOTES_NOTICED: notesNoticed } : {}),
+      },
     })
     if (child.status === 0) {
       if (argv[0] === 'build') finish('finished', { reason: 'the queue is built' }, 0)
@@ -11370,7 +11513,18 @@ function fixSpecs(description, f, text, specs, problems, round) {
   const bodies = specs
     .map((s) => `### .caw-tasks/${s}\n\n${readFileSync(join(QUEUE_DIR, s), 'utf8')}`)
     .join('\n\n')
-
+  // With the plan object these specs were rendered from, the architect returns only what it
+  // changes; without it — a hand-written or hand-edited queue — it returns the whole plan, as
+  // it always has, because there is nothing exact to lay a partial answer over.
+  const prior = readPlanObject(specs)
+  const answerShape = prior
+    ? ['\n\nReturn only the tasks you change or add, each in full, and leave every other task',
+      ' out: a task you do not return stays on disk exactly as it is. Put in `order` the slug of',
+      ' every task that remains, returned or untouched, in the order they run; a slug missing',
+      ' from `order` is removed. `coverage` holds the cases of the tasks you return, and only',
+      ' those. Change only what closing the holes requires.'].join('')
+    : ['\n\nReturn the whole plan again with the holes closed, and change only what closing them',
+      ' requires: a spec nobody raised a hole about comes back as it was.'].join('')
   const architectPrompt = [
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
@@ -11378,8 +11532,8 @@ function fixSpecs(description, f, text, specs, problems, round) {
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they run:\n\n' + bodies,
     '\n\nHoles to close:\n- ' + problems.join('\n- '),
-    '\n\nReturn the whole plan again with the holes closed, and change only what closing them',
-    ' requires: a spec nobody raised a hole about comes back as it was. Where a hole is about a',
+    answerShape,
+    ' Where a hole is about a',
     ' boundary — a case sitting in a task that cannot verify it, an ordering that puts a task',
     ' before what it needs — move it, and record every such move in `resplit` with the hole that',
     ' forced it. A hole is closed when `done_when` checks it on the tree the task leaves behind,',
@@ -11389,15 +11543,23 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
     ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
   ].join('')
-  const { value: out } = planningCanonicalCall(
-    'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
+  const { value: answer } = prior
+    ? planningCanonicalCall('architect', architectPrompt, SCHEMA.planRevision, f,
+      (revision) => (blocked(revision.blocked) ? null
+        : validatePlanRelations(mergePlanRevision(prior, revision))))
+    : planningCanonicalCall('architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
 
-  if (out.blocked) {
-    die(`architect stopped while closing holes:\n\n${out.blocked}\n\n` +
+  if (prior ? blocked(answer.blocked) : answer.blocked) {
+    die(`architect stopped while closing holes:\n\n${answer.blocked}\n\n` +
         `  The specs are untouched on disk. Answer this where a later run will find it — a file\n` +
         `  under '## Canonical docs' in .caw/CAW.md — then run this command again.`)
   }
+  const out = prior ? mergePlanRevision(prior, answer) : answer
   if (!out.tasks?.length) die('architect returned no tasks and no reason')
+  if (prior) {
+    say(`  architect revised ${answer.tasks.length} of ${out.tasks.length} task(s);` +
+      ` the rest are kept as they were`)
+  }
 
   clearSpecs()
   writeSpecs(out.tasks, out.coverage)
