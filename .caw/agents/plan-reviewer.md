@@ -34,6 +34,11 @@ the code, before you read the plan closely.
   `change` and a contradicting thing in `done_when`, is `unverifiable`.
 - A task needing something a later task produces is `misordered`.
 - A task doing work the request did not ask for is `out_of_scope`.
+- A task too large to deliver in one executor call is `oversized`: it bundles work that can be
+  delivered and verified separately — a feature, the canon text for it, its strings, its gate
+  wiring — or it exceeds per-task size limits the profile states. Name the parts to split off and
+  their order. A task whose parts genuinely cannot land apart, with a concrete
+  `indivisible_reason`, is not oversized; neither is a large task that is one change.
 
 Treat each declared surface and state transition as a requirement. A task that combines
 independently deliverable surfaces without a concrete `indivisible_reason` is `unverifiable`:

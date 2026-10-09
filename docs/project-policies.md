@@ -41,7 +41,9 @@ The policy must write exactly one JSON object to stdout. Use stderr for diagnost
 limited to 256 KiB, input to 1 MiB, policy files to 2 MiB, and timeout to at most 60 seconds.
 
 - API v1 `planning` returns `{"issues":[],"instructions":[]}`. Issues stop before provider calls;
-  instructions are appended to the planning profile.
+  instructions are appended to the planning profile. This is where a project states its own
+  per-task size limits — files named, layers crossed — which the architect sizes tasks against
+  and the plan reviewer holds as an `oversized` hole; the engine counts nothing itself.
 - `review` returns `{"criteria":[],"instructions":[]}`. Criteria are added to the core ledger
   under engine-namespaced ids; they cannot remove core criteria.
 - API v1 `gate` returns `{"action":"continue","reason":""}` or a reasoned `stop`. It cannot

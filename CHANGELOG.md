@@ -5,6 +5,14 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- An `oversized` plan-review slot: a task too large for one executor call is a hole that `plan`
+  and `review-specs` close by splitting before approval. The architect is told to size tasks for
+  one call and not to bundle separately deliverable work; tasks the engine already estimates as
+  large executor work are handed to the plan reviewer as the first candidates. Per-task limits
+  are the project's, stated through planning-policy `instructions`; the engine counts nothing.
+
 ## [0.2.3] - 2026-10-09
 
 ### Changed

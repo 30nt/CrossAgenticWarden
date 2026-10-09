@@ -2211,6 +2211,16 @@ const SCHEMA = closeSchema({
         type: 'array', items: { type: 'string' },
         description: 'a task doing work the request did not ask for',
       },
+      // Measured on one iOS install: an approved 8-task queue held a task naming 27 files that
+      // bundled a view model, entries on three screens, strings in four languages, a canon
+      // paragraph, unit and UI tests and gate wiring; two earlier tasks there had each lost a
+      // whole 60-minute executor call to the timeout. No slot said "too big", so none was used.
+      oversized: {
+        type: 'array', items: { type: 'string' },
+        description: 'a task too large to deliver in one executor call: name the task, the parts ' +
+          'that can be delivered and verified separately, and the order they go in. A task whose ' +
+          'parts genuinely cannot land apart, with a concrete indivisible_reason, is not oversized.',
+      },
       undecidable: {
         type: 'array', items: { type: 'string' },
         description: 'a question the request itself does not settle and the plan is guessing at. ' +
@@ -2239,8 +2249,8 @@ const SCHEMA = closeSchema({
         },
       },
     },
-    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'undecidable',
-      'carried'],
+    required: ['relations', 'uncovered', 'unverifiable', 'misordered', 'out_of_scope', 'oversized',
+      'undecidable', 'carried'],
   },
 
   // A source is an address the engine can resolve, not a model's assertion that it looked
@@ -7816,6 +7826,7 @@ function plan(description, { shipping = false } = {}) {
       ' Give every independently changeable surface a globally unique id and one explicit state',
       ' machine. Put unrelated surfaces in separate tasks. If several surfaces truly cannot be',
       ' delivered independently, keep them together only with a concrete indivisible_reason.',
+      ' Size every task for one executor call: work that can be delivered and verified on its own — a feature, the canon text that describes it, its strings, the gate wiring for it — gets its own task in order, unless a concrete indivisible_reason says why it cannot land apart. Stay inside any per-task size limits the profile states.',
       ' Assign executor_budget small to one bounded local surface, normal to an ordinary feature,',
       ' and large to cross-layer, database, authorization, security, credential, or migration work.',
       ' The engine may raise your proposal to its safety floor and never lowers it.',
@@ -7872,6 +7883,8 @@ function plan(description, { shipping = false } = {}) {
       ' effective is max(requested, safety floor). Treat an effective class that is still too',
       ' small for reliable complete delivery as an `unverifiable` hole:\n\n' +
         JSON.stringify(budgetSelections, null, 2),
+      oversizedCandidatesBlock(budgetSelections.filter((row) => row.effective === 'large')
+        .map((row) => ({ task: row.task, reason: row.reason }))),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
       '\n\nEngine-owned relation ledger. Return exactly one `relations` row for every id:',
       '\n\n' + JSON.stringify(ledger.relations, null, 2),
@@ -7923,6 +7936,7 @@ function plan(description, { shipping = false } = {}) {
       ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
       ...(r.misordered || []).map((x) => `misordered — ${x}`),
       ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+      ...(r.oversized || []).map((x) => `oversized — ${x}`),
       ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
         const hole = planHoles.find((h) => h.id === row.id)?.hole || row.id
         return `still open [${row.id}] — ${hole} — ${row.evidence}`
@@ -11541,6 +11555,7 @@ function fixSpecs(description, f, text, specs, problems, round) {
     ' not when `change` mentions it.',
     ' Preserve the explicit surfaces and state machines. Split unrelated surfaces into separate',
     ' tasks unless the task carries a concrete indivisible_reason.',
+    ' Size every task for one executor call: work that can be delivered and verified on its own — a feature, the canon text that describes it, its strings, the gate wiring for it — gets its own task in order, unless a concrete indivisible_reason says why it cannot land apart. Stay inside any per-task size limits the profile states.',
     ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
     ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
   ].join('')
@@ -11678,6 +11693,19 @@ function carriedHolesBlock(holes) {
   ].join('')
 }
 
+// The tasks the engine's own budget estimate already calls large, handed to the plan reviewer as
+// the first places to look for an `oversized` hole. A candidate, not a verdict: the reviewer
+// judges whether the task fits one executor call, and the profile may state the project's limits.
+function oversizedCandidatesBlock(candidates) {
+  const general = '\n\nJudge each task\'s size against one executor call. A task too large for' +
+    ' one — bundling work that can be delivered and verified separately, or beyond per-task' +
+    ' size limits the profile states — is an `oversized` hole: name what to split off and in' +
+    ' which order.'
+  if (!candidates.length) return general
+  return `${general} The engine estimates these as large executor work; start there:\n\n` +
+    JSON.stringify(candidates, null, 2)
+}
+
 function judgeSpecs(description, f, text, population, holes = []) {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to review')
@@ -11701,6 +11729,14 @@ function judgeSpecs(description, f, text, population, holes = []) {
     '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',
     ' reliable complete delivery is an `unverifiable` hole; the engine will separately enforce',
     ' its structural and sensitive-work floor when the executor starts.',
+    oversizedCandidatesBlock(specs.map((name) => {
+      const body = readFileSync(join(QUEUE_DIR, name), 'utf8')
+      const requested = body.match(/^executor_budget_requested:\s*(\S+)/m)?.[1] ||
+        body.match(/^executor_budget:\s*(\S+)/m)?.[1]
+      let budget = null
+      try { budget = effectiveExecutorBudgetClass(requested, body) } catch { return null }
+      return budget.effective === 'large' ? { task: name, reason: budget.reason } : null
+    }).filter(Boolean)),
     '\n\nThese were written by hand, so there is no separate coverage mapping: each spec\'s',
     ' "## Must cover" block is its coverage claim, and a spec with no such block is claiming',
     ' nothing.',
@@ -11733,6 +11769,7 @@ function judgeSpecs(description, f, text, population, holes = []) {
     ...(r.unverifiable || []).map((x) => `unverifiable — ${x}`),
     ...(r.misordered || []).map((x) => `misordered — ${x}`),
     ...(r.out_of_scope || []).map((x) => `out of scope — ${x}`),
+    ...(r.oversized || []).map((x) => `oversized — ${x}`),
     // An earlier hole still open is a hole, whatever else this review found or did not.
     ...(r.carried || []).filter((row) => row.state === 'open').map((row) => {
       const hole = holes.find((h) => h.id === row.id)?.hole || row.id
