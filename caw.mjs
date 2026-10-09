@@ -890,7 +890,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.2'
+const VERSION = '0.2.3'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -7732,7 +7732,7 @@ function taskEvidenceLifecycleBlock(f) {
   ].join('\n')
 }
 
-function plan(description) {
+function plan(description, { shipping = false } = {}) {
   setProviderBudgetPhase('planning')
   const { f, text: profileText } = profile()
   noticeNotesLog()
@@ -7951,7 +7951,8 @@ function plan(description) {
       writeSpecs(out.tasks, out.coverage)
       writePlan(description, out, history, [], population, [], planProvenance, risk)
       say(`  ${PLAN}`)
-      say(`\nRead them, edit or reorder freely, then:  node caw.mjs build`)
+      say(shipping ? '\n· ship: the plan is approved; autopilot builds it now'
+        : `\nRead them, edit or reorder freely, then:  node caw.mjs build`)
       say(`  spent ${formatAccounting(accounting)}`)
       return
     }
@@ -10975,8 +10976,8 @@ function resumeTask(cmd, arg) {
 // command the stop itself offers — never one it does not. It lowers no gate and skips no
 // reviewer: every commit is still a reviewer's approval of a tree a green gate ran on. What it
 // may answer is bounded per task by the profile, and everything it does not recognise, a stall
-// included, is the human's, exactly as without it. Running `build` instead of `autopilot` is how
-// an install opts out; nothing else changes for it.
+// included, is the human's, exactly as without it. `ship` plans and then runs it. Running `build`
+// — after `plan`, where `ship` was used — is how an install opts out; nothing else changes for it.
 //
 // Three kinds of stop, three answers. A stop about the infrastructure — a gate that timed out or
 // refused, a role killed at its timeout, an expired credential with a configured re-auth command —
@@ -12467,7 +12468,7 @@ const USAGE = `caw.mjs ${VERSION} — a small agentic pipeline.
   caw.mjs plan "<description>"            architect + reviewers -> specs in ${QUEUE_DIR}/
   caw.mjs build [--no-full]               each spec: executor -> fast gate -> reviewer
   caw.mjs autopilot [--no-full]           build, answering the stops whose answer is not in doubt
-  caw.mjs ship "<description>"            both, without stopping to show you the plan
+  caw.mjs ship "<description>"            plan, then autopilot, without stopping to show you the plan
   caw.mjs review-specs "<description>"    judge hand-written specs in ${QUEUE_DIR}/
   caw.mjs round <NNN_slug.md>             one more review round on a stopped task
   caw.mjs review <NNN_slug.md>            review a task finished by hand, and commit
@@ -12529,8 +12530,16 @@ else if (cmd === 'autopilot') runAutopilot(noFull)
 else if (cmd === 'ship') {
   if (!arg) die('ship needs a description')
   activeRequest = arg
-  plan(arg)
-  build(noFull)
+  plan(arg, { shipping: true })
+  // `ship` is for not stopping to look, and so is `autopilot`: a ship whose build stopped at its
+  // first answerable stop asked a person for exactly the decision autopilot exists to make. The
+  // plan's run is closed here as the success it is — autopilot exits with its last step's code,
+  // and the exit handler would otherwise record a plan that passed as failed.
+  if (runRecord) {
+    writeRunManifest('completed')
+    runRecord = null
+  }
+  runAutopilot(noFull)
 }
 else if (cmd === 'round' || cmd === 'review') resumeTask(cmd, arg)
 else if (cmd === 'review-specs') {

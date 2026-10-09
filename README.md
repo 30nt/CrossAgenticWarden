@@ -161,7 +161,7 @@ guards wrong is a way to lock a session out of `Bash` and `Edit` at once.
 node caw.mjs plan "<request>"        # architect + reviewers → specs in .caw-tasks/
 node caw.mjs build [--no-full]       # each spec: executor → fast gate → reviewer, until approved
 node caw.mjs autopilot [--no-full]   # build, answering the stops whose answer is not in doubt
-node caw.mjs ship "<request>"        # both, without stopping to show you the plan
+node caw.mjs ship "<request>"        # plan, then autopilot, without stopping to show you the plan
 node caw.mjs review-specs "<request>"  # judge (and fix) whatever is in .caw-tasks/
 node caw.mjs round <spec>            # one more review round on a task that stopped
 node caw.mjs review <spec>           # review a task you finished by hand, and commit it
@@ -191,7 +191,8 @@ credential is re-authenticated by `autopilot_reauth_cmd` when the profile sets o
 `autopilot_rounds` (3), `autopilot_gate_retries` (1) and `autopilot_role_resumes` (1); it never
 lowers a gate or skips a reviewer, and a commit it authorised says so on its `Review:` line.
 Its decisions are written to `.caw-logs/autopilot-*.jsonl`, and `autopilot_notify_cmd` runs when
-it finishes or stops.
+it finishes or stops. `ship` plans and then runs `autopilot`; `plan` followed by `build` is the
+same without it.
 
 `ls .caw-tasks/` is the queue. A task commit stays public and compact; its `CAW-Audit` digest
 points to the complete private record under Git's `caw/audit/` path. That record keeps the spec,
@@ -237,7 +238,7 @@ CAW appends payload-free counters and durations to Git's private `caw/metrics/ru
 
 ## Status and licence
 
-**v0.2.2 is the latest tagged release.** One maintainer, a research
+**v0.2.3 is the latest tagged release.** One maintainer, a research
 tool, exercised on a handful of real projects rather than benchmarked. The adapter contract is
 not stable until v1.
 

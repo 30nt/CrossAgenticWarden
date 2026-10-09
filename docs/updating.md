@@ -74,6 +74,13 @@ one that belongs upstream instead.
 - **`autopilot` is opt-in.** Nothing changes for an install that keeps running `build`. Its limits
   and hooks are the optional `autopilot_*` profile fields in the README.
 
+### `ship` builds through `autopilot` — coming to 0.2.3
+
+`ship` used to be `plan` then `build`; it is now `plan` then `autopilot`. An install that runs
+`ship` therefore gets autopilot's answers to infrastructure and progress stops, within the
+`autopilot_*` limits in its profile, and its notify hook if it sets one. An install that wants a
+person to answer every stop runs `plan` and then `build`.
+
 ### When, and who decides
 
 **The install decides.** Not the owner, and not a session on another machine: neither can see

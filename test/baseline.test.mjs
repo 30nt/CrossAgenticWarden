@@ -7465,3 +7465,52 @@ test('autopilot shows a notes.log notice once per run, not on every step',
     ['build', 'review'])
   assert.equal((result.stdout.match(/note\(s\) from a run that died/g) || []).length, 1)
 })
+
+// ---------------------------------------------------------------- ship
+
+const shipPlanning = (description) => [
+  { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+  { envelope: envelope(plan()) },
+  { envelope: envelope(planReview()) },
+]
+const planRunStatus = (f) => readdirSync(join(f.root, '.caw-logs'))
+  .filter((name) => name.startsWith('run-'))
+  .map((name) => JSON.parse(readFileSync(join(f.root, '.caw-logs', name, 'manifest.json'), 'utf8')))
+  .find((manifest) => manifest.calls.some((call) => call.role === 'architect'))?.status
+
+test('ship plans and then builds through autopilot', { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const result = run(f, ['ship', description, '--no-full'], [
+    ...shipPlanning(description),
+    { writeFiles: { 'src/output.txt': 'done\n' }, envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict({ criteria: ['must-cover-1', 'change-1', 'done-when-1'].map((id) => ({
+      id, state: 'met', evidence: 'src/output.txt exists; removing it turns the gate red',
+    })) })) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /ship: the plan is approved; autopilot builds it now/)
+  assert.doesNotMatch(result.stdout, /then:\s+node caw\.mjs build/)
+  assert.match(result.stdout, /autopilot finished: the queue is built/)
+  assert.deepEqual(autopilotJournal(f).filter((entry) => entry.event === 'run').map((entry) => entry.argv),
+    [['build', '--no-full']])
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_baseline-task.md')), false, 'the task committed')
+  assert.equal(planRunStatus(f), 'completed')
+})
+
+// autopilot exits with its last step's code, and the plan's run record used to be closed by the
+// same exit: a plan that passed would have been recorded as failed by a build that stopped.
+test('a ship whose build stops for the human keeps its plan recorded as completed',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const result = run(f, ['ship', description, '--no-full'], [
+    ...shipPlanning(description),
+    { envelope: envelope({ ...delivery('cannot'), blocked: 'the request contradicts the canonical document' }) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /autopilot stopped: executor-blocked is a decision/)
+  assert.equal(planRunStatus(f), 'completed')
+})

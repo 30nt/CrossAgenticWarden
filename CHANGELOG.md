@@ -5,6 +5,15 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-09
+
+### Changed
+
+- `ship` is `plan` followed by `autopilot` rather than by `build`: once the plan is approved, the
+  stops whose answer is not in doubt are answered within the profile's `autopilot_*` limits, and
+  the plan's own run record is closed as completed before the build starts. `plan` then `build`
+  keeps the previous behaviour.
+
 ## [0.2.2] - 2026-10-07
 
 ### Changed
@@ -212,7 +221,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/30nt/CrossAgenticWarden/compare/v0.1.0...v0.2.0
