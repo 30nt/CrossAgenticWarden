@@ -165,7 +165,7 @@ guard-хуки способны разом лишить сессию и `Bash`, 
 node caw.mjs plan "<request>"        # architect + reviewers → specs in .caw-tasks/
 node caw.mjs build [--no-full]       # each spec: executor → fast gate → reviewer, until approved
 node caw.mjs autopilot [--no-full]   # build, answering the stops whose answer is not in doubt
-node caw.mjs ship "<request>"        # both, without stopping to show you the plan
+node caw.mjs ship "<request>"        # plan, then autopilot, without stopping to show you the plan
 node caw.mjs review-specs "<request>"  # judge (and fix) whatever is in .caw-tasks/
 node caw.mjs round <spec>            # one more review round on a task that stopped
 node caw.mjs review <spec>           # review a task you finished by hand, and commit it
@@ -197,7 +197,8 @@ node caw.mjs artifacts list          # retained run/recovery/probe/transport art
 `autopilot_role_resumes` (1); он никогда не понижает гейт и не пропускает ревьюера, а коммит,
 который он разрешил, говорит об этом в строке `Review:`. Его решения пишутся в
 `.caw-logs/autopilot-*.jsonl`, а `autopilot_notify_cmd` запускается, когда он заканчивает или
-останавливается.
+останавливается. `ship` планирует и затем запускает `autopilot`; `plan`, а за ним `build`, — то же
+самое без него.
 
 `ls .caw-tasks/` — это вся очередь. Публичное сообщение task-коммита остаётся коротким, а его
 digest `CAW-Audit` указывает на полную приватную запись в Git-пути `caw/audit/`. Там после

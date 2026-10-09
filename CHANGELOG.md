@@ -5,6 +5,13 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- `ship` is `plan` followed by `autopilot` rather than by `build`: once the plan is approved, the
+  stops whose answer is not in doubt are answered within the profile's `autopilot_*` limits, and
+  the plan's own run record is closed as completed before the build starts. `plan` then `build`
+  keeps the previous behaviour.
+
 ## [0.2.2] - 2026-10-07
 
 ### Changed
