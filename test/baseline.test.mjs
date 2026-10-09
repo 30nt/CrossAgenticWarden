@@ -142,7 +142,8 @@ const planReview = (subject = plan()) => ({
   relations: planningLedger(subject).relations.map(({ id }) => ({
     id, state: 'covered', evidence: 'the linked final-tree criterion establishes the case',
   })),
-  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], undecidable: [], carried: [],
+  uncovered: [], unverifiable: [], misordered: [], out_of_scope: [], oversized: [], undecidable: [],
+  carried: [],
 })
 const delivery = (summary, claims = [], mutations = []) => ({ summary, notes: [], claims, mutations, blocked: '' })
 const verdict = ({ criteria = [], carried = [], broken = [], uncovered = [], weak = [], noted = [] } = {}) => {
@@ -7513,4 +7514,72 @@ test('a ship whose build stops for the human keeps its plan recorded as complete
   assert.equal(result.status, 1)
   assert.match(result.stdout, /autopilot stopped: executor-blocked is a decision/)
   assert.equal(planRunStatus(f), 'completed')
+})
+
+// ---------------------------------------------------------------- oversized tasks
+
+// Measured on one iOS install: an approved 8-task queue held a task naming 27 files that bundled
+// seven separable pieces of work, and the plan reviewer had no slot that said "too big".
+test('an oversized task is a plan hole the architect splits before approval', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const bundled = plan()
+  bundled.tasks[0].change = ['Write the fixture output and its database migration.']
+  const split = plan()
+  split.tasks = [
+    { ...plan().tasks[0], slug: 'fixture-migration', title: 'Fixture migration',
+      change: ['Add the database migration for the fixture output.'],
+      done_when: ['The fixture migration is applied.'],
+      surfaces: [{ id: 'fixture-schema', responsibility: 'The fixture table.' }],
+      state_machines: [{ surface: 'fixture-schema', states: ['absent', 'present'],
+        transitions: [{ from: 'absent', event: 'migrate', to: 'present' }] }],
+      executor_budget: 'large' },
+    plan().tasks[0],
+  ]
+  split.coverage = [
+    { case: 'fixture table', task: 'fixture-migration', acceptance_criteria: ['The fixture migration is applied.'] },
+    { case: 'fixture output', task: 'baseline-task', acceptance_criteria: ['The fixture output exists.'] },
+  ]
+  const result = run(f, ['plan', description], [
+    { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+    { envelope: envelope(bundled) },
+    { envelope: envelope({ ...planReview(bundled),
+      oversized: ['baseline-task: the migration can land on its own before the output'] }) },
+    { envelope: envelope(split) },
+    { envelope: envelope({ ...planReview(split),
+      carried: [{ id: 'h1', state: 'closed', evidence: 'the migration is its own first task' }] }) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /oversized — baseline-task: the migration can land on its own/)
+  const reviews = calls(f).filter(({ role }) => role === 'plan-reviewer')
+  assert.match(reviews[0].input, /Judge each task's size against one executor call/)
+  assert.match(reviews[0].input, /estimates these as large executor work; start there:[\s\S]*"task": "baseline-task"/)
+  const architects = calls(f).filter(({ role }) => role === 'architect')
+  assert.match(architects[0].input, /Size every task for one executor call/)
+  assert.match(architects[1].input, /oversized — baseline-task/)
+  assert.equal(existsSync(join(f.root, '.caw-tasks', '001_fixture-migration.md')), true)
+})
+
+test('review-specs names large specs as oversized candidates and holds an oversized one', () => {
+  const f = fixture({ git: true })
+  const description = 'Create the fixture output'
+  const bundled = plan()
+  bundled.tasks[0].change = ['Write the fixture output and its database migration.']
+  const planned = run(f, ['plan', description], [
+    { envelope: envelope(population([{ case: 'fixture output', source: requestSource(description) }])) },
+    { envelope: envelope(bundled) },
+    { envelope: envelope(planReview(bundled)) },
+  ])
+  assert.equal(planned.status, 0, `${planned.stdout}\n${planned.stderr}`)
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', '--no-fix', description], [
+    { envelope: envelope({ ...planReview(bundled),
+      oversized: ['001_baseline-task.md: the migration can land on its own before the output'] }) },
+  ])
+
+  assert.equal(result.status, 1)
+  assert.match(result.stdout, /oversized — 001_baseline-task\.md: the migration can land on its own/)
+  const review = calls(f).find(({ role }) => role === 'plan-reviewer')
+  assert.match(review.input, /estimates these as large executor work; start there:[\s\S]*"task": "001_baseline-task\.md"/)
 })

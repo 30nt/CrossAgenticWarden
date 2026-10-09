@@ -5,6 +5,16 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-09
+
+### Added
+
+- An `oversized` plan-review slot: a task too large for one executor call is a hole that `plan`
+  and `review-specs` close by splitting before approval. The architect is told to size tasks for
+  one call and not to bundle separately deliverable work; tasks the engine already estimates as
+  large executor work are handed to the plan reviewer as the first candidates. Per-task limits
+  are the project's, stated through planning-policy `instructions`; the engine counts nothing.
+
 ## [0.2.3] - 2026-10-09
 
 ### Changed
@@ -221,7 +231,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.0...v0.2.1

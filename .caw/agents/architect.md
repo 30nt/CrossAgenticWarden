@@ -39,6 +39,10 @@ in the first.
 Split the request into tasks that are each:
 
 - **One commit's worth.** If you cannot say what changed in one sentence, split it.
+- **One executor call's worth.** Work that can be delivered and verified on its own — a feature,
+  the canon text that describes it, its strings, the gate wiring for it — is its own task, unless
+  a concrete `indivisible_reason` says why it cannot land apart. Stay inside any per-task size
+  limits the profile states; the plan reviewer holds an oversized task as a hole.
 - **Independently gated.** Each task must leave the tree passing the fast gate.
 - **Ordered.** Tasks run strictly in sequence, in the order you return them. Order is the
   only way to state a dependency — there is no `depends_on` field, because in a sequential
