@@ -58,8 +58,20 @@ test('a stall, a judgement and an unrecognised stop all go to the human', () => 
     'gate-evidence-refused', 'gate-changed-tree', 'gate-policy', 'advisory-review', 'decision']) {
     assert.equal(decide({ kind, task }).action, 'stop', kind)
   }
-  assert.match(decide(null).reason, /names no task/)
+  assert.match(decide(null).reason, /without a stop record/)
   assert.match(decide({ kind: 'unknown', task }).reason, /without a stop record/)
+})
+
+// Measured on one iOS install: a reviewer's provider answered "You're out of usage credits", the
+// build child exited 1 with no record, and the journal said `unknown names no task` while a
+// round-2 task with an open item sat there.
+test('a provider out of usage, or a role that died on its own, stops for the human and is named', () => {
+  const usage = decide({ kind: 'provider-usage-exhausted', role: 'reviewer', provider: 'claude', task })
+  assert.equal(usage.action, 'stop')
+  assert.match(usage.reason, /claude usage is exhausted .*reviewer.*001_x\.md/)
+  const failed = decide({ kind: 'role-failed', role: 'executor', status: 1, task })
+  assert.equal(failed.action, 'stop')
+  assert.match(failed.reason, /executor exited 1 on 001_x\.md/)
 })
 
 test('a queue gate that did not pass is the human\'s, and is named', () => {

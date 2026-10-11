@@ -187,7 +187,8 @@ child processes, reads the kind of each stop, and answers only the ones whose an
 doubt: a gate that timed out or refused is re-run through `review`, a role killed at its timeout
 is resumed, a round cap or a gate still red after retries gets one more `round`, and an expired
 credential is re-authenticated by `autopilot_reauth_cmd` when the profile sets one. A stall, a
-`blocked` executor and every other stop go to the human, as without it. Per task it allows
+`blocked` executor, a provider out of usage and every other stop go to the human, as without
+it; each is named in the journal with its role and task. Per task it allows
 `autopilot_rounds` (3), `autopilot_gate_retries` (1) and `autopilot_role_resumes` (1); it never
 lowers a gate or skips a reviewer, and a commit it authorised says so on its `Review:` line.
 Its decisions are written to `.caw-logs/autopilot-*.jsonl`, and `autopilot_notify_cmd` runs when
@@ -238,7 +239,7 @@ CAW appends payload-free counters and durations to Git's private `caw/metrics/ru
 
 ## Status and licence
 
-**v0.2.4 is the latest tagged release.** One maintainer, a research
+**v0.2.5 is the latest tagged release.** One maintainer, a research
 tool, exercised on a handful of real projects rather than benchmarked. The adapter contract is
 not stable until v1.
 

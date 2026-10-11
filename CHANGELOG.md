@@ -5,6 +5,17 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-11
+
+### Fixed
+
+- A role whose provider says its usage is exhausted ("You're out of usage credits", a plan's usage
+  limit) stops with `provider-usage-exhausted` and a message that names the provider, instead of
+  `<role> exited 1`. Any other nonzero provider exit writes a `role-failed` stop record with the
+  role, provider, status and task. `autopilot` names both in its journal and to
+  `autopilot_notify_cmd` instead of `unknown names no task`, and a run that left no record at all
+  now reads `the run stopped without a stop record`. Each decision stays with the human.
+
 ## [0.2.4] - 2026-10-09
 
 ### Added
@@ -231,7 +242,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.1...v0.2.2

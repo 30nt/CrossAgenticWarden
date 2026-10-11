@@ -890,7 +890,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.4'
+const VERSION = '0.2.5'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -5620,10 +5620,11 @@ function agent(role, prompt, schema, f, spec, context = null) {
     const interrupted = Boolean(r.signal) || [130, 143].includes(r.status)
     const failureText = provider.adapter.decodeFailure(r)
     const expired = expiredCredentials(`${failureText}\n${r.stderr || ''}`)
+    const usageExhausted = !expired && providerUsageExhausted(`${failureText}\n${r.stderr || ''}`)
     recordMissingEnumeratorPopulation(role, interrupted ? 'call was interrupted' : 'call failed')
     recordProviderFailure(role, provider, r, attempt,
       budgetExhausted ? 'budget-exhausted' : interrupted ? 'interrupted'
-        : expired ? 'credentials-expired' : 'nonzero-exit')
+        : expired ? 'credentials-expired' : usageExhausted ? 'usage-exhausted' : 'nonzero-exit')
     if (budgetExhausted) {
       writeStopRecord('budget-exhausted', { role, task: spec || null })
       die(`${role} reached its configured live budget and was stopped. Its partial edits remain ` +
@@ -5642,6 +5643,21 @@ function agent(role, prompt, schema, f, spec, context = null) {
         `  A planning stage reuses whatever already answered, so the roles that finished are ` +
         `not paid for twice.\n${failureText}`)
     }
+    // Measured on one iOS install: a challenger reviewer died on "You're out of usage credits",
+    // the engine said `reviewer exited 1` and wrote no record, and autopilot stopped on `unknown
+    // names no task` with a task in round 2 and one open item. Waiting does not refill credits, so
+    // this stays the human's; what changes is that the stop says whose account and which task.
+    if (usageExhausted) {
+      writeStopRecord('provider-usage-exhausted',
+        { role, provider: binding.provider, task: spec || null })
+      die(`${role} could not run: the ${binding.provider} provider says its usage is exhausted.\n` +
+        `  Nothing is wrong with the tree, the spec or the request — restore the account's usage ` +
+        `(or bind the role to another model) and run the same command again.\n${failureText}`)
+    }
+    // Any other provider death is still a stop autopilot has to report, and `unknown names no
+    // task` told nobody which role or which task it was.
+    writeStopRecord('role-failed',
+      { role, provider: binding.provider, status: r.status, task: spec || null })
     die(`${role} exited ${r.status}\n${failureText}`)
   }
   let decoded, result
@@ -5844,6 +5860,21 @@ const EXPIRED_CREDENTIALS = [
 function expiredCredentials(text) {
   const value = String(text || '')
   return EXPIRED_CREDENTIALS.some((pattern) => pattern.test(value))
+}
+
+// The provider's own sentence for an account with nothing left to spend. As narrow as the
+// credential patterns, for the same reason: told to restore usage over a defect in their tree,
+// an operator loses more than a generic `exited 1` costs them. The first is measured verbatim
+// (Claude CLI, one iOS install); the other two are the same CLIs' wording for a plan limit.
+const USAGE_EXHAUSTED = [
+  /\bout\s+of\s+usage\s+credits\b/i,
+  /\busage\s+limit\s+reached\b/i,
+  /\bhit\s+your\s+usage\s+limit\b/i,
+]
+
+function providerUsageExhausted(text) {
+  const value = String(text || '')
+  return USAGE_EXHAUSTED.some((pattern) => pattern.test(value))
 }
 
 function canonicalRepairPrompt(role, prompt, problem, repair) {
@@ -11022,6 +11053,15 @@ function decideAutopilot(record, counts, limits, { treeDirty }) {
   const task = record?.task || null
   const human = (reason) => ({ action: 'stop', reason })
   if (AUTOPILOT_QUEUE_STOPS[kind]) return human(AUTOPILOT_QUEUE_STOPS[kind])
+  if (kind === 'unknown') return human('the run stopped without a stop record')
+  if (kind === 'provider-usage-exhausted') {
+    return human(`${record.provider || 'the provider'} usage is exhausted (${record.role || 'a role'}` +
+      `${task ? ` on ${task}` : ''})`)
+  }
+  if (kind === 'role-failed') {
+    return human(`${record.role || 'a role'} exited ${record.status ?? 'nonzero'}` +
+      `${task ? ` on ${task}` : ''}`)
+  }
   if (!task) return human(`${kind} names no task`)
   const spent = counts.tasks[task] || { rounds: 0, gates: 0, resumes: 0 }
   // The role that died decides where the task resumes: an executor's round is re-run, a
@@ -12663,7 +12703,7 @@ export {
   populationBlock, providerLaunch, readProjectPolicies, resolvePopulation, resolvePopulationSource,
   resolveProviderBudgets, roleGuaranteeMismatch, removeTree, restoreWeakReplaySurface,
   retainWeakVerificationEvents,
-  boundedUtf8HeadTail, expiredCredentials, normalizePropertyKeys, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
+  boundedUtf8HeadTail, expiredCredentials, providerUsageExhausted, normalizePropertyKeys, pruneAdapterTransports, pruneInvocationScratch, pruneReviewSurfaces,
   requiredGateChecks, reviewNeedsChallenger, runProjectPolicy, runWeakReplaySession, taskDeliveryDiff,
   taskEvidenceLifecycleBlock, taskKey,
   verifyProjectPolicies, zeroAccounting,
