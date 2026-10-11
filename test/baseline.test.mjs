@@ -22,7 +22,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  adapterImplementationDigest, expiredCredentials,
+  adapterImplementationDigest, expiredCredentials, providerUsageExhausted,
   extractTaskTopology, groupFindings, mergeReviewPasses,
   planningLedger, populationBlock,
   providerLaunch, readProjectPolicies, resolvePopulation, reviewCriteriaIssue,
@@ -6735,6 +6735,69 @@ test('an expired credential is told apart from an ordinary provider failure', ()
     'ENOENT: no such file or directory',
     '',
   ]) assert.equal(expiredCredentials(text), false, text)
+})
+
+// Measured on one iOS install: a challenger reviewer died with the CLI's own sentence, the engine
+// said `reviewer exited 1` and wrote no stop record, and autopilot could name neither the role nor
+// the task. Nothing about the tree was wrong; only the account was.
+const OUT_OF_CREDITS = "You're out of usage credits. Switch to another model, or manage usage " +
+  'credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.'
+
+test('a provider out of usage is told apart from an ordinary failure and from a credential', () => {
+  for (const text of [OUT_OF_CREDITS, 'Claude AI usage limit reached|1760094000',
+    "You've hit your usage limit. Upgrade to Pro or try again later."]) {
+    assert.equal(providerUsageExhausted(text), true, text)
+    assert.equal(expiredCredentials(text), false, text)
+  }
+  for (const text of [
+    'exited 1',
+    'API Error: 500 Server error mid-response',
+    'the spec says the usage screen shows the remaining credits',
+    'rate limit the login endpoint to 5 requests a minute',
+    '',
+  ]) assert.equal(providerUsageExhausted(text), false, text)
+})
+
+test('a role whose provider ran out of usage writes a named stop record',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'first\n')
+  const record = join(f.parent, 'stop.json')
+  const result = run(f, ['review', '001_task.md'], [{
+    status: 1,
+    stdoutText: `${JSON.stringify({ type: 'result', subtype: 'success', is_error: true,
+      result: OUT_OF_CREDITS, terminal_reason: 'api_error' })}\n`,
+  }], { CAW_STOP_RECORD: record })
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /reviewer could not run: the test-claude provider says its usage is exhausted/)
+  assert.deepEqual(JSON.parse(readFileSync(record, 'utf8')), {
+    version: 1, kind: 'provider-usage-exhausted', command: 'review',
+    role: 'reviewer', provider: 'test-claude', task: '001_task.md',
+  })
+})
+
+test('a role that exits nonzero for any other reason still names itself and its task',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'first\n')
+  const record = join(f.parent, 'stop.json')
+  const result = run(f, ['review', '001_task.md'], [{
+    status: 1,
+    stdoutText: `${JSON.stringify({ type: 'result', subtype: 'success', is_error: true,
+      result: 'API Error: 500 Server error mid-response', terminal_reason: 'api_error' })}\n`,
+  }], { CAW_STOP_RECORD: record })
+
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /reviewer exited 1/)
+  assert.deepEqual(JSON.parse(readFileSync(record, 'utf8')), {
+    version: 1, kind: 'role-failed', command: 'review',
+    role: 'reviewer', provider: 'test-claude', status: 1, task: '001_task.md',
+  })
 })
 
 test('a malformed executor answer is repaired once instead of ending the run', () => {

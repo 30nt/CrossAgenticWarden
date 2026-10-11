@@ -5,6 +5,15 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- A role whose provider says its usage is exhausted ("You're out of usage credits", a plan's usage
+  limit) stops with `provider-usage-exhausted` and a message that names the provider, instead of
+  `<role> exited 1`. Any other nonzero provider exit writes a `role-failed` stop record with the
+  role, provider, status and task. `autopilot` names both in its journal and to
+  `autopilot_notify_cmd` instead of `unknown names no task`, and a run that left no record at all
+  now reads `the run stopped without a stop record`. Each decision stays with the human.
+
 ## [0.2.4] - 2026-10-09
 
 ### Added
