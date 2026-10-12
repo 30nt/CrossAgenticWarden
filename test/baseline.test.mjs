@@ -6379,6 +6379,80 @@ test('an executor asks the engine to run the gate, and to run it on a mutation, 
   assert.equal(body.requests, 3)
 })
 
+// Measured on one install, two executors in one batch: "the probe always runs the full gate", so
+// a reviewer mutation the narrowed replay let survive could not be watched surviving; and "the probe
+// only prints the gate's tail", so whether the Supabase step had run at all was not visible.
+test('a mutated probe tells the gate its path, and the whole probe output is kept as a file', () => {
+  const echoGate = 'node -e "const fs=require(\'fs\');' +
+    'const c=JSON.parse(fs.readFileSync(process.env.CAW_GATE_CONTRACT,\'utf8\'));' +
+    'console.log(\'HEAD kind=\'+c.kind+\' paths=\'+(process.env.CAW_GATE_MUTATION_PATHS||\'-\'));' +
+    'for(let i=0;i<2000;i++)console.log(\'step line \'+i+\' \'+\'x\'.repeat(40));' +
+    'console.log(\'TAIL\')"'
+  const f = fixture({ git: true, gateFast: echoGate })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'), '---\ntitle: Task\n---\n\nDo it.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\n' },
+      gateProbes: [
+        { readLog: true },
+        { readLog: true, mutation: { path: 'src/output.txt', find: 'value=42', replace: 'value=41' } },
+      ],
+      envelope: envelope(delivery('done')) },
+    { envelope: envelope(verdict()) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(calls(f)[0].input, /CAW_GATE_MUTATION_PATHS, as on the engine's own mutation replay/)
+  const probes = latestTaskAudit(f).delivery.executor_notes
+    .filter((note) => note.startsWith('fake-gate-probe:'))
+    .map((note) => JSON.parse(note.slice('fake-gate-probe:'.length)))
+  assert.equal(probes[0].logFirst, 'HEAD kind=executor-probe paths=-')
+  assert.equal(probes[1].logFirst, 'HEAD kind=executor-probe paths=src/output.txt')
+  for (const probe of probes) {
+    assert.equal(probe.last, 'caw-gate: green (status 0)')
+    // Printed: a bounded head and tail. Kept: every line the gate wrote.
+    assert.ok(probe.logBytes > 90000, `log has ${probe.logBytes} bytes`)
+    assert.ok(probe.printedBytes < 20000, `printed ${probe.printedBytes} bytes`)
+  }
+})
+
+test('an executor handed findings from two blind passes is told they may be one defect', () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\n---\n\n## Must cover\n- The value is kept.\n')
+  writeFileSync(join(f.root, 'delivery.txt'), 'first\n')
+  configureProfileFields(f, { review_challenger_passes: '1', review_challenger_policy: 'fixed' })
+  execFileSync('git', ['commit', '-qam', 'challenger'], { cwd: f.root })
+  const finding = (where) => verdict({
+    criteria: [{ id: 'must-cover-1', state: 'uncovered', evidence: 'no reload test' }],
+    uncovered: [{ where, fix: 'add a reload test', evidence: 'nothing reloads', criterion_ids: ['must-cover-1'] }],
+  })
+  const first = run(f, ['review', '001_task.md'], [
+    { envelope: envelope(finding('delivery.txt:1')) },
+    { envelope: envelope(finding('delivery.txt line 1')) },
+  ])
+  assert.equal(first.status, 1, `${first.stdout}\n${first.stderr}`)
+  assert.match(first.stdout, /discovery: challenger pass 2/)
+  const result = run(f, ['round', '001_task.md'], [
+    { writeFiles: { 'delivery.txt': 'kept\n' }, envelope: envelope(delivery('kept')) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded' },
+        { id: 'r1.2', state: 'closed', evidence: 'reloaded' }],
+    })) },
+    { envelope: envelope(verdict({
+      criteria: [{ id: 'must-cover-1', state: 'met', evidence: 'reloaded' }],
+      carried: [{ id: 'r1.1', state: 'closed', evidence: 'reloaded' },
+        { id: 'r1.2', state: 'closed', evidence: 'reloaded' }],
+    })) },
+  ])
+
+  const executor = calls(f).find((call) => call.role === 'executor')
+  assert.ok(executor, `${result.stdout}\n${result.stderr}`)
+  assert.match(executor.input, /raised blind to each other and may describe one defect/)
+})
+
 test('the gate broker answers at most its per-call limit and refuses the rest', () => {
   const f = fixture({ git: true })
   mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })

@@ -6332,7 +6332,9 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
   // guessed. Both are always set, including empty, so a gate can tell an engine that offers
   // the contract from one that does not.
   env.CAW_GATE_REQUIRED_CHECKS = requiredCheckIds.join('\n')
-  // The files a weak-mutation run changed, one per line; empty on every other run.
+  // The files a weak-mutation run or a mutated executor probe changed, one per line; empty on
+  // every other run. The probe carries them so a gate that narrows a replay can narrow the
+  // executor's own experiment the same way, and the executor sees what the replay will see.
   env.CAW_GATE_MUTATION_PATHS = (context.mutationPaths || []).join('\n')
   const contractPath = join(evidenceScratch, 'contract.json')
   writeFileSync(contractPath, `${JSON.stringify({
@@ -6405,6 +6407,7 @@ function gate(cmd, spec, cwd = undefined, timeoutMs = null, context = {}) {
     const value = {
       ok: state === 'green', state, status,
       out: `${rawOutput}${evidenceDiagnostic}`.slice(-8000),
+      ...(context.fullOutput ? { fullOutput: `${rawOutput}${evidenceDiagnostic}` } : {}),
       durationMs: Date.now() - startedAt, timeoutMs, receipt,
     }
     if (resolvedRuntime) recordStage('gate', kind, startedAt, state, {
@@ -9686,6 +9689,7 @@ const reviewMutationRows = (rows) => rows.filter((row) => row.source === 'review
 // deciding gate runs it — so the probe gives the executor no new kind of reach, only an earlier
 // look. It is bounded per call, and it certifies nothing; only the orchestrator's gate does.
 const GATE_PROBE_REQUESTS_MAX = 6
+const GATE_PROBE_LOG_MAX = 16 * 1024 * 1024
 const GATE_PROBE_REQUEST_ID = /^[a-z0-9-]{1,64}$/
 const GATE_PROBE_POLL_MS = 200
 
@@ -9724,6 +9728,7 @@ while (!existsSync(response)) {
 }
 const answer = JSON.parse(readFileSync(response, 'utf8'))
 if (answer.output) process.stdout.write(answer.output.endsWith('\\n') ? answer.output : answer.output + '\\n')
+if (answer.log) process.stdout.write('caw-gate: full output: ' + answer.log + '\\n')
 process.stdout.write('caw-gate: ' + answer.state + (answer.status === null || answer.status === undefined
   ? '' : ' (status ' + answer.status + ')') + (answer.reason ? ': ' + answer.reason : '') + '\\n')
 process.exit(answer.state === 'green' ? 0 : answer.state === 'red' ? 1 : 2)
@@ -9771,9 +9776,12 @@ const gateProbeInstructions = (probe, f) => [
   '\n\nGate probe. Your write boundary may keep the gate from running where you are. The command',
   ` ${JSON.stringify(probe.command)} (also in $CAW_GATE_PROBE) runs the profile's fast gate`,
   ` \`${f.gate_fast}\` on a disposable copy of your tree as it stands, outside that boundary, and`,
-  ' prints its output and `caw-gate: green|red` (exit 0 when green). With `--mutation -` it first',
+  ' prints the head and tail of its output, a `caw-gate: full output: <file>` line naming the',
+  ' whole output, and `caw-gate: green|red` (exit 0 when green). With `--mutation -` it first',
   ' applies one mutation of the shipped code read from stdin as JSON {"path","find","replace"}',
-  ' (`find` exactly once in `path`) — use it to watch your test go red. Each run takes as long',
+  ' (`find` exactly once in `path`) — use it to watch your test go red. The gate is told the',
+  ' mutated path in CAW_GATE_MUTATION_PATHS, as on the engine\'s own mutation replay, so a gate',
+  ' that narrows its run by path runs here what the replay will run. Each run takes as long',
   ' as the gate, so give that shell call a long timeout',
   f.gate_fast_timeout_ms ? ` (the gate's limit is ${f.gate_fast_timeout_ms} ms)` : '',
   `. At most ${GATE_PROBE_REQUESTS_MAX} runs in this call. It is a fact for you, not the verdict:`,
@@ -9828,13 +9836,21 @@ function runGateBroker(dir) {
           throw new Error('a mutation needs string path, a non-empty find, and a different replace')
         }
         surface = createReviewSurface(f)
-        if (mutation) applyExecutorMutation(mutation, surface)
+        const mutatedPath = mutation ? applyExecutorMutation(mutation, surface) : null
         const result = gate(f.gate_fast, spec, surface.workingRoot, f.gate_fast_timeout_ms, {
-          task: spec, kind: 'executor-probe', collectEvidence: false,
+          task: spec, kind: 'executor-probe', collectEvidence: false, fullOutput: true,
+          mutationPaths: mutatedPath ? [mutatedPath] : [],
         })
+        // Measured on one install: an executor could not tell from the printed tail whether the
+        // gate's Supabase step had run at all. The whole output is kept beside the answer, in
+        // the directory the executor already reads the probe from, for the rest of its call.
+        const log = join(dir, 'responses', `${id}.log`)
+        writeFileSync(log, boundedUtf8HeadTail(result.fullOutput ?? result.out,
+          GATE_PROBE_LOG_MAX).text, { mode: 0o600 })
         answer(id, {
           state: result.state, status: result.status ?? null, duration_ms: result.durationMs,
           mutated: Boolean(mutation), output: boundedUtf8HeadTail(result.out, 12 * 1024).text,
+          log,
         })
       } catch (error) {
         answer(id, { state: 'unavailable', status: null, mutated: Boolean(mutation),
@@ -10239,6 +10255,13 @@ function runTask(file, f, profileText, opts = {}) {
           ? '\nClose every open finding in the dossier before doing unrelated work.' +
             (open.some((i) => i.round < round)
               ? ' Older ids have survived at least one attempted fix; use their checked evidence.'
+              : '') +
+            // Measured on one install: two findings of one round, one from each blind review
+            // pass, described the same re-snapshot rule and both reached the executor.
+            (open.some((i) => i.discovery === 'late-same-baseline')
+              ? ' Findings from different review passes were raised blind to each other and may' +
+                ' describe one defect: fix it once, and say in `notes` which ids that one change' +
+                ' answers.'
               : '')
           : '',
         mutationFact && executorMutationRows(mutationFact.results).length

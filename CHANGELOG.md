@@ -5,6 +5,17 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- A gate probe given a mutation (`$CAW_GATE_PROBE --mutation -`) sets `CAW_GATE_MUTATION_PATHS`
+  to the mutated path, as the engine's own mutation replay does; the run's `kind` stays
+  `executor-probe`. A gate that narrows replays by path can narrow the executor's experiment the
+  same way, so the executor sees what the replay will see.
+- A gate probe keeps the gate's whole output in a file beside its answer and prints
+  `caw-gate: full output: <file>`; the printed output is still a bounded head and tail.
+- An executor handed open findings from more than one blind review pass is told they may
+  describe one defect, to fix it once and say in `notes` which ids that change answers.
+
 ## [0.2.5] - 2026-10-11
 
 ### Fixed
