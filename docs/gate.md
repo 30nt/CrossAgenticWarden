@@ -110,7 +110,7 @@ that offers the contract from one that does not:
 |---|---|
 | `CAW_GATE_REQUIRED_CHECKS` | the required check ids, one per line, for a shell to loop over |
 | `CAW_GATE_CONTRACT` | a path to version-1 JSON: `required_check_ids`, `criteria`, `acceptance_cases` |
-| `CAW_GATE_MUTATION_PATHS` | on a `weak-mutation` run, the files the mutation changed, one per line; empty on every other run |
+| `CAW_GATE_MUTATION_PATHS` | on a `weak-mutation` run or a mutated `executor-probe`, the files the mutation changed, one per line; empty on every other run |
 
 The JSON is what a gate needs to link rather than declare. A check naming a criterion must use
 the engine's own stable census id, and one naming an acceptance case must match that row's exact
@@ -118,8 +118,12 @@ the engine's own stable census id, and one naming an acceptance case must match 
 `CAW_GATE_REQUIRED_CHECKS` directly; do not parse `## Required gate checks` out of `CAW_SPEC`,
 which duplicates engine-owned identity in project code and drifts silently when it changes.
 
-The JSON also names the run's `kind`: `fast`, `batch`, `full`, `contract-preflight`, and on a
-disposable review copy `weak-baseline` or `weak-mutation`. A replay run exists only to learn whether
+The JSON also names the run's `kind`: `fast`, `batch`, `full`, `contract-preflight`, on a
+disposable review copy `weak-baseline` or `weak-mutation`, and `executor-probe` for a run the
+executor asked for through `$CAW_GATE_PROBE`. A probe given a mutation carries its path in
+`CAW_GATE_MUTATION_PATHS` too, so a gate that narrows replays by path can narrow the executor's own
+experiment the same way and show it what the replay will see. The probe prints the head and tail
+of the gate's output and the path of a file holding all of it. A replay run exists only to learn whether
 one mutation turns the gate red, so a gate may make it cheaper: stop at the first failure, and run
 only the tests that reach `CAW_GATE_MUTATION_PATHS`. Narrowing is the project's call and its risk.
 A suite cut too far lets a mutation survive that the full suite would catch, and the reviewer's

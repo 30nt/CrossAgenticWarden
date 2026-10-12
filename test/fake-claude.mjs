@@ -150,8 +150,14 @@ for (const probe of next.gateProbes || []) {
       input: probe.mutation ? JSON.stringify(probe.mutation) : '', encoding: 'utf8',
     })
     : { status: null, stdout: '', stderr: 'CAW_GATE_PROBE is not set' }
+  // The whole output is read back while the call is still running, as the executor would.
+  const logPath = `${result.stdout || ''}`.split('\n')
+    .find((line) => line.startsWith('caw-gate: full output: '))?.slice('caw-gate: full output: '.length)
+  const log = logPath ? readFileSync(logPath, 'utf8') : null
   value.notes = [...(value.notes || []), `fake-gate-probe:${JSON.stringify({
     status: result.status, last: `${result.stdout}${result.stderr}`.trim().split('\n').pop(),
+    ...(probe.readLog ? { logFirst: log?.split('\n')[0] ?? null, logBytes: log?.length ?? null,
+      printedBytes: `${result.stdout || ''}`.length } : {}),
   })}`]
 }
 

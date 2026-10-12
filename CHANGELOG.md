@@ -5,6 +5,19 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-12
+
+### Changed
+
+- A gate probe given a mutation (`$CAW_GATE_PROBE --mutation -`) sets `CAW_GATE_MUTATION_PATHS`
+  to the mutated path, as the engine's own mutation replay does; the run's `kind` stays
+  `executor-probe`. A gate that narrows replays by path can narrow the executor's experiment the
+  same way, so the executor sees what the replay will see.
+- A gate probe keeps the gate's whole output in a file beside its answer and prints
+  `caw-gate: full output: <file>`; the printed output is still a bounded head and tail.
+- An executor handed open findings from more than one blind review pass is told they may
+  describe one defect, to fix it once and say in `notes` which ids that change answers.
+
 ## [0.2.5] - 2026-10-11
 
 ### Fixed
@@ -242,7 +255,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.2...v0.2.3
