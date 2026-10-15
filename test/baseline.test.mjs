@@ -5764,6 +5764,39 @@ test('builtin request index gives planning roles a bounded deterministic file ma
   }
 })
 
+// Measured on one install: `plan` stopped on two holes, and `review-specs` with the same request on
+// the same HEAD paid the enumerator again ($1.31) because it built the project index alone, without
+// the builtin request index `plan` had cached against. Its architect and plan reviewer were never
+// shown the planning index either, so `index_audience: planning` held for `plan` only.
+test('review-specs uses the same planning index as plan, for the cache and for its roles', () => {
+  const f = fixture({ git: true, builtinIndex: 'request-v1', indexAudience: 'planning' })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'language-authority.swift'), 'profile language authority\n')
+  execFileSync('git', ['add', 'src/language-authority.swift'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add authority fixture'], { cwd: f.root })
+  const description = 'make profile language authoritative'
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([])) }, { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope({ ...planReview(), unverifiable: ['the task names no file it changes'] }) },
+    { envelope: envelope({ tasks: plan().tasks, order: ['baseline-task'],
+      coverage: plan().coverage, blocked: '', resplit: [] }) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'the task now names src/language-authority.swift',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  const roles = calls(f)
+  assert.deepEqual(roles.map(({ role }) => role), ['plan-reviewer', 'architect', 'plan-reviewer'])
+  for (const call of roles) assert.match(call.input, /src\/language-authority\.swift/, call.role)
+})
+
 test('index_cmd that exits non-zero enumerates without it and says so', () => {
   const f = fixture({ indexCmd: 'node -e "console.log(\\"partial\\"); process.exit(3)"' })
   const result = indexPlan(f)

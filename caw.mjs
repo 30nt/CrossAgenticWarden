@@ -11549,7 +11549,16 @@ function reviewSpecs(description, noFix) {
   // 24% different populations run to run. That number decided how much of the spread between
   // runs is sampling and how much is the request growing. Nothing else could have told them
   // apart, and after this line it has to be measured on purpose rather than found in the waste.
-  const population = requireReadyRequest(enumerate(description, text, f), 'review-specs')
+  //
+  // The same planning index `plan` builds, for the same two reasons it builds it there. The
+  // enumerator's population is cached against the index it was shown, so a review-specs that built
+  // the project index alone missed the cache on an unchanged request and tree — measured on one
+  // install at $1.31 — and its architect and plan reviewer were never shown the index that
+  // `index_audience: planning` promises every planning role.
+  const resolvedPlanningIndex = planningIndex(description, f)
+  const planningIndexBlock = f.index_audience === 'planning' ? indexBlock(resolvedPlanningIndex) : ''
+  const population = requireReadyRequest(
+    enumerate(description, text, f, resolvedPlanningIndex), 'review-specs')
   const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
   text = populationPolicy.text
   if (populationPolicy.risk) {
@@ -11565,7 +11574,7 @@ function reviewSpecs(description, noFix) {
   let holes = unclosedHoles(existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : '')
   if (holes.length) say(`  carrying ${holes.length} earlier hole(s) from ${PLAN} into this review`)
   for (let round = 1; round <= FIX_ROUNDS; round++) {
-    const verdict = judgeSpecs(description, f, text, population, holes)
+    const verdict = judgeSpecs(description, f, text, population, holes, planningIndexBlock)
     if (!verdict.problems.length) {
       return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
     }
@@ -11578,7 +11587,7 @@ function reviewSpecs(description, noFix) {
         `${FIX_ROUNDS} rounds is this command's cap — run it again to continue, or close these by hand`)
     }
 
-    fixSpecs(description, f, text, verdict.specs, verdict.problems, round)
+    fixSpecs(description, f, text, verdict.specs, verdict.problems, round, planningIndexBlock)
     holes = verdict.problems.map((hole, index) => ({ id: `h${index + 1}`, hole }))
   }
 }
@@ -11587,7 +11596,7 @@ function reviewSpecs(description, noFix) {
 // re-split renames files: closing a hole by moving a case into a new task leaves the old
 // `007_role-clone.md` on disk beside the new `007_clone-and-guards.md`, and both are in the
 // build glob.
-function fixSpecs(description, f, text, specs, problems, round) {
+function fixSpecs(description, f, text, specs, problems, round, planningIndexBlock = '') {
   const bodies = specs
     .map((s) => `### .caw-tasks/${s}\n\n${readFileSync(join(QUEUE_DIR, s), 'utf8')}`)
     .join('\n\n')
@@ -11607,6 +11616,7 @@ function fixSpecs(description, f, text, specs, problems, round) {
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    planningIndexBlock,
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they run:\n\n' + bodies,
     '\n\nHoles to close:\n- ' + problems.join('\n- '),
@@ -11769,7 +11779,7 @@ function oversizedCandidatesBlock(candidates) {
     JSON.stringify(candidates, null, 2)
 }
 
-function judgeSpecs(description, f, text, population, holes = []) {
+function judgeSpecs(description, f, text, population, holes = [], planningIndexBlock = '') {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to review')
 
@@ -11787,6 +11797,7 @@ function judgeSpecs(description, f, text, population, holes = []) {
     ' coverage. They are already on disk and will be built as they stand unless you name a hole.',
     '\n\nRequest they are meant to satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    planningIndexBlock,
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they will run:\n\n' + bodies,
     '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',

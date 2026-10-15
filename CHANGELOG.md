@@ -5,6 +5,14 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- `review-specs` builds the same planning index `plan` builds — the project index combined with
+  `builtin_index` — and hands it to the enumerator and, under `index_audience: planning`, to its
+  architect and plan reviewer. It used the project index alone, so the enumerator's population
+  cache missed whenever `builtin_index` was set, and `index_audience: planning` reached the
+  planning roles of `plan` only.
+
 ## [0.2.6] - 2026-10-12
 
 ### Changed
