@@ -1780,14 +1780,15 @@ test('review-specs hands the earlier holes to the plan reviewer and approves onl
 
   writeFileSync(f.calls, '')
   const result = run(f, ['review-specs', description], [
-    { envelope: envelope(population([{
-      case: 'fixture output', source: requestSource(description),
-    }])) },
+    // The specs are still the bytes the plan wrote, so the architect closes the hole first.
+    { envelope: envelope({ tasks: plan().tasks, order: ['baseline-task'],
+      coverage: plan().coverage, blocked: '', resplit: [] }) },
     { envelope: envelope({ ...planReview(), carried: [{
       id: 'h1', state: 'closed', evidence: 'task 001 now declares init(client:) in its Change',
     }] }) },
   ])
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['architect', 'plan-reviewer'])
   assert.match(result.stdout, /carrying 1 earlier hole\(s\)/)
   assert.match(result.stdout, /earlier holes settled: h1 closed/)
   const reviewer = calls(f).find((call) => call.role === 'plan-reviewer')
@@ -1803,9 +1804,8 @@ test('a re-judge that says nothing about an earlier hole does not approve the qu
 
   // Silence twice: the answer and its one repair both leave `carried` empty.
   const result = run(f, ['review-specs', description], [
-    { envelope: envelope(population([{
-      case: 'fixture output', source: requestSource(description),
-    }])) },
+    { envelope: envelope({ tasks: plan().tasks, order: ['baseline-task'],
+      coverage: plan().coverage, blocked: '', resplit: [] }) },
     { envelope: envelope(planReview()) },
     { envelope: envelope(planReview()) },
   ])
@@ -5764,6 +5764,39 @@ test('builtin request index gives planning roles a bounded deterministic file ma
   }
 })
 
+// Measured on one install: `plan` stopped on two holes, and `review-specs` with the same request on
+// the same HEAD paid the enumerator again ($1.31) because it built the project index alone, without
+// the builtin request index `plan` had cached against. Its architect and plan reviewer were never
+// shown the planning index either, so `index_audience: planning` held for `plan` only.
+test('review-specs uses the same planning index as plan, for the cache and for its roles', () => {
+  const f = fixture({ git: true, builtinIndex: 'request-v1', indexAudience: 'planning' })
+  mkdirSync(join(f.root, 'src'), { recursive: true })
+  writeFileSync(join(f.root, 'src', 'language-authority.swift'), 'profile language authority\n')
+  execFileSync('git', ['add', 'src/language-authority.swift'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'add authority fixture'], { cwd: f.root })
+  const description = 'make profile language authoritative'
+  let result = run(f, ['plan', description], [
+    { envelope: envelope(population([])) }, { envelope: envelope(plan()) },
+    { envelope: envelope(planReview()) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+
+  writeFileSync(f.calls, '')
+  result = run(f, ['review-specs', description], [
+    { envelope: envelope({ ...planReview(), unverifiable: ['the task names no file it changes'] }) },
+    { envelope: envelope({ tasks: plan().tasks, order: ['baseline-task'],
+      coverage: plan().coverage, blocked: '', resplit: [] }) },
+    { envelope: envelope({ ...planReview(), carried: [{
+      id: 'h1', state: 'closed', evidence: 'the task now names src/language-authority.swift',
+    }] }) },
+  ])
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+  assert.match(result.stdout, /population cache hit [0-9a-f]{12} — enumerator call skipped/)
+  const roles = calls(f)
+  assert.deepEqual(roles.map(({ role }) => role), ['plan-reviewer', 'architect', 'plan-reviewer'])
+  for (const call of roles) assert.match(call.input, /src\/language-authority\.swift/, call.role)
+})
+
 test('index_cmd that exits non-zero enumerates without it and says so', () => {
   const f = fixture({ indexCmd: 'node -e "console.log(\\"partial\\"); process.exit(3)"' })
   const result = indexPlan(f)
@@ -7583,6 +7616,58 @@ test('review-specs asks for the whole plan when the specs on disk are not the re
   const architect = calls(f).find(({ role }) => role === 'architect')
   assert.match(architect.input, /Return the whole plan again/)
   assert.doesNotMatch(result.stdout, /architect revised/)
+})
+
+// Measured on a second install: `plan` stopped after its rounds with two holes in `## Unclosed` and
+// the specs on disk exactly as it wrote them, and `review-specs` paid a plan reviewer ($0.96) to
+// re-find exactly those two holes before its architect was ever asked to close them.
+const planStoppedOnHoleInB = (f) => {
+  const result = run(f, ['plan', twoTaskDescription], [
+    { envelope: envelope(population([
+      { case: 'a output', source: requestSource('the a output') },
+      { case: 'b output', source: requestSource('the b output') },
+    ])) },
+    { envelope: envelope(twoTaskPlan()) },
+    holeInB,
+  ])
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^## Unclosed/m)
+}
+const closedB = () => [
+  { envelope: envelope({ tasks: [taskFixture('task-b', 'The b output exists under src/b.')],
+    order: ['task-a', 'task-b'],
+    coverage: [{ case: 'b output', task: 'task-b', acceptance_criteria: ['The b output exists under src/b.'] }],
+    blocked: '', resplit: [] }) },
+  { envelope: envelope({ ...planReview(twoTaskPlan('The b output exists under src/b.')),
+    carried: [{ id: 'h1', state: 'closed', evidence: 'task-b done_when now names src/b' }] }) },
+]
+
+test('review-specs after a plan that stopped on holes asks the architect first', () => {
+  const f = fixture({ git: true, planningMaxRounds: '1' })
+  planStoppedOnHoleInB(f)
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', twoTaskDescription], closedB())
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['architect', 'plan-reviewer'])
+  assert.match(calls(f)[0].input, /task-b: its done_when does not say where the b output is/)
+  assert.match(result.stdout, /specs are as the last plan wrote them/)
+  assert.match(readFileSync(join(f.root, '.caw-tasks', 'PLAN.md'), 'utf8'), /^approved: true$/m)
+})
+
+test('review-specs judges first when the specs changed after the plan stopped', () => {
+  const f = fixture({ git: true, planningMaxRounds: '1' })
+  planStoppedOnHoleInB(f)
+  const specB = join(f.root, '.caw-tasks', '002_task-b.md')
+  writeFileSync(specB, `${readFileSync(specB, 'utf8')}\n<!-- edited by hand -->\n`)
+  writeFileSync(f.calls, '')
+  const result = run(f, ['review-specs', twoTaskDescription], [
+    { envelope: envelope({ ...planReview(twoTaskPlan()), carried: [
+      { id: 'h1', state: 'closed', evidence: 'the hand edit names src/b' }] }) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(calls(f).map(({ role }) => role), ['plan-reviewer'])
 })
 
 test('autopilot shows a notes.log notice once per run, not on every step',

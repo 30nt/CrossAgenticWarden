@@ -890,7 +890,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.6'
+const VERSION = '0.2.7'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -3433,6 +3433,7 @@ function recordExecutorStop(ex, kept) {
 // excluded by NAME rather than by a `NNN_slug.md` pattern, because a ticket is a spec a human
 // wrote and named, and a pattern would silently drop the ones that do not match it.
 const PLAN = join(QUEUE_DIR, 'PLAN.md')
+const HUMAN_PLANNING_REVIEW_HOLE = 'signed human planning review required'
 const RISK_RECORD = join(QUEUE_DIR, '.risk.json')
 const RISK_RECORD_MAX = 64 * 1024
 
@@ -7308,8 +7309,9 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     ...(unclosed.length
       ? ['## Unclosed — this plan was NOT approved', '',
          ...unclosed.map((p) => `- ${p}`), '',
-         'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
-         '`approved:` above. `build` refuses until it does.', '']
+         'Run `node caw.mjs review-specs "<the request>"`: its architect closes these and its review',
+         'flips `approved:` above. Edit the specs by hand first only if you want to. `build` refuses',
+         'until it is approved.', '']
       : []),
   ].join('\n')
   writeFileSync(PLAN, unclosed.length || undecidable.length
@@ -7324,10 +7326,10 @@ function planIncomplete(description, out, history, problems, reason, population,
   writeSpecs(out.tasks, out.coverage)
   writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
-  if (problems.length === 1 && problems[0] === 'signed human planning review required') {
+  if (problems.length === 1 && problems[0] === HUMAN_PLANNING_REVIEW_HOLE) {
     say(`\nPrepare the signed review: node caw.mjs human-review prepare plan <identity>`)
   } else {
-    say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+    say(`\nClose them with:  node caw.mjs review-specs "<the request>"  (its architect goes first)`)
   }
   say(`  spent ${formatAccounting(accounting)}`)
   // Non-zero: the run did not succeed, and nothing reading this script may conclude otherwise.
@@ -7891,7 +7893,7 @@ function plan(description, { shipping = false } = {}) {
 
     if (f.planning_independence === 'human-review') {
       planIncomplete(description, out, history,
-        ['signed human planning review required'],
+        [HUMAN_PLANNING_REVIEW_HOLE],
         'automated plan review is disabled by planning_independence: human-review',
         population, planProvenance, risk)
     }
@@ -11549,7 +11551,16 @@ function reviewSpecs(description, noFix) {
   // 24% different populations run to run. That number decided how much of the spread between
   // runs is sampling and how much is the request growing. Nothing else could have told them
   // apart, and after this line it has to be measured on purpose rather than found in the waste.
-  const population = requireReadyRequest(enumerate(description, text, f), 'review-specs')
+  //
+  // The same planning index `plan` builds, for the same two reasons it builds it there. The
+  // enumerator's population is cached against the index it was shown, so a review-specs that built
+  // the project index alone missed the cache on an unchanged request and tree — measured on one
+  // install at $1.31 — and its architect and plan reviewer were never shown the index that
+  // `index_audience: planning` promises every planning role.
+  const resolvedPlanningIndex = planningIndex(description, f)
+  const planningIndexBlock = f.index_audience === 'planning' ? indexBlock(resolvedPlanningIndex) : ''
+  const population = requireReadyRequest(
+    enumerate(description, text, f, resolvedPlanningIndex), 'review-specs')
   const populationPolicy = applyPopulationPolicy(description, text, population, planning.risk)
   text = populationPolicy.text
   if (populationPolicy.risk) {
@@ -11564,8 +11575,22 @@ function reviewSpecs(description, noFix) {
   // the round before it raised, because fixSpecs has just edited the specs to close exactly those.
   let holes = unclosedHoles(existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : '')
   if (holes.length) say(`  carrying ${holes.length} earlier hole(s) from ${PLAN} into this review`)
-  for (let round = 1; round <= FIX_ROUNDS; round++) {
-    const verdict = judgeSpecs(description, f, text, population, holes)
+  // Measured on a second install: `plan` stopped with two holes and left the specs as it wrote
+  // them, and this command paid a plan reviewer ($0.96) to re-find exactly those two before its
+  // architect was asked to close them. When every spec on disk is still the bytes the last
+  // planning write recorded, the holes in PLAN.md were raised against these very specs, and the
+  // only new thing a reviewer could say is what it would say again after the fix — so the
+  // architect goes first and the review that follows answers the holes by id. A hand edit, or a
+  // queue with no record, is judged first as before: the holes may no longer be what is wrong.
+  let firstFix = 0
+  if (!noFix && holes.length && !holes.some(({ hole }) => hole === HUMAN_PLANNING_REVIEW_HOLE) &&
+      readPlanObject(specFiles())) {
+    say(`  specs are as the last plan wrote them; the architect closes the carried hole(s) first`)
+    fixSpecs(description, f, text, specFiles(), holes.map(({ hole }) => hole), 1, planningIndexBlock)
+    firstFix = 1
+  }
+  for (let round = 1; round <= FIX_ROUNDS - firstFix; round++) {
+    const verdict = judgeSpecs(description, f, text, population, holes, planningIndexBlock)
     if (!verdict.problems.length) {
       return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
     }
@@ -11573,12 +11598,13 @@ function reviewSpecs(description, noFix) {
     say(`\nholes (round ${round}/${FIX_ROUNDS}):\n  - ${verdict.problems.join('\n  - ')}`)
 
     if (noFix) return stopWithHoles(verdict.problems, verdict.specs, 'run again to close them')
-    if (round === FIX_ROUNDS) {
+    if (round === FIX_ROUNDS - firstFix) {
       return stopWithHoles(verdict.problems, verdict.specs,
         `${FIX_ROUNDS} rounds is this command's cap — run it again to continue, or close these by hand`)
     }
 
-    fixSpecs(description, f, text, verdict.specs, verdict.problems, round)
+    fixSpecs(description, f, text, verdict.specs, verdict.problems, round + firstFix,
+      planningIndexBlock)
     holes = verdict.problems.map((hole, index) => ({ id: `h${index + 1}`, hole }))
   }
 }
@@ -11587,7 +11613,7 @@ function reviewSpecs(description, noFix) {
 // re-split renames files: closing a hole by moving a case into a new task leaves the old
 // `007_role-clone.md` on disk beside the new `007_clone-and-guards.md`, and both are in the
 // build glob.
-function fixSpecs(description, f, text, specs, problems, round) {
+function fixSpecs(description, f, text, specs, problems, round, planningIndexBlock = '') {
   const bodies = specs
     .map((s) => `### .caw-tasks/${s}\n\n${readFileSync(join(QUEUE_DIR, s), 'utf8')}`)
     .join('\n\n')
@@ -11607,6 +11633,7 @@ function fixSpecs(description, f, text, specs, problems, round) {
     'These task specs are on disk and a reviewer has found holes in them. Close every one.',
     '\n\nRequest they must satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    planningIndexBlock,
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they run:\n\n' + bodies,
     '\n\nHoles to close:\n- ' + problems.join('\n- '),
@@ -11658,8 +11685,9 @@ function stopWithHoles(problems, specs, why) {
       kept.replace(/\n+$/, ''), '',
       '## Unclosed — this plan was NOT approved', '',
       ...problems.map((p) => `- ${String(p).replace(/\n+/g, ' ')}`), '',
-      'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
-      '`approved:` above. `build` refuses until it does.', '',
+      'Run `node caw.mjs review-specs "<the request>"`: its architect closes these and its review',
+      'flips `approved:` above. Edit the specs by hand first only if you want to. `build` refuses',
+      'until it is approved.', '',
     ].join('\n'))
     say(`  ${PLAN}: ## Unclosed now lists these ${problems.length}; the next review-specs carries them`)
   }
@@ -11769,7 +11797,7 @@ function oversizedCandidatesBlock(candidates) {
     JSON.stringify(candidates, null, 2)
 }
 
-function judgeSpecs(description, f, text, population, holes = []) {
+function judgeSpecs(description, f, text, population, holes = [], planningIndexBlock = '') {
   const specs = specFiles()
   if (!specs.length) die('.caw-tasks/ is empty — nothing to review')
 
@@ -11787,6 +11815,7 @@ function judgeSpecs(description, f, text, population, holes = []) {
     ' coverage. They are already on disk and will be built as they stand unless you name a hole.',
     '\n\nRequest they are meant to satisfy:\n\n' + description,
     '\n\nProfile:\n\n' + text,
+    planningIndexBlock,
     taskEvidenceLifecycleBlock(f),
     '\n\nThe specs, in the order they will run:\n\n' + bodies,
     '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',

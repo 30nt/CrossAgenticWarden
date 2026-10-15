@@ -5,6 +5,31 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-15
+
+### Changed
+
+- `review-specs` after a `plan` that stopped on holes asks the architect first when every spec on
+  disk is still the bytes the last planning write recorded: the holes in `PLAN.md` were raised
+  against those very specs, so the plan reviewer that used to re-find them first is skipped. A
+  hand-edited queue is judged first as before. `PLAN.md` and the stop message no longer tell the
+  operator to fix the specs by hand before running it.
+
+### Documentation
+
+- `docs/updating.md`: the profile fields added since 0.1.0 whose omitted default differs from the
+  distributed profile, and that `<caw-clone>` stays literal inside the rails-update markers.
+- `docs/gate.md`: binding required gate check ids to the tests that prove them, and keeping gate
+  scratch in `CAW_GATE_ARTIFACTS_DIR`.
+
+### Fixed
+
+- `review-specs` builds the same planning index `plan` builds — the project index combined with
+  `builtin_index` — and hands it to the enumerator and, under `index_audience: planning`, to its
+  architect and plan reviewer. It used the project index alone, so the enumerator's population
+  cache missed whenever `builtin_index` was set, and `index_audience: planning` reached the
+  planning roles of `plan` only.
+
 ## [0.2.6] - 2026-10-12
 
 ### Changed
@@ -255,7 +280,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.3...v0.2.4
