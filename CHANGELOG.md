@@ -5,6 +5,21 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- `review-specs` after a `plan` that stopped on holes asks the architect first when every spec on
+  disk is still the bytes the last planning write recorded: the holes in `PLAN.md` were raised
+  against those very specs, so the plan reviewer that used to re-find them first is skipped. A
+  hand-edited queue is judged first as before. `PLAN.md` and the stop message no longer tell the
+  operator to fix the specs by hand before running it.
+
+### Documentation
+
+- `docs/updating.md`: the profile fields added since 0.1.0 whose omitted default differs from the
+  distributed profile, and that `<caw-clone>` stays literal inside the rails-update markers.
+- `docs/gate.md`: binding required gate check ids to the tests that prove them, and keeping gate
+  scratch in `CAW_GATE_ARTIFACTS_DIR`.
+
 ### Fixed
 
 - `review-specs` builds the same planning index `plan` builds — the project index combined with

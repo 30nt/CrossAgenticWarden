@@ -3433,6 +3433,7 @@ function recordExecutorStop(ex, kept) {
 // excluded by NAME rather than by a `NNN_slug.md` pattern, because a ticket is a spec a human
 // wrote and named, and a pattern would silently drop the ones that do not match it.
 const PLAN = join(QUEUE_DIR, 'PLAN.md')
+const HUMAN_PLANNING_REVIEW_HOLE = 'signed human planning review required'
 const RISK_RECORD = join(QUEUE_DIR, '.risk.json')
 const RISK_RECORD_MAX = 64 * 1024
 
@@ -7308,8 +7309,9 @@ function writePlan(description, out, history, unclosed, population, undecidable 
     ...(unclosed.length
       ? ['## Unclosed — this plan was NOT approved', '',
          ...unclosed.map((p) => `- ${p}`), '',
-         'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
-         '`approved:` above. `build` refuses until it does.', '']
+         'Run `node caw.mjs review-specs "<the request>"`: its architect closes these and its review',
+         'flips `approved:` above. Edit the specs by hand first only if you want to. `build` refuses',
+         'until it is approved.', '']
       : []),
   ].join('\n')
   writeFileSync(PLAN, unclosed.length || undecidable.length
@@ -7324,10 +7326,10 @@ function planIncomplete(description, out, history, problems, reason, population,
   writeSpecs(out.tasks, out.coverage)
   writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
-  if (problems.length === 1 && problems[0] === 'signed human planning review required') {
+  if (problems.length === 1 && problems[0] === HUMAN_PLANNING_REVIEW_HOLE) {
     say(`\nPrepare the signed review: node caw.mjs human-review prepare plan <identity>`)
   } else {
-    say(`\nFix them in the specs above, then:  node caw.mjs review-specs "<the request>"`)
+    say(`\nClose them with:  node caw.mjs review-specs "<the request>"  (its architect goes first)`)
   }
   say(`  spent ${formatAccounting(accounting)}`)
   // Non-zero: the run did not succeed, and nothing reading this script may conclude otherwise.
@@ -7891,7 +7893,7 @@ function plan(description, { shipping = false } = {}) {
 
     if (f.planning_independence === 'human-review') {
       planIncomplete(description, out, history,
-        ['signed human planning review required'],
+        [HUMAN_PLANNING_REVIEW_HOLE],
         'automated plan review is disabled by planning_independence: human-review',
         population, planProvenance, risk)
     }
@@ -11573,7 +11575,21 @@ function reviewSpecs(description, noFix) {
   // the round before it raised, because fixSpecs has just edited the specs to close exactly those.
   let holes = unclosedHoles(existsSync(PLAN) ? readFileSync(PLAN, 'utf8') : '')
   if (holes.length) say(`  carrying ${holes.length} earlier hole(s) from ${PLAN} into this review`)
-  for (let round = 1; round <= FIX_ROUNDS; round++) {
+  // Measured on a second install: `plan` stopped with two holes and left the specs as it wrote
+  // them, and this command paid a plan reviewer ($0.96) to re-find exactly those two before its
+  // architect was asked to close them. When every spec on disk is still the bytes the last
+  // planning write recorded, the holes in PLAN.md were raised against these very specs, and the
+  // only new thing a reviewer could say is what it would say again after the fix — so the
+  // architect goes first and the review that follows answers the holes by id. A hand edit, or a
+  // queue with no record, is judged first as before: the holes may no longer be what is wrong.
+  let firstFix = 0
+  if (!noFix && holes.length && !holes.some(({ hole }) => hole === HUMAN_PLANNING_REVIEW_HOLE) &&
+      readPlanObject(specFiles())) {
+    say(`  specs are as the last plan wrote them; the architect closes the carried hole(s) first`)
+    fixSpecs(description, f, text, specFiles(), holes.map(({ hole }) => hole), 1, planningIndexBlock)
+    firstFix = 1
+  }
+  for (let round = 1; round <= FIX_ROUNDS - firstFix; round++) {
     const verdict = judgeSpecs(description, f, text, population, holes, planningIndexBlock)
     if (!verdict.problems.length) {
       return approveSpecs(verdict.specs, description, population, populationPolicy.risk)
@@ -11582,12 +11598,13 @@ function reviewSpecs(description, noFix) {
     say(`\nholes (round ${round}/${FIX_ROUNDS}):\n  - ${verdict.problems.join('\n  - ')}`)
 
     if (noFix) return stopWithHoles(verdict.problems, verdict.specs, 'run again to close them')
-    if (round === FIX_ROUNDS) {
+    if (round === FIX_ROUNDS - firstFix) {
       return stopWithHoles(verdict.problems, verdict.specs,
         `${FIX_ROUNDS} rounds is this command's cap — run it again to continue, or close these by hand`)
     }
 
-    fixSpecs(description, f, text, verdict.specs, verdict.problems, round, planningIndexBlock)
+    fixSpecs(description, f, text, verdict.specs, verdict.problems, round + firstFix,
+      planningIndexBlock)
     holes = verdict.problems.map((hole, index) => ({ id: `h${index + 1}`, hole }))
   }
 }
@@ -11668,8 +11685,9 @@ function stopWithHoles(problems, specs, why) {
       kept.replace(/\n+$/, ''), '',
       '## Unclosed — this plan was NOT approved', '',
       ...problems.map((p) => `- ${String(p).replace(/\n+/g, ' ')}`), '',
-      'Fix these in the specs, then `node caw.mjs review-specs "<the request>"`, which flips',
-      '`approved:` above. `build` refuses until it does.', '',
+      'Run `node caw.mjs review-specs "<the request>"`: its architect closes these and its review',
+      'flips `approved:` above. Edit the specs by hand first only if you want to. `build` refuses',
+      'until it is approved.', '',
     ].join('\n'))
     say(`  ${PLAN}: ## Unclosed now lists these ${problems.length}; the next review-specs carries them`)
   }
