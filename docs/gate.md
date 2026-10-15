@@ -136,6 +136,22 @@ while IFS= read -r id; do [ -n "$id" ] && printf '%s\n' "$id"; done \
   <<< "$CAW_GATE_REQUIRED_CHECKS"
 ```
 
+That loop shows where the ids come from, not what makes one passed. A gate that writes every
+declared id as `passed` whenever its suite is green has turned the architect's required checks
+into a restatement of the exit code. Bind each id to the tests that prove it instead. One install
+marks tests with the id they prove (a pytest marker, `@pytest.mark.gate_check("<id>")`) and lets
+a plugin write the manifest: an id is `passed` only if at least one test carrying it ran and every
+one of them passed. An id that no test carries makes the gate **red**, not refused, so the
+executor is sent back to write the test rather than the build stopping on infrastructure. Any
+test runner with tags or name patterns can take the same shape.
+
+Gate scratch belongs in `CAW_GATE_ARTIFACTS_DIR`. The engine creates that directory for every run
+and removes it afterwards, and it reads back only the files the manifest lists as artifacts, so
+anything else written there is ignored. A gate that cleans up after itself with
+`trap 'rm …' EXIT` needs no cleanup at all there. That also matters because some agent hosts
+refuse to run a shell script containing `rm`. On a hand run the variable is unset; a gate should
+then write nothing it would have to remove.
+
 CAW owns the resulting receipt. It records the command result, bounded output and artifact
 digests against the exact delivery digest. Manifest files are limited to 1 MiB, 128 checks and 32
 artifacts. Each artifact is at most 16 MiB and all artifacts together at most 64 MiB. Paths must

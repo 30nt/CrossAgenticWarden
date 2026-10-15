@@ -59,6 +59,29 @@ and run `grep -rn 'LOCAL CHANGE' caw.mjs .caw/` **before** copying, not after: t
 make re-application a list rather than a memory. A local change that survives two updates is
 one that belongs upstream instead.
 
+### Profile fields an older profile omits — coming from 0.1.0
+
+**An omitted field is not an error, and it is not the distributed value either.** `.caw/CAW.md`
+is project-owned and is never copied by an update, so a profile written for 0.1.0 keeps its old
+fields, and the engine reads every field added since then at its built-in default. Nothing warns.
+These are the fields where that default differs from what the distributed `.caw/CAW.md` sets;
+compare your profile against this list rather than against `caw.mjs`:
+
+| field | omitted | distributed profile | what omitting it means |
+|---|---|---|---|
+| `task_independence` | `same-provider` | `different-model` | the reviewer may be the executor's own model |
+| `require_role_smoke` | `false` | `true` | a model, adapter or engine change is not re-proved by `smoke` before spend |
+| `index_format` | `text-v0` | `json-v1` | `index_cmd` output is read as plain text |
+| `builtin_index` | none | `request-v1` | planning roles get no engine-built file map of the request |
+| `index_audience` | `enumerator` | `planning` | the architect and plan reviewer are not shown the index |
+| `executor_budget_{small,normal,large}_{tool_events,event_bytes}` | no limit | 120/1 MiB, 180/2 MiB, 260/4 MiB | executor calls run without a live budget; set all six or none |
+
+Every other field added since 0.1.0 either defaults to the distributed value (`pipeline_mode`,
+`planning_max_rounds`, `planning_independence`, `review_challenger_*`, `gate_unavailable_review`,
+the `budget_*_calls` limits) or is empty in the distributed profile too (gate timeouts,
+`gate_batch`, `executor_max_*`, `weak_*_cmd`, `human_review_allowed_signers`). The `autopilot_*`
+fields are opt-in and absent from both.
+
 ### What else a gate and a profile meet — coming to 0.2.0
 
 - **A gate's leftovers are stopped.** The fast gate runs in a process group of its own, and the
@@ -141,7 +164,9 @@ reminder only and never evidence about a noninteractive child capability.
 session asked it to — the same rule that stops a peer from rewriting yours.
 
 Copy it verbatim, markers included. The markers are what make "does this project carry the rule"
-a diff instead of a memory, and they are why the block may sit anywhere in the file:
+a diff instead of a memory, and they are why the block may sit anywhere in the file. That
+includes `<caw-clone>`: it stays literal inside the markers, or the diff below fails. Name the
+clone's path outside them, on a line of your own:
 
 ```markdown
 <!-- caw-rails-update -->
