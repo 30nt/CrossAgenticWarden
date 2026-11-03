@@ -89,6 +89,10 @@ review_challenger_passes: 1
 review_challenger_policy: fixed
 review_challenger_file_threshold: 8
 
+# Case-insensitive regular expression added to the mutation_proof floor. A task whose text or
+# delivered paths match cannot run as mutation_proof: none. The value takes no trailing comment.
+mutation_risk_pattern:
+
 # Require a successful role-specific provider call for the exact model/reasoning binding.
 # Run `node caw.mjs smoke all` after changing .caw/runtime.json.
 require_role_smoke: true

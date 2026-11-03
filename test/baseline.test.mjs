@@ -130,6 +130,7 @@ const plan = () => ({
     }],
     indivisible_reason: '',
     executor_budget: 'small',
+    mutation_proof: 'required',
   }],
   coverage: [{
     case: 'fixture output', task: 'baseline-task',
@@ -6167,6 +6168,131 @@ test('a surviving executor mutation goes back to the executor before any reviewe
   assert.equal(manifest.diagnostics.filter((row) => row.kind === 'mutation-measurement').length, 2)
 })
 
+test('mutation_proof none runs no named mutation and turns a reviewer weak into a note',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\nmutation_proof: none\n---\n\n## Must cover\n- The value and the label are kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\nlabel=x\n' },
+      envelope: envelope(delivery('first', [], executorMutations)) },
+    { echoPromptMatch: 'row needs no mutation and no experiment|must name one concrete mutation',
+      envelope: envelope(verdict({
+        criteria: [{ id: 'must-cover-1', state: 'weak', evidence: 'the label is unchecked' }],
+        weak: [{ where: 'src/output.txt:2', fix: 'check the label', evidence: 'changed the label',
+          mutation: { patch: readmeMutation('never-replayed'), breaks: 'the label' } }],
+      })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /mutation proof: none \(requested none, floor none\)/)
+  assert.match(calls(f)[0].input, /carries `mutation_proof: none`: leave `mutations` empty/)
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 1)
+  assert.match(result.stdout, /open now 0,  noted 2/)
+  const audit = latestTaskAudit(f)
+  const reviewerNotes = audit.delivery.reviewer_notes
+  assert.match(reviewerNotes.join('\n'), /weak not required, noted only/)
+  assert.deepEqual(JSON.parse(reviewerNotes.find((note) => note.startsWith('fake-prompt-echo:'))
+    .slice('fake-prompt-echo:'.length)), ['row needs no mutation and no experiment'])
+  assert.equal(audit.review.certification.limitations.some((row) => /mutation/.test(row)), false)
+  assert.deepEqual(audit.review.certification.open_item_ids, [])
+  assert.equal(audit.review.certification.mutation_proof.effective, 'none')
+  assert.equal(audit.review.certification.criteria[0].state, 'met')
+})
+
+test('a delivery that reaches a risk path restores mutation proof for a task planned as none',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true, gateFast: mutationGate })
+  const gateLog = join(f.parent, 'gate-calls.log')
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\nmutation_proof: none\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'src/output.txt': 'value=42\nlabel=x\n', 'src/migrations/001.sql': 'select 1;\n' },
+      envelope: envelope(delivery('first', [], executorMutations.slice(0, 1))) },
+    { echoPromptMatch: 'row needs no mutation and no experiment|must name one concrete\\s+mutation',
+      envelope: envelope(verdict({ criteria: [{
+        id: 'must-cover-1', state: 'met', evidence: 'changing the value turns the gate red',
+        evidence_refs: ['executor-mutation:m-value'],
+      }] })) },
+  ], { CAW_GATE_LOG: gateLog })
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  // `src/` is new here, so plain porcelain would report the folder and the migration inside it
+  // would match nothing.
+  assert.match(result.stdout, /mutation proof raised to required — the delivery changes src\/migrations\/001\.sql/)
+  // Its gate, one unmutated copy, one mutated copy.
+  assert.equal(readFileSync(gateLog, 'utf8').trim().split('\n').length, 3)
+  const audit = latestTaskAudit(f)
+  assert.deepEqual(JSON.parse(audit.delivery.reviewer_notes
+    .find((note) => note.startsWith('fake-prompt-echo:')).slice('fake-prompt-echo:'.length)),
+  ['must name one concrete mutation'])
+  const proof = audit.review.certification.mutation_proof
+  assert.deepEqual([proof.requested, proof.effective], ['none', 'required'])
+})
+
+test('a change to a tracked risk file restores mutation proof', { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, 'db', 'migrations'), { recursive: true })
+  writeFileSync(join(f.root, 'db', 'migrations', '001.sql'), 'select 1;\n')
+  execFileSync('git', ['add', '-A'], { cwd: f.root })
+  execFileSync('git', ['commit', '-qm', 'migration'], { cwd: f.root })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\nmutation_proof: none\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'db/migrations/001.sql': 'select 2;\n' }, envelope: envelope(delivery('first')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'must-cover-1', state: 'met', evidence: 'the file changed',
+    }] })) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /mutation proof raised to required — the delivery changes db\/migrations\/001\.sql/)
+})
+
+test('a task whose own text names sensitive work cannot run as mutation_proof none',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\nmutation_proof: none\n---\n\n## Change\n- Add a database column.\n')
+  const result = run(f, ['build'], [
+    { writeFiles: { 'delivery.txt': 'delivery\n' }, envelope: envelope(delivery('first')) },
+    { envelope: envelope(verdict({ criteria: [{
+      id: 'change-1', state: 'met', evidence: 'the column is present',
+    }] })) },
+  ])
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /mutation proof: required \(requested none, floor required\)/)
+  assert.doesNotMatch(calls(f)[0].input, /leave `mutations` empty/)
+})
+
+test('an unknown mutation_proof stops the task before any provider is paid',
+  { skip: claudeOuterProfileSkip() }, () => {
+  const f = fixture({ git: true })
+  mkdirSync(join(f.root, '.caw-tasks'), { recursive: true })
+  writeFileSync(join(f.root, '.caw-tasks', '001_task.md'),
+    '---\ntitle: Task\nmutation_proof: sometimes\n---\n\n## Must cover\n- The value is kept.\n')
+  const result = run(f, ['build'], [])
+
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /mutation_proof must be required or none — got "sometimes"/)
+  assert.equal(calls(f).length, 0)
+})
+
+test('an invalid mutation_risk_pattern refuses the profile', () => {
+  const f = fixture({ git: true })
+  configureProfileFields(f, { mutation_risk_pattern: '(' })
+  const result = run(f, ['build'], [])
+
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /mutation_risk_pattern is not a regular expression/)
+})
+
 // Measured on one iOS install, twice: the executor after a rejecting review was shown the pre-review
 // "m1 caught, m2 caught, m3 caught" beside "Close every open finding", read the first as the
 // answer to the second, and returned the tree the reviewer had just rejected.
@@ -7543,7 +7669,7 @@ const taskFixture = (slug, doneWhen) => ({
     surface: `${slug}-output`, states: ['absent', 'present'],
     transitions: [{ from: 'absent', event: `write ${slug}`, to: 'present' }],
   }],
-  indivisible_reason: '', executor_budget: 'small',
+  indivisible_reason: '', executor_budget: 'small', mutation_proof: 'required',
 })
 const twoTaskPlan = (doneWhenB = 'The b output exists.') => ({
   tasks: [taskFixture('task-a', 'The a output exists.'), taskFixture('task-b', doneWhenB)],

@@ -77,7 +77,7 @@ This is the fact the gate attempt above would have given you, on a host where it
 install the executor could never run the gate, listed every red-making mutation as
 "unmeasured", and the reviewer spent a whole round on each one that survived. Do not mutate the
 test itself, and do not name a mutation you expect to survive. Leave `mutations` empty when the
-task adds no test.
+task adds no test, and when its spec carries `mutation_proof: none`.
 
 Record every meaningful check in `claims`. A claim has a stable id, links to the criterion and
 acceptance-case ids it exercised, the command and selector, the observed result, a short summary

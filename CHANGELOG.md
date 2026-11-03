@@ -5,6 +5,15 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- `mutation_proof`, a per-task class of `required` or `none`. Planning proposes it, and the engine
+  raises `none` from the task's words and again from the paths the delivery changed. Under `none`
+  no executor mutation runs and a reviewer's `weak` becomes a note. A spec without the field means
+  `required`, so an existing queue behaves as before. `mutation_risk_pattern` extends the floor per
+  project, and the task certificate records the class. A test that proves a risk is `required`,
+  and mock or harness code is `none` only when a `required` task in the same queue exercises it.
+
 ## [0.2.7] - 2026-10-15
 
 ### Changed

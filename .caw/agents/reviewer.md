@@ -88,6 +88,9 @@ rounds that raised 6, then 1, 1, 1 — $94.07 of a $187.11 build — and both la
 visible in round 1 to anyone who had tried. Finding them one per round is the expensive way to
 find them all.
 
+The engine tells you when a task carries `mutation_proof: none`. There a `Must cover` row needs
+no mutation and no experiment, and a doubt about a test's strength is `noted`, never `weak`.
+
 Later rounds show you what earlier rounds already `noted`. Do not restate those.
 
 **Three slots block, and every item in them carries `evidence`.**
