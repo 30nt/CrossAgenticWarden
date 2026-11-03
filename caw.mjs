@@ -161,6 +161,7 @@ const EXECUTOR_TOOL_EVENT_LIMIT_MAX = 10_000
 const EXECUTOR_EVENT_BYTE_LIMIT_MAX = 256 * 1024 * 1024
 const EXECUTOR_BUDGET_CLASSES = Object.freeze(['small', 'normal', 'large'])
 const EXECUTOR_BUDGET_RANK = new Map(EXECUTOR_BUDGET_CLASSES.map((name, index) => [name, index]))
+const MUTATION_PROOF_CLASSES = Object.freeze(['required', 'none'])
 const PIPELINE_MODES = new Set(['fast', 'standard', 'strict'])
 const TASK_DOSSIER_TOTAL_MAX = 192 * 1024
 const TASK_DOSSIER_CAPS = Object.freeze({
@@ -890,7 +891,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.7'
+const VERSION = '0.2.8'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -1943,9 +1944,16 @@ const TASK = {
         'for cross-layer, database, authorization, security, credential, or migration work. ' +
         'The engine may raise this proposal but never lower it.',
     },
+    mutation_proof: {
+      type: 'string', enum: MUTATION_PROOF_CLASSES,
+      description: 'required when a silent failure of this task would lose data, open access, ' +
+        'or break a stated product rule; none for mock code, test harness, strings, layout and ' +
+        'other work where a passing test is proof enough. The engine may raise none to required ' +
+        'but never the reverse.',
+    },
   },
   required: ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
-    'indivisible_reason', 'executor_budget'],
+    'indivisible_reason', 'executor_budget', 'mutation_proof'],
 }
 
 // One shape for every blocking slot of a task verdict. `where` and `fix` are what the executor
@@ -3182,7 +3190,7 @@ function recordWeakVerification(task, round, verification, status = 'active') {
 
 function recordTaskCertification({ task, round, criteria, open, author, reviewer, reviewSurface,
   reviewBaseline, weakVerification, gateReceipt = null, acceptanceCases = [], executorClaims = [],
-  topology = null }) {
+  topology = null, mutationProof = null }) {
   const run = beginRunRecord()
   const population = activePopulationCertification || {
     state: 'unknown', source: 'no-plan-population-record', digest: null,
@@ -3208,6 +3216,9 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
     author: author || { kind: 'human-or-prior-unobserved' },
     reviewer,
     population,
+    // Not a limitation: `none` is what the plan decided, and it must not read as a defect of the
+    // certificate. It is here so that an approval says how much was asked of it.
+    mutation_proof: mutationProof,
     criteria,
     acceptance_cases: acceptanceCases,
     executor_claims: executorClaims,
@@ -3946,6 +3957,10 @@ function profile(preflight = true) {
       die('.caw/CAW.md review_challenger_file_threshold must be a positive whole number')
     }
     f.review_challenger_file_threshold = threshold
+  }
+  if (f.mutation_risk_pattern) {
+    try { f.mutation_risk_regex = new RegExp(f.mutation_risk_pattern, 'im') }
+    catch (error) { die(`.caw/CAW.md mutation_risk_pattern is not a regular expression: ${error.message}`) }
   }
   if (f.require_role_smoke === undefined || f.require_role_smoke === '') {
     f.require_role_smoke = false
@@ -5192,11 +5207,9 @@ function planningLedger(out) {
   return { version: 1, tasks, requirements, cases, relations }
 }
 
-function executorBudgetFloor(taskOrSpec) {
-  const body = typeof taskOrSpec === 'string'
-    ? taskOrSpec
-    : JSON.stringify(taskOrSpec || {})
-  const riskBody = (typeof taskOrSpec === 'string'
+// The text a floor judges: what the task says it will do, with the clauses it rules out removed.
+function taskRiskBody(taskOrSpec) {
+  return (typeof taskOrSpec === 'string'
     ? taskOrSpec
     : [
         taskOrSpec?.title,
@@ -5212,6 +5225,14 @@ function executorBudgetFloor(taskOrSpec) {
     .split('\n')
     .map((line) => line.replace(/\b(?:do not|don't|must not|never|without|no)\b.*$/i, ''))
     .join('\n')
+}
+
+const SENSITIVE_WORK = /\b(?:migration|database|schema|postgres|supabase|rls|row[- ]level security|authentication|authorization|credential|secret|security|permission|privilege|grant|access policy|security policy)\b/i
+
+function executorBudgetFloor(taskOrSpec) {
+  const body = typeof taskOrSpec === 'string'
+    ? taskOrSpec
+    : JSON.stringify(taskOrSpec || {})
   const surfaceCount = typeof taskOrSpec === 'string'
     ? (body.split(/^## Surfaces\s*$/m)[1]?.split(/^## /m)[0]
       ?.split('\n').filter((line) => /^-\s+`[^`]+`/.test(line)).length || 0)
@@ -5220,8 +5241,7 @@ function executorBudgetFloor(taskOrSpec) {
     ? (body.match(/^\s+-\s+`[^`]+`\s+--\s+.+\s+-->\s+`[^`]+`\s*$/gm)?.length || 0)
     : (taskOrSpec?.state_machines || []).reduce((sum, machine) =>
       sum + (machine.transitions?.length || 0), 0)
-  const sensitive = /\b(?:migration|database|schema|postgres|supabase|rls|row[- ]level security|authentication|authorization|credential|secret|security|permission|privilege|grant|access policy|security policy)\b/i
-    .test(riskBody)
+  const sensitive = SENSITIVE_WORK.test(taskRiskBody(taskOrSpec))
   if (surfaceCount > 1 || sensitive) {
     return {
       class: 'large',
@@ -5252,6 +5272,69 @@ function executorBudgetSelections(tasks) {
     task: task.slug,
     ...effectiveExecutorBudgetClass(task.executor_budget, task),
   }))
+}
+
+// Measured on one iOS install, 31 October to 2 November: mutation replays took 15.1 of 41 gate and
+// agent hours, and 83 task reviews returned no `broken` finding. By task name, about two thirds of
+// that time went on mock, harness and UI tasks. So the proof is a per-task class, and like the budget
+// the floor only raises it: the task's own words first, then what the delivery really changed,
+// because a task planned as harness work can still reach a migration.
+function mutationProofFloor(taskOrSpec, f = {}, files = []) {
+  const projectRisk = f.mutation_risk_regex || null
+  const riskyPath = files.find((path) => RISK_PATH.test(path) || projectRisk?.test(path))
+  if (riskyPath) return { class: 'required', reason: `the delivery changes ${riskyPath}` }
+  const body = taskRiskBody(taskOrSpec)
+  if (SENSITIVE_WORK.test(body)) {
+    return { class: 'required', reason: 'the task names database, authorization, security, ' +
+      'credential, or migration work' }
+  }
+  if (projectRisk?.test(body)) {
+    return { class: 'required', reason: 'the task matches mutation_risk_pattern' }
+  }
+  return { class: 'none', reason: 'nothing in the task or its delivery is a named risk' }
+}
+
+function effectiveMutationProof(requested, taskOrSpec, f = {}, files = []) {
+  const proposed = requested || 'required'
+  if (!MUTATION_PROOF_CLASSES.includes(proposed)) {
+    throw new TypeError(`mutation_proof must be required or none — got ${JSON.stringify(proposed)}`)
+  }
+  const floor = mutationProofFloor(taskOrSpec, f, files)
+  return {
+    requested: proposed,
+    floor: floor.class,
+    effective: proposed === 'required' ? 'required' : floor.class,
+    reason: proposed === 'required' && floor.class === 'none' ? 'the task requires it' : floor.reason,
+  }
+}
+
+function mutationProofSelections(tasks, f) {
+  return (tasks || []).map((task) => ({
+    task: task.slug,
+    ...effectiveMutationProof(task.mutation_proof, task, f),
+  }))
+}
+
+const declaredMutationProof = (specText) =>
+  specText.match(/^mutation_proof:\s*(\S+)\s*$/m)?.[1] || null
+
+// Under `none` a reviewer's doubt about a test is worth keeping and not worth a replay or a round.
+// The engine moves it itself, before validation, so a reviewer that disregards the prompt cannot
+// buy a mutation gate. A row an open carried item still holds stays as it is.
+function demoteWeakFindings(verdict, open = []) {
+  const carried = new Map((verdict.carried || []).map((row) => [row.id, row]))
+  const held = new Set(open.filter((item) => carried.get(item.id)?.state === 'open')
+    .flatMap((item) => [...(item.criterion_ids || []),
+      ...(carried.get(item.id)?.criterion_ids || [])]))
+  const demoted = (verdict.weak || []).map((item) =>
+    `weak not required, noted only — ${item.where}: ${item.fix}; ` +
+    `this task carries mutation_proof: none. Evidence: ${item.evidence}`)
+  verdict.weak = []
+  verdict.noted = [...(verdict.noted || []), ...demoted]
+  for (const row of verdict.criteria || []) {
+    if (row.state === 'weak' && !held.has(row.id)) row.state = 'met'
+  }
+  return demoted.length
 }
 
 function validatePlanRelations(out) {
@@ -7115,6 +7198,13 @@ const changedFiles = () =>
   git('status', '--porcelain').split('\n').filter(Boolean).map((l) => l.slice(3))
     .filter((p) => !p.startsWith(`${QUEUE_DIR}/`) && !p.startsWith(`${LOG_DIR}/`))
 
+// Every path, for a check that must not miss one. Plain porcelain folds a new directory into
+// `src/` and a rename into `old -> new`, so a migration in a new folder would match no pattern.
+const deliveredPaths = () =>
+  git('status', '--porcelain', '-z', '--untracked-files=all', '--no-renames')
+    .split('\0').filter(Boolean).map((l) => l.slice(3))
+    .filter((p) => !p.startsWith(`${QUEUE_DIR}/`) && !p.startsWith(`${LOG_DIR}/`))
+
 function taskDeliveryDiff(cwd = undefined) {
   const maxBuffer = 64 * 1024 * 1024
   const result = spawnSync('git', [
@@ -7321,9 +7411,9 @@ function writePlan(description, out, history, unclosed, population, undecidable 
 }
 
 function planIncomplete(description, out, history, problems, reason, population, provenance,
-  risk = null) {
+  risk = null, f = {}) {
   say(`\n${reason}`)
-  writeSpecs(out.tasks, out.coverage)
+  writeSpecs(out.tasks, out.coverage, f)
   writePlan(description, out, history, problems, population, [], provenance, risk)
   say(`\n${PLAN} written, approved: false. Unclosed:\n  - ${problems.join('\n  - ')}`)
   if (problems.length === 1 && problems[0] === HUMAN_PLANNING_REVIEW_HOLE) {
@@ -7821,7 +7911,7 @@ function plan(description, { shipping = false } = {}) {
     if (architectBudgetIssue && last) {
       planIncomplete(description, last, history, problems || [architectBudgetIssue],
         `provider budget stopped planning before architect: ${architectBudgetIssue}`,
-        population, planProvenance, risk)
+        population, planProvenance, risk, f)
     }
     // Hand the architect its own plan back.
     //
@@ -7866,6 +7956,13 @@ function plan(description, { shipping = false } = {}) {
       ' Assign executor_budget small to one bounded local surface, normal to an ordinary feature,',
       ' and large to cross-layer, database, authorization, security, credential, or migration work.',
       ' The engine may raise your proposal to its safety floor and never lowers it.',
+      ' Assign mutation_proof required where a silent failure would lose data, open access, or',
+      ' break a stated product rule, and to every test whose purpose is to prove such a risk.',
+      ' Assign none to strings, layout, docs and gate wiring, and to mock code or test harness only',
+      ' when a required task in this queue exercises it: the harness is what lets a test go red, and',
+      ' only a mutation in the task that consumes it proves both. Keep risky logic and plumbing in',
+      ' separate tasks so each gets its own class. The engine may raise none to required, from the',
+      ' task and from its delivery.',
     ].join('')
     const { value: out, validation: ledger } = planningCanonicalCall(
       'architect', architectPrompt, SCHEMA.plan, f, validatePlanRelations)
@@ -7895,7 +7992,7 @@ function plan(description, { shipping = false } = {}) {
       planIncomplete(description, out, history,
         [HUMAN_PLANNING_REVIEW_HOLE],
         'automated plan review is disabled by planning_independence: human-review',
-        population, planProvenance, risk)
+        population, planProvenance, risk, f)
     }
 
     const reviewerBudgetIssue = providerBudgetIssue('plan-reviewer', f.provider_budgets)
@@ -7903,7 +8000,7 @@ function plan(description, { shipping = false } = {}) {
       planIncomplete(description, out, history,
         [`plan review did not run — ${reviewerBudgetIssue}`],
         `provider budget stopped planning before plan-reviewer: ${reviewerBudgetIssue}`,
-        population, planProvenance, risk)
+        population, planProvenance, risk, f)
     }
     // The previous round's holes are exactly what the architect just revised against, so the
     // re-judge answers them by id before it can call the revision clean.
@@ -7919,6 +8016,12 @@ function plan(description, { shipping = false } = {}) {
       ' effective is max(requested, safety floor). Treat an effective class that is still too',
       ' small for reliable complete delivery as an `unverifiable` hole:\n\n' +
         JSON.stringify(budgetSelections, null, 2),
+      '\n\nEngine-owned mutation proof selections. The requested value came from the architect;',
+      ' effective is required when the request or the floor says so. Treat an effective `none`',
+      ' on work whose silent failure would lose data, open access, or break a stated product',
+      ' rule, on a test that proves such a risk, or on mock or harness code that no required task',
+      ' in this queue exercises as an `unverifiable` hole:\n\n' +
+        JSON.stringify(mutationProofSelections(out.tasks, f), null, 2),
       oversizedCandidatesBlock(budgetSelections.filter((row) => row.effective === 'large')
         .map((row) => ({ task: row.task, reason: row.reason }))),
       "\n\nThe architect's coverage mapping:\n\n" + JSON.stringify(out.coverage, null, 2),
@@ -7985,7 +8088,7 @@ function plan(description, { shipping = false } = {}) {
         ? `\n  the same verdict also found, and these are NOT answers to the question above` +
           ` —\n  they may themselves rest on it:\n    - ${problems.join('\n    - ')}`
         : `\n  Nothing else in this verdict: the other four slots came back empty.`)
-      writeSpecs(out.tasks, out.coverage)
+      writeSpecs(out.tasks, out.coverage, f)
       writePlan(description, out, history, problems, population, r.undecidable, planProvenance,
         risk)
       say(`\n${PLAN} written, approved: false — the specs below it rest on a guess.`)
@@ -7998,7 +8101,7 @@ function plan(description, { shipping = false } = {}) {
       process.exit(1)
     }
     if (!problems.length) {
-      writeSpecs(out.tasks, out.coverage)
+      writeSpecs(out.tasks, out.coverage, f)
       writePlan(description, out, history, [], population, [], planProvenance, risk)
       say(`  ${PLAN}`)
       say(shipping ? '\n· ship: the plan is approved; autopilot builds it now'
@@ -8022,7 +8125,7 @@ function plan(description, { shipping = false } = {}) {
     // bought was an early exit that has never once been right.
   }
   planIncomplete(description, last, history, problems,
-    `Still has holes after ${f.planning_max_rounds} rounds.`, population, planProvenance, risk)
+    `Still has holes after ${f.planning_max_rounds} rounds.`, population, planProvenance, risk, f)
 }
 
 // Writes the specs and says where they went, and nothing else. The next-step line belongs to
@@ -8102,7 +8205,7 @@ function mergePlanRevision(prior, revision) {
   }
 }
 
-function writeSpecs(tasks, coverage) {
+function writeSpecs(tasks, coverage, f) {
   mkdirSync(QUEUE_DIR, { recursive: true })
   const ledger = planningLedger({ tasks, coverage })
   tasks.forEach((t, i) => {
@@ -8112,6 +8215,7 @@ function writeSpecs(tasks, coverage) {
     const links = ledger.relations.filter((relation) => relation.task === t.slug)
     const gateChecks = t.gate_checks || []
     const budget = effectiveExecutorBudgetClass(t.executor_budget, t)
+    const proof = effectiveMutationProof(t.mutation_proof, t, f)
     const gateCheckIds = gateChecks.map((check) => check.id)
     if (new Set(gateCheckIds).size !== gateCheckIds.length) {
       die(`task ${t.slug} contains duplicate gate check ids`)
@@ -8120,7 +8224,9 @@ function writeSpecs(tasks, coverage) {
     writeFileSync(path, [
       '---', `id: ${id}`, `task_key: ${t.slug}`, `title: ${t.title}`,
       `executor_budget_requested: ${budget.requested}`,
-      `executor_budget: ${budget.effective}`, '---', '',
+      `executor_budget: ${budget.effective}`,
+      `mutation_proof_requested: ${proof.requested}`,
+      `mutation_proof: ${proof.effective}`, '---', '',
       '## Read', ...t.read.map((x) => `- ${x}`), '',
       '## Surfaces', ...t.surfaces.map((surface) =>
         `- \`${surface.id}\` — ${surface.responsibility}`), '',
@@ -8566,7 +8672,7 @@ function requireTaskBranch(f) {
   if (branch === (f.main_branch || 'main')) die(`on ${branch} — branch first, this commits`)
 }
 
-const CHALLENGER_RISK_PATH = /(^|\/)(auth|security|billing|payment|migrations?|polic(?:y|ies)|rls)(\/|[._-]|$)/i
+const RISK_PATH = /(^|\/)(auth|security|billing|payment|migrations?|polic(?:y|ies)|rls)(\/|[._-]|$)/i
 
 // Why a challenger was planned before the primary pass, in the words of the profile. Measured on
 // one iOS install: pass 2 ran with nothing in the log saying why, and the operator reconstructed a wrong
@@ -8580,14 +8686,14 @@ function challengerReason(f, files, open = []) {
     return `review_challenger_policy: risk, ${files.length} changed files` +
       ` (threshold ${f.review_challenger_file_threshold})`
   }
-  const risky = files.find((path) => CHALLENGER_RISK_PATH.test(path))
+  const risky = files.find((path) => RISK_PATH.test(path))
   return risky ? `review_challenger_policy: risk, ${risky} is a risk path` : null
 }
 
 function reviewNeedsChallenger(f, files, open = [], verdict = null) {
   if (f.review_challenger_policy === 'fixed') return f.review_challenger_passes > 0
   if (open.length || files.length >= f.review_challenger_file_threshold ||
-      files.some((path) => CHALLENGER_RISK_PATH.test(path))) return true
+      files.some((path) => RISK_PATH.test(path))) return true
   if (!verdict) return false
   return ['broken', 'uncovered', 'weak'].some((slot) => (verdict[slot] || []).length > 0) ||
     (verdict.criteria || []).some((row) => row.state !== 'met')
@@ -10143,6 +10249,9 @@ function runTask(file, f, profileText, opts = {}) {
   let executorBudget
   try { executorBudget = executorBudgetForSpec(f, spec) }
   catch (error) { die(`${file} — ${error?.message || error}`) }
+  let mutationProof
+  try { mutationProof = effectiveMutationProof(declaredMutationProof(spec), spec, f) }
+  catch (error) { die(`${file} — ${error?.message || error}`) }
   const topology = extractTaskTopology(spec)
   const coreCriteria = topology.criteria
   const acceptancePolicy = runProjectPolicy('acceptance', {
@@ -10160,6 +10269,8 @@ function runTask(file, f, profileText, opts = {}) {
     say(`  executor budget: ${selection}; ${executorBudget.tool_events || 'unlimited'} tool events, ` +
         `${executorBudget.event_bytes || 'unlimited'} event bytes — ${executorBudget.reason}`)
   }
+  say(`  mutation proof: ${mutationProof.effective} (requested ${mutationProof.requested},` +
+    ` floor ${mutationProof.floor}) — ${mutationProof.reason}`)
 
   const history = resume?.history || []
   const startRound = resume?.round || 0
@@ -10252,6 +10363,10 @@ function runTask(file, f, profileText, opts = {}) {
         executorBudget?.event_bytes
           ? `\nYour provider event stream is capped at ${executorBudget.event_bytes} bytes.` +
             ' Keep command output narrow and avoid rereading files already inspected.'
+          : '',
+        mutationProof.effective === 'none'
+          ? '\nThis task carries `mutation_proof: none`: leave `mutations` empty. The engine runs' +
+            ' none of them and restores the requirement for review if the delivery reaches a risk path.'
           : '',
         open.length
           ? '\nClose every open finding in the dossier before doing unrelated work.' +
@@ -10498,9 +10613,16 @@ function runTask(file, f, profileText, opts = {}) {
       die(`${file} — gate is green but nothing changed. Read the spec yourself.`)
     }
 
+    // Judged again here, on the paths the delivery really changed: the plan's `none` was a claim
+    // about work that had not been done yet.
+    const deliveryProof = effectiveMutationProof(mutationProof.effective, spec, f, deliveredPaths())
+    if (deliveryProof.effective !== mutationProof.effective) {
+      say(`  mutation proof raised to required — ${deliveryProof.reason}`)
+    }
     if (measureMutations && !gateUnavailable) {
       measureMutations = false
-      try { mutationFact = measureExecutorMutations(ex.mutations, f, file, deliveryDigest(),
+      const namedMutations = deliveryProof.effective === 'required' ? ex.mutations : []
+      try { mutationFact = measureExecutorMutations(namedMutations, f, file, deliveryDigest(),
         replayableReviewFindings(history)) }
       catch (error) { die(`${file} — executor mutations: ${error?.message || error}`) }
       recordExecutorMutations(file, round + 1, mutationFact)
@@ -10619,10 +10741,14 @@ function runTask(file, f, profileText, opts = {}) {
         // (a hash call-site count blind to an aliased import; an isolation test reading the
         // seam's error instead of the function's answer). Both were visible in round 1 to
         // anyone who had tried to break the code.
-        ' For every `Must cover` row you record `met`, its evidence must name one concrete',
-        ' mutation of the shipped code and the check that fails on it. If you can name a',
-        ' mutation the current verification would NOT catch, the row is `weak` now, in this',
-        ' round, with that mutation as its evidence — not a finding held for a later round:\n\n' +
+        (deliveryProof.effective === 'required'
+          ? ' For every `Must cover` row you record `met`, its evidence must name one concrete' +
+            ' mutation of the shipped code and the check that fails on it. If you can name a' +
+            ' mutation the current verification would NOT catch, the row is `weak` now, in this' +
+            ' round, with that mutation as its evidence — not a finding held for a later round:\n\n'
+          : ' This task carries `mutation_proof: none`. A `Must cover` row needs no mutation and' +
+            ' no experiment: judge it on its evidence. A doubt about the strength of a test goes' +
+            ' in `noted`, never `weak`. `broken` and `uncovered` block as always:\n\n') +
           renderReviewCriteria(spec, projectCriteria),
         // Only the kinds this delivery has rows for. Measured on two installs, every pass of several tasks:
         // offered `review-mutation:<id>` with nothing replayed, the reviewer cited its own capture
@@ -10719,6 +10845,7 @@ function runTask(file, f, profileText, opts = {}) {
           if (deliveryDigest() !== deliveryBaseline) {
             die(`${file} — delivery tree changed during reviewer pass ${passIndex + 1}; refusing the verdict`)
           }
+          if (deliveryProof.effective === 'none') demoteWeakFindings(passVerdict, open)
           const carriedProblem = carriedSetIssue(passVerdict.carried, open)
           const criteriaProblem = carriedProblem ? null : reviewCriteriaIssue(
             spec, passVerdict.criteria, passVerdict, projectCriteria, open)
@@ -10834,6 +10961,7 @@ function runTask(file, f, profileText, opts = {}) {
       acceptanceCases,
       executorClaims: ex?.claims || [],
       topology,
+      mutationProof: deliveryProof,
     })
     sayRound(round, round - startRound, adj, added, nowOpen, (rv.noted || []).length, taskAccounting())
 
@@ -11648,6 +11776,7 @@ function fixSpecs(description, f, text, specs, problems, round, planningIndexBlo
     ' Size every task for one executor call: work that can be delivered and verified on its own — a feature, the canon text that describes it, its strings, the gate wiring for it — gets its own task in order, unless a concrete indivisible_reason says why it cannot land apart. Stay inside any per-task size limits the profile states.',
     ' Preserve or raise each executor_budget class. Use small for one bounded local surface,',
     ' normal for an ordinary feature, and large for cross-layer or sensitive work.',
+    ' Preserve each mutation_proof, or raise none to required where a hole shows the risk.',
   ].join('')
   const { value: answer } = prior
     ? planningCanonicalCall('architect', architectPrompt, SCHEMA.planRevision, f,
@@ -11668,7 +11797,7 @@ function fixSpecs(description, f, text, specs, problems, round, planningIndexBlo
   }
 
   clearSpecs()
-  writeSpecs(out.tasks, out.coverage)
+  writeSpecs(out.tasks, out.coverage, f)
   if (out.resplit?.length) say(`  re-split (round ${round}):\n    - ${out.resplit.join('\n    - ')}`)
 }
 
@@ -11821,6 +11950,11 @@ function judgeSpecs(description, f, text, population, holes = [], planningIndexB
     '\n\nCheck each executor_budget value as part of verifiability. A budget too small for a',
     ' reliable complete delivery is an `unverifiable` hole; the engine will separately enforce',
     ' its structural and sensitive-work floor when the executor starts.',
+    '\n\nCheck each `mutation_proof: none` the same way. A `none` on work whose silent failure',
+    ' would lose data, open access, or break a stated product rule, on a test that proves such a',
+    ' risk, or on mock or harness code that no required spec in this queue exercises is an',
+    ' `unverifiable` hole; a spec with no such line means required. The engine separately raises `none` from the task',
+    ' text and from the delivered paths.',
     oversizedCandidatesBlock(specs.map((name) => {
       const body = readFileSync(join(QUEUE_DIR, name), 'utf8')
       const requested = body.match(/^executor_budget_requested:\s*(\S+)/m)?.[1] ||
@@ -12748,7 +12882,8 @@ export {
   canonicalAuthorityPaths, compactRunMetrics,
   collectGateEvidence, retainGateEvidence,
   decideGateFailure, decidePlanningAction, deltaAccounting, executorClaimsIssue,
-  effectiveExecutorBudgetClass, executorBudgetFloor, executorBudgetForSpec,
+  demoteWeakFindings, effectiveExecutorBudgetClass, effectiveMutationProof, executorBudgetFloor,
+  executorBudgetForSpec,
   extractReviewCriteria, formatAccounting,
   extractTaskTopology, groupFindings, mergeReviewPasses, normalizeAccounting, planRelationIssue, planningLedger,
   reviewContractIssue, reviewCriteriaIssue,

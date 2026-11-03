@@ -6,7 +6,9 @@ import {
   SCHEMA,
   canonicalAuthorityPaths,
   decidePlanningAction,
+  demoteWeakFindings,
   effectiveExecutorBudgetClass,
+  effectiveMutationProof,
   executorBudgetFloor,
   executorBudgetForSpec,
   planRelationIssue,
@@ -70,6 +72,7 @@ const relatedPlan = () => ({
     }],
     indivisible_reason: '',
     executor_budget: 'small',
+    mutation_proof: 'required',
   }],
   coverage: [{
     case: 'empty and populated states',
@@ -120,7 +123,57 @@ test('plan-reviewer schema requires the complete relation ledger', () => {
     ['case', 'task', 'acceptance_criteria'])
   assert.deepEqual(SCHEMA.plan.properties.tasks.items.required,
     ['slug', 'title', 'read', 'change', 'done_when', 'gate_checks', 'surfaces', 'state_machines',
-      'indivisible_reason', 'executor_budget'])
+      'indivisible_reason', 'executor_budget', 'mutation_proof'])
+})
+
+test('mutation proof is proposed by planning and only ever raised by the floor', () => {
+  const plumbing = 'Add a mock flag.'
+  assert.equal(effectiveMutationProof('none', plumbing).effective, 'none')
+  assert.equal(effectiveMutationProof('required', plumbing).effective, 'required')
+  assert.equal(effectiveMutationProof(null, plumbing).effective, 'required')
+  assert.deepEqual(effectiveMutationProof('none', 'Change the RLS policy.'), {
+    requested: 'none', floor: 'required', effective: 'required',
+    reason: 'the task names database, authorization, security, credential, or migration work',
+  })
+  // A clause the task rules out is not work the task does.
+  assert.equal(effectiveMutationProof('none', 'Add a flag. Do not touch the database.').effective,
+    'none')
+  assert.throws(() => effectiveMutationProof('maybe', plumbing),
+    /mutation_proof must be required or none/)
+})
+
+test('the mutation proof floor reads the delivered paths and the project pattern', () => {
+  const task = 'Add a mock flag.'
+  assert.equal(effectiveMutationProof('none', task, {}, ['src/view.swift']).effective, 'none')
+  assert.deepEqual(effectiveMutationProof('none', task, {}, ['db/migrations/001.sql']), {
+    requested: 'none', floor: 'required', effective: 'required',
+    reason: 'the delivery changes db/migrations/001.sql',
+  })
+  const f = { mutation_risk_regex: /deletePhoto|^supabase\//im }
+  assert.equal(effectiveMutationProof('none', task, f, ['supabase/seed.sql']).effective, 'required')
+  assert.equal(effectiveMutationProof('none', 'Rework deletePhoto.', f).effective, 'required')
+  assert.equal(effectiveMutationProof('none', task, f, ['src/view.swift']).effective, 'none')
+})
+
+test('demoting weak findings keeps a row an open carried item still holds', () => {
+  const verdict = {
+    criteria: [
+      { id: 'must-cover-1', state: 'weak', evidence: 'new doubt' },
+      { id: 'must-cover-2', state: 'weak', evidence: 'still open' },
+      { id: 'done-when-1', state: 'broken', evidence: 'wrong' },
+    ],
+    carried: [{ id: 'r1.1', state: 'open' }],
+    broken: [{ where: 'a:1' }],
+    uncovered: [],
+    weak: [{ where: 'b:2', fix: 'tighten', evidence: 'green with the label changed' }],
+    noted: ['kept'],
+  }
+  demoteWeakFindings(verdict, [{ id: 'r1.1', slot: 'weak', criterion_ids: ['must-cover-2'] }])
+  assert.deepEqual(verdict.criteria.map((row) => row.state), ['met', 'weak', 'broken'])
+  assert.deepEqual(verdict.weak, [])
+  assert.equal(verdict.broken.length, 1)
+  assert.equal(verdict.noted[0], 'kept')
+  assert.match(verdict.noted[1], /^weak not required, noted only — b:2: tighten;/)
 })
 
 test('executor budget class is proposed by planning and raised by deterministic safety floors', () => {

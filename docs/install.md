@@ -218,6 +218,18 @@ uses risk-triggered challenger passes. Strict retains iterative planning and fix
 `planning_max_rounds` bounds planning at `1..3`; `review_challenger_policy: risk` adds configured
 challengers only for broad or risky paths, carried findings, or a primary blocking result.
 
+`mutation_proof` is a per-task spec field, `required` or `none`; a spec without it means
+`required`. The architect proposes it, the plan reviewer may call a wrong `none` an `unverifiable`
+hole, and the engine raises `none` to `required` from sensitive words in the task and again from
+the paths the delivery changed. Under `none` the engine runs no executor mutation, and a
+reviewer's `weak` becomes a non-blocking note; `broken` and `uncovered` still block, and the task
+certificate records the class. `mutation_risk_pattern` adds a project case-insensitive regular
+expression to that floor, matched against the task text and the changed paths.
+By default a test that proves a risk is `required`, and mock or harness code may be `none` only
+when a `required` task in the same queue exercises it. A project rule that words and paths cannot
+express, such as "every UI scenario here exists for a risk", belongs in the planning policy's
+`instructions`, which the architect and the plan reviewer both read; nothing lowers the floor.
+
 Set `builtin_index: request-v1` for the engine's bounded request-token/file index, and
 `index_audience: planning` to pass the same digest, together with any `index_cmd` output, to
 enumerator, architect, and plan-reviewer. Use `gate_batch` for broad tests that should run once after the task

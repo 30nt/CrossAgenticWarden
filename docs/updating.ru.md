@@ -82,7 +82,8 @@ Digest движка и адаптера входит в identity role smoke. П�
 Остальные поля, добавленные после 0.1.0, либо по умолчанию равны распространяемому значению
 (`pipeline_mode`, `planning_max_rounds`, `planning_independence`, `review_challenger_*`,
 `gate_unavailable_review`, лимиты `budget_*_calls`), либо пусты и в распространяемом профиле
-(таймауты гейтов, `gate_batch`, `executor_max_*`, `weak_*_cmd`, `human_review_allowed_signers`).
+(таймауты гейтов, `gate_batch`, `executor_max_*`, `weak_*_cmd`, `mutation_risk_pattern`,
+`human_review_allowed_signers`).
 Поля `autopilot_*` включаются по желанию и отсутствуют в обоих.
 
 ### Что ещё встретят гейт и профиль — при переходе на 0.2.0

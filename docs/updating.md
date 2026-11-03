@@ -79,7 +79,8 @@ compare your profile against this list rather than against `caw.mjs`:
 Every other field added since 0.1.0 either defaults to the distributed value (`pipeline_mode`,
 `planning_max_rounds`, `planning_independence`, `review_challenger_*`, `gate_unavailable_review`,
 the `budget_*_calls` limits) or is empty in the distributed profile too (gate timeouts,
-`gate_batch`, `executor_max_*`, `weak_*_cmd`, `human_review_allowed_signers`). The `autopilot_*`
+`gate_batch`, `executor_max_*`, `weak_*_cmd`, `mutation_risk_pattern`,
+`human_review_allowed_signers`). The `autopilot_*`
 fields are opt-in and absent from both.
 
 ### What else a gate and a profile meet — coming to 0.2.0

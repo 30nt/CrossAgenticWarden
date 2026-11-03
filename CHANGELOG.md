@@ -5,6 +5,17 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-11-03
+
+### Added
+
+- `mutation_proof`, a per-task class of `required` or `none`. Planning proposes it, and the engine
+  raises `none` from the task's words and again from the paths the delivery changed. Under `none`
+  no executor mutation runs and a reviewer's `weak` becomes a note. A spec without the field means
+  `required`, so an existing queue behaves as before. `mutation_risk_pattern` extends the floor per
+  project, and the task certificate records the class. A test that proves a risk is `required`,
+  and mock or harness code is `none` only when a `required` task in the same queue exercises it.
+
 ## [0.2.7] - 2026-10-15
 
 ### Changed
@@ -280,7 +291,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.4...v0.2.5
