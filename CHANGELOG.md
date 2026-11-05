@@ -5,6 +5,8 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-11-05
+
 ### Fixed
 
 - A zsh here-document works inside the Claude and Codex write boundaries: both adapters set
@@ -301,7 +303,8 @@ still allowed to change between `0.x` minor releases.
 
 - First public research release of the minimal task, gate, review, and commit pipeline.
 
-[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/30nt/CrossAgenticWarden/compare/v0.2.5...v0.2.6
