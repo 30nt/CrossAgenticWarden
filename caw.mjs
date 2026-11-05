@@ -891,7 +891,7 @@ const notes = []
 
 // An install is a vendored copy, so the version an operator can state is the tag this file
 // was taken at. It is printed, never enforced: byte-identity against the tag is the check.
-const VERSION = '0.2.8'
+const VERSION = '0.2.9'
 const ROLES = ['architect', 'enumerator', 'plan-reviewer', 'executor', 'reviewer']
 const REASONING = new Set(['low', 'medium', 'high', 'max'])
 const PROVIDER_BUDGET_DEFAULTS = Object.freeze({
@@ -999,6 +999,20 @@ let runtimeResidualsPrinted = false
 const adapters = new Map()
 const valueRuntime = new WeakMap()
 const runtimeIdentity = (value) => value && typeof value === 'object' ? valueRuntime.get(value) || null : null
+// What is known of a role's call before it answers: the binding launched, nothing observed.
+function launchedRuntime(role) {
+  const binding = resolvedRuntime.value.roles[role]
+  const provider = resolvedRuntime.providers.get(binding.provider)
+  return {
+    state: 'launched',
+    runtime_digest: resolvedRuntime.digest,
+    provider: binding.provider,
+    vendor: provider.adapter.vendor,
+    adapter_digest: provider.adapter.digest,
+    cli_version: provider.cliVersion,
+    requested: { model: binding.model, reasoning: binding.reasoning },
+  }
+}
 
 // Provider paths are data, never shell source. JavaScript CLIs need an explicit Node launcher on
 // every host (and on Windows have no shebang mechanism at all); command scripts need a shell, which
@@ -3199,7 +3213,8 @@ function recordTaskCertification({ task, round, criteria, open, author, reviewer
   if (!['sample', 'complete'].includes(population.state)) {
     limitations.push(`population-${population.state}`)
   }
-  if (!author) limitations.push('author-runtime-unobserved')
+  // A launched-only author is the binding the engine started, not one a returned call confirmed.
+  if (!author || author.state === 'launched') limitations.push('author-runtime-unobserved')
   if (weakVerification?.state?.startsWith('unverified')) {
     limitations.push(weakVerification.state)
   }
@@ -10347,6 +10362,11 @@ function runTask(file, f, profileText, opts = {}) {
       // stop the executor after it has edited the tree but before it returns canonical output.
       // The dirty tree is recoverable on its own; this state preserves the prior confirmed-red
       // receipt and review history needed to continue it without a fresh reading.
+      // The binding the engine launches is recorded before the call and replaced by the observed
+      // identity when it answers. Measured on one iOS install: an executor killed at the agent
+      // timeout left a green delivery in the tree, and `review` refused it as "recorded author is
+      // unknown" under different-model, so judging that tree cost a fresh executor round.
+      runtimeHistory.push({ round: round + 1, role: 'executor', ...launchedRuntime('executor') })
       saveRound(file, spec, ex, history, round, how, noted, taskAccounting(), runtimeHistory,
         weakVerification, gateFact)
       ex = canonicalRepairCall('executor', [
@@ -10411,7 +10431,8 @@ function runTask(file, f, profileText, opts = {}) {
       unchangedFact = null
       measureMutations = (ex.mutations || []).length > 0 ||
         replayableReviewFindings(history).length > 0
-      runtimeHistory.push({ round: round + 1, role: 'executor', ...runtimeIdentity(ex) })
+      runtimeHistory[runtimeHistory.length - 1] =
+        { round: round + 1, role: 'executor', ...runtimeIdentity(ex) }
 
       if (blocked(ex.blocked)) {
         const kept = keepBlocked(file)

@@ -358,8 +358,13 @@ export default {
       cwd: execution.workingRoot,
       env: {
         ...providerEnv,
+        // zsh writes a here-document under TMPPREFIX, default /tmp/zsh, and ignores TMPDIR, so
+        // inside the boundary every heredoc failed with "can't create temp file".
         ...(execution.scratchRoot
-          ? { TMPDIR: execution.scratchRoot, CLAUDE_CODE_TMPDIR: execution.scratchRoot }
+          ? {
+              TMPDIR: execution.scratchRoot, CLAUDE_CODE_TMPDIR: execution.scratchRoot,
+              TMPPREFIX: join(execution.scratchRoot, 'zsh'),
+            }
           : {}),
         PWD: execution.workingRoot,
       },

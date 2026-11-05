@@ -1,7 +1,7 @@
 import './isolated-tmp.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { arch, platform, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -400,6 +400,43 @@ test('planning invocations keep repository reads and shell but grant writes only
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// Reported by one iOS install: two executors noted "zsh could not create a temp file" and fell
+// back to Edit. zsh puts a here-document under TMPPREFIX (default /tmp/zsh), not under TMPDIR.
+test('a zsh here-document works inside both seatbelt boundaries',
+  { skip: platform() === 'darwin' && arch() === 'arm64' && existsSync('/bin/zsh')
+    ? false : 'needs the macOS seatbelt and /bin/zsh' }, () => {
+    const root = mkdtempSync(join(tmpdir(), 'caw-heredoc-contract-'))
+    const workingRoot = join(root, 'delivery')
+    const scratchRoot = join(root, 'provider-tmp')
+    mkdirSync(workingRoot)
+    mkdirSync(scratchRoot)
+    let codexInvocation
+    try {
+      const request = (adapter, provider) => adapter.buildInvocation({
+        role: 'executor',
+        binding: { provider, model: 'fixture', reasoning: 'high' },
+        schema: { type: 'object' }, instructions: 'fixture', prompt: 'fixture',
+        executable: `/fixture/${provider}`,
+        execution: {
+          workingRoot, scratchRoot, writeBoundary: 'delivery-tree',
+          writeBoundaryBy: 'os-boundary', deniedReadPaths: [], env: { PWD: workingRoot },
+        },
+      })
+      codexInvocation = request(codex, 'codex')
+      for (const [name, invocation] of [['claude', request(claude, 'claude')], ['codex', codexInvocation]]) {
+        assert.equal(invocation.executable, '/usr/bin/sandbox-exec', name)
+        const shell = spawnSync('/usr/bin/sandbox-exec',
+          ['-p', invocation.args[1], '/bin/zsh', '-f', '-c', 'cat <<EOF\nheredoc ok\nEOF'],
+          { cwd: workingRoot, env: { PATH: process.env.PATH, ...invocation.env }, encoding: 'utf8' })
+        assert.equal(shell.stderr, '', name)
+        assert.equal(shell.stdout, 'heredoc ok\n', name)
+      }
+    } finally {
+      if (codexInvocation) rmSync(codexInvocation.transport.root, { recursive: true, force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 
 test('Codex enumerator uses one outer write boundary with native execution enabled',
   { skip: !(platform() === 'darwin' && arch() === 'arm64') }, () => {

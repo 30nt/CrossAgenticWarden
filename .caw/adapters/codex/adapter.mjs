@@ -338,6 +338,8 @@ export default {
         CODEX_HOME: join(transport.root, 'codex-home'),
         PWD: workingRoot,
         TMPDIR: join(transport.root, 'tmp'),
+        // zsh puts here-documents under TMPPREFIX, not TMPDIR; its /tmp/zsh default is outside.
+        TMPPREFIX: join(transport.root, 'tmp', 'zsh'),
       },
       transport: { root: transport.root, finalResponsePath: transport.finalResponsePath },
       requestedNative: {
