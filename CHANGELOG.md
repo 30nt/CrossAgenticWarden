@@ -5,6 +5,16 @@ still allowed to change between `0.x` minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- A zsh here-document works inside the Claude and Codex write boundaries: both adapters set
+  `TMPPREFIX` inside their scratch, because zsh ignores `TMPDIR` and defaulted to `/tmp/zsh`.
+  The adapter digests change, so run `node caw.mjs smoke all` after updating.
+- An executor killed mid-call, for example at the agent timeout, still names its author: the engine
+  records the binding it launched before the call. `review` under `different-model` or
+  `cross-vendor` can then judge the tree it left instead of refusing an unknown author; the
+  certificate keeps `author-runtime-unobserved`.
+
 ## [0.2.8] - 2026-11-03
 
 ### Added

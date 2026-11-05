@@ -3245,6 +3245,37 @@ for (const scenario of ['same-author-model', 'same-author-vendor', 'independent'
   })
 }
 
+test('an executor killed at the agent timeout still names its launched author for review', () => {
+  const f = fixture({ git: true, taskIndependence: 'different-model' })
+  mkdirSync(join(f.root, '.caw-tasks'))
+  const file = '001_killed.md'
+  writeFileSync(join(f.root, '.caw-tasks', file),
+    '---\ntitle: Killed\n---\n\n## Done when\n\n- Output exists.\n')
+  const killed = run(f, ['build', '--no-full'], [{
+    writeFiles: { 'output.txt': 'result\n' }, delayMs: 2000,
+    envelope: envelope(delivery('Write output')),
+  }], { CAW_AGENT_TIMEOUT_MS: '300' })
+  assert.equal(killed.status, 1)
+  assert.match(killed.stderr, /executor did not finish within/)
+  assert.equal(readFileSync(join(f.root, 'output.txt'), 'utf8'), 'result\n')
+  const runtimePath = join(f.root, '.caw', 'runtime.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.roles.reviewer.model = 'opus'
+  writeFileSync(runtimePath, JSON.stringify(runtime))
+  const state = JSON.parse(readFileSync(join(f.root, '.caw-tasks', `.round-${file}.json`), 'utf8'))
+  assert.deepEqual(state.runtime_history.map((entry) => [entry.role, entry.state, entry.requested.model]),
+    [['executor', 'launched', runtime.roles.executor.model]])
+
+  const reviewed = run(f, ['review', file], [{ envelope: envelope(verdict({ criteria: [
+    { id: 'done-when-1', state: 'met', evidence: 'read output' },
+  ] })) }])
+  assert.equal(reviewed.status, 0, reviewed.stderr || reviewed.stdout)
+  const certification = latestTaskAudit(f).review.certification
+  assert.equal(certification.independence.satisfied, true)
+  assert.equal(certification.independence.author.model, runtime.roles.executor.model)
+  assert.ok(certification.limitations.includes('author-runtime-unobserved'))
+})
+
 for (const mode of ['same-provider', 'different-model', 'cross-vendor']) {
   test(`review with an unknown author obeys ${mode} independence`, () => {
     const f = fixture({ git: true, taskIndependence: mode })
